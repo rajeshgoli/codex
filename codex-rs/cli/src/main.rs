@@ -1079,6 +1079,12 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     if !subcommand_cli.add_dir.is_empty() {
         interactive.add_dir.extend(subcommand_cli.add_dir);
     }
+    if subcommand_cli.event_stream.is_some() {
+        interactive.event_stream = subcommand_cli.event_stream;
+    }
+    if subcommand_cli.event_schema_version.is_some() {
+        interactive.event_schema_version = subcommand_cli.event_schema_version;
+    }
     if let Some(prompt) = subcommand_cli.prompt {
         // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
         interactive.prompt = Some(prompt.replace("\r\n", "\n").replace('\r', "\n"));
