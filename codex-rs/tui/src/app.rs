@@ -769,6 +769,7 @@ impl App {
         initial_prompt: Option<String>,
         initial_images: Vec<PathBuf>,
         session_selection: SessionSelection,
+        control_socket: Option<PathBuf>,
         feedback: codex_feedback::CodexFeedback,
         is_first_run: bool,
         should_prompt_windows_sandbox_nux_at_startup: bool,
@@ -1117,6 +1118,13 @@ See the Codex keymap documentation for supported actions and examples."
             }
         }
 
+        let mut control_socket_handle = control_socket
+            .map(|socket_path| {
+                crate::control_socket::ControlSocketHandle::start(socket_path, app_event_tx.clone())
+            })
+            .transpose()
+            .wrap_err("failed to initialize control socket")?;
+
         let event_stream_started_at = Instant::now();
         let tui_events = tui.event_stream();
         tokio::pin!(tui_events);
@@ -1233,6 +1241,10 @@ See the Codex keymap documentation for supported actions and examples."
                 }
             }
         };
+        if let Some(mut handle) = control_socket_handle.take() {
+            handle.shutdown();
+        }
+
         if let Err(err) = app_server.shutdown().await {
             tracing::warn!(error = %err, "failed to shut down embedded app server");
         }
