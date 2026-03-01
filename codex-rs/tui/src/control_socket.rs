@@ -30,6 +30,8 @@ use std::io::BufReader;
 #[cfg(unix)]
 use std::io::ErrorKind;
 #[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
@@ -515,8 +517,19 @@ fn run_listener_loop(listener: UnixListener, state: Arc<ControlState>, shutdown:
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
-                if let Err(err) = handle_connection(stream, Arc::clone(&state), Arc::clone(&shutdown)) {
-                    tracing::warn!("control socket connection error: {err}");
+                let connection_state = Arc::clone(&state);
+                let connection_shutdown = Arc::clone(&shutdown);
+                if let Err(err) = std::thread::Builder::new()
+                    .name("codex-control-conn".to_string())
+                    .spawn(move || {
+                        if let Err(err) =
+                            handle_connection(stream, connection_state, connection_shutdown)
+                        {
+                            tracing::warn!("control socket connection error: {err}");
+                        }
+                    })
+                {
+                    tracing::warn!("failed to spawn control socket worker: {err}");
                 }
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
@@ -545,22 +558,20 @@ fn handle_connection(
         if shutdown.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => return Ok(()),
-            Ok(_) => {
+        match read_line_capped(&mut reader, &shutdown)? {
+            ReadLineOutcome::Eof => return Ok(()),
+            ReadLineOutcome::TooLarge => {
+                let response = response_err(
+                    "",
+                    &state.epoch,
+                    "invalid_request",
+                    format!("request exceeds max length of {REQUEST_MAX_CHARS} characters"),
+                );
+                write_response(&mut stream, &response)?;
+            }
+            ReadLineOutcome::Line(line) => {
                 let line = line.trim();
                 if line.is_empty() {
-                    continue;
-                }
-                if line.len() > REQUEST_MAX_CHARS {
-                    let response = response_err(
-                        "",
-                        &state.epoch,
-                        "invalid_request",
-                        format!("request exceeds max length of {REQUEST_MAX_CHARS} characters"),
-                    );
-                    write_response(&mut stream, &response)?;
                     continue;
                 }
 
@@ -575,12 +586,64 @@ fn handle_connection(
                 };
                 write_response(&mut stream, &response)?;
             }
+        }
+    }
+}
+
+#[cfg(unix)]
+enum ReadLineOutcome {
+    Eof,
+    Line(String),
+    TooLarge,
+}
+
+#[cfg(unix)]
+fn read_line_capped(
+    reader: &mut BufReader<UnixStream>,
+    shutdown: &Arc<AtomicBool>,
+) -> std::io::Result<ReadLineOutcome> {
+    let mut bytes = Vec::new();
+    let mut too_large = false;
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(ReadLineOutcome::Eof);
+        }
+        let mut byte = [0u8; 1];
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                if bytes.is_empty() && !too_large {
+                    return Ok(ReadLineOutcome::Eof);
+                }
+                break;
+            }
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if !too_large {
+                    bytes.push(byte[0]);
+                    if bytes.len() > REQUEST_MAX_CHARS {
+                        too_large = true;
+                        bytes.clear();
+                    }
+                }
+            }
             Err(err) if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut => {
                 continue;
             }
             Err(err) => return Err(err),
         }
     }
+    if too_large {
+        return Ok(ReadLineOutcome::TooLarge);
+    }
+    let line = String::from_utf8(bytes).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("request is not valid UTF-8: {err}"),
+        )
+    })?;
+    Ok(ReadLineOutcome::Line(line))
 }
 
 #[cfg(unix)]
