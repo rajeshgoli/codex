@@ -2461,6 +2461,8 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         approval_policy,
         web_search,
         prompt,
+        event_stream,
+        event_schema_version,
         config_overrides,
         ..
     } = subcommand_cli;
@@ -2475,6 +2477,12 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     }
     if strict_config {
         interactive.strict_config = true;
+    }
+    if event_stream.is_some() {
+        interactive.event_stream = event_stream;
+    }
+    if event_schema_version.is_some() {
+        interactive.event_schema_version = event_schema_version;
     }
     if let Some(prompt) = prompt {
         // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
