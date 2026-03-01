@@ -110,6 +110,18 @@ pub struct Cli {
     #[arg(long = "no-alt-screen", default_value_t = false)]
     pub no_alt_screen: bool,
 
+    /// Emit structured JSONL lifecycle events to a file path, or `-` for stdout.
+    #[arg(long = "event-stream", value_name = "PATH_OR_STDOUT")]
+    pub event_stream: Option<String>,
+
+    /// Pin the event stream schema version for compatibility.
+    #[arg(
+        long = "event-schema-version",
+        value_name = "INT",
+        requires = "event_stream"
+    )]
+    pub event_schema_version: Option<u32>,
+
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 }
