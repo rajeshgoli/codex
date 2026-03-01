@@ -1021,6 +1021,7 @@ See the Codex keymap documentation for supported actions and examples."
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
+        let control_socket_event_tx = app_event_tx.clone();
         let mut app = Self {
             model_catalog,
             session_telemetry: session_telemetry.clone(),
@@ -1120,7 +1121,10 @@ See the Codex keymap documentation for supported actions and examples."
 
         let mut control_socket_handle = control_socket
             .map(|socket_path| {
-                crate::control_socket::ControlSocketHandle::start(socket_path, app_event_tx.clone())
+                crate::control_socket::ControlSocketHandle::start(
+                    socket_path,
+                    control_socket_event_tx.clone(),
+                )
             })
             .transpose()
             .wrap_err("failed to initialize control socket")?;
