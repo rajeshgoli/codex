@@ -1,9 +1,11 @@
 use clap::Args;
 use clap::FromArgMatches;
 use clap::Parser;
+use clap::ValueHint;
 use codex_utils_cli::ApprovalModeCliArg;
 use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::SharedCliOptions;
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -80,6 +82,10 @@ pub struct Cli {
         requires = "event_stream"
     )]
     pub event_schema_version: Option<u32>,
+
+    /// Bind a local control socket for programmatic request/response control.
+    #[arg(long = "control-socket", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub control_socket: Option<PathBuf>,
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
