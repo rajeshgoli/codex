@@ -72,6 +72,7 @@ mod clipboard_paste;
 mod clipboard_text;
 mod collaboration_modes;
 mod color;
+mod control_socket;
 pub mod custom_terminal;
 mod cwd_prompt;
 mod debug_config;
@@ -920,6 +921,7 @@ async fn run_ratatui_app(
         prompt,
         images,
         no_alt_screen,
+        control_socket,
         ..
     } = cli;
 
@@ -936,6 +938,7 @@ async fn run_ratatui_app(
         prompt,
         images,
         session_selection,
+        control_socket,
         feedback,
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
         should_prompt_windows_sandbox_nux_at_startup,
