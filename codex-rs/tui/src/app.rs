@@ -1733,6 +1733,7 @@ impl App {
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
+        let control_socket_event_tx = app_event_tx.clone();
         let mut app = Self {
             server: thread_manager.clone(),
             otel_manager: otel_manager.clone(),
@@ -1820,7 +1821,10 @@ impl App {
 
         let mut control_socket_handle = control_socket
             .map(|socket_path| {
-                crate::control_socket::ControlSocketHandle::start(socket_path, app_event_tx.clone())
+                crate::control_socket::ControlSocketHandle::start(
+                    socket_path,
+                    control_socket_event_tx.clone(),
+                )
             })
             .transpose()
             .wrap_err("failed to initialize control socket")?;
@@ -3152,6 +3156,9 @@ impl App {
             } => {
                 self.chat_widget
                     .submit_user_message_with_mode(text, collaboration_mode);
+            }
+            AppEvent::SubmitExternalLiteralUserMessage { text } => {
+                self.chat_widget.submit_external_literal_user_message(text);
             }
             AppEvent::ManageSkillsClosed => {
                 self.chat_widget.handle_manage_skills_closed();
