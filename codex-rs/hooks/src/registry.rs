@@ -8,6 +8,8 @@ use crate::types::HookResponse;
 #[derive(Default, Clone)]
 pub struct HooksConfig {
     pub legacy_notify_argv: Option<Vec<String>>,
+    pub after_tool_use_argv: Option<Vec<String>>,
+    pub after_tool_use_abort_on_failure: bool,
 }
 
 #[derive(Clone)]
@@ -32,9 +34,15 @@ impl Hooks {
             .map(crate::notify_hook)
             .into_iter()
             .collect();
+        let after_tool_use = config
+            .after_tool_use_argv
+            .filter(|argv| !argv.is_empty() && !argv[0].is_empty())
+            .map(|argv| crate::after_tool_use_hook(argv, config.after_tool_use_abort_on_failure))
+            .into_iter()
+            .collect();
         Self {
             after_agent,
-            after_tool_use: Vec::new(),
+            after_tool_use,
         }
     }
 
@@ -231,6 +239,7 @@ mod tests {
         assert!(
             Hooks::new(HooksConfig {
                 legacy_notify_argv: Some(vec![]),
+                ..HooksConfig::default()
             })
             .after_agent
             .is_empty()
@@ -238,6 +247,7 @@ mod tests {
         assert!(
             Hooks::new(HooksConfig {
                 legacy_notify_argv: Some(vec!["".to_string()]),
+                ..HooksConfig::default()
             })
             .after_agent
             .is_empty()
@@ -245,11 +255,63 @@ mod tests {
         assert_eq!(
             Hooks::new(HooksConfig {
                 legacy_notify_argv: Some(vec!["notify-send".to_string()]),
+                ..HooksConfig::default()
             })
             .after_agent
             .len(),
             1
         );
+
+        assert!(
+            Hooks::new(HooksConfig {
+                after_tool_use_argv: Some(vec![]),
+                ..HooksConfig::default()
+            })
+            .after_tool_use
+            .is_empty()
+        );
+        assert!(
+            Hooks::new(HooksConfig {
+                after_tool_use_argv: Some(vec!["".to_string()]),
+                ..HooksConfig::default()
+            })
+            .after_tool_use
+            .is_empty()
+        );
+        assert_eq!(
+            Hooks::new(HooksConfig {
+                after_tool_use_argv: Some(vec!["echo".to_string()]),
+                ..HooksConfig::default()
+            })
+            .after_tool_use
+            .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn after_tool_use_config_failure_continues_by_default() {
+        let hooks = Hooks::new(HooksConfig {
+            after_tool_use_argv: Some(vec!["__codex_nonexistent_hook_command__".to_string()]),
+            ..HooksConfig::default()
+        });
+
+        let outcomes = hooks.dispatch(after_tool_use_payload("cfg-continue")).await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0].result, HookResult::FailedContinue(_)));
+    }
+
+    #[tokio::test]
+    async fn after_tool_use_config_failure_can_abort() {
+        let hooks = Hooks::new(HooksConfig {
+            after_tool_use_argv: Some(vec!["__codex_nonexistent_hook_command__".to_string()]),
+            after_tool_use_abort_on_failure: true,
+            ..HooksConfig::default()
+        });
+
+        let outcomes = hooks.dispatch(after_tool_use_payload("cfg-abort")).await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0].result, HookResult::FailedAbort(_)));
     }
 
     #[tokio::test]

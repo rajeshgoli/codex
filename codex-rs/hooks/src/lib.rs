@@ -16,4 +16,5 @@ pub use types::HookToolInput;
 pub use types::HookToolInputLocalShell;
 pub use types::HookToolKind;
 pub use user_notification::legacy_notify_json;
+pub use user_notification::after_tool_use_hook;
 pub use user_notification::notify_hook;

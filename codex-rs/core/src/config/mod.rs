@@ -143,6 +143,14 @@ pub(crate) fn test_config() -> Config {
     .expect("load default test config")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HookFailureBehavior {
+    #[default]
+    Continue,
+    Abort,
+}
+
 /// Application configuration loaded from disk and merged with overrides.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Permissions {
@@ -263,6 +271,18 @@ pub struct Config {
     ///
     /// If unset the feature is disabled.
     pub notify: Option<Vec<String>>,
+
+    /// Optional external command to spawn after each tool call.
+    ///
+    /// Codex appends one JSON argument containing the full hook payload
+    /// (`hook_event.event_type = "after_tool_use"`).
+    pub after_tool_use: Option<Vec<String>>,
+
+    /// Behavior when an `after_tool_use` hook fails.
+    ///
+    /// - `continue` (default): continue operation after recording hook failure.
+    /// - `abort`: abort the operation immediately on hook failure.
+    pub after_tool_use_failure_behavior: HookFailureBehavior,
 
     /// TUI notifications preference. When set, the TUI will send terminal notifications on
     /// approvals and turn completions when not focused.
@@ -1042,6 +1062,14 @@ pub struct ConfigToml {
     /// Optional external command to spawn for end-user notifications.
     #[serde(default)]
     pub notify: Option<Vec<String>>,
+
+    /// Optional external command to spawn after each tool call.
+    #[serde(default)]
+    pub after_tool_use: Option<Vec<String>>,
+
+    /// Behavior when an after_tool_use hook fails (`continue` or `abort`).
+    #[serde(default)]
+    pub after_tool_use_failure_behavior: Option<HookFailureBehavior>,
 
     /// System instructions.
     pub instructions: Option<String>,
@@ -2100,6 +2128,8 @@ impl Config {
             enforce_residency: enforce_residency.value,
             did_user_set_custom_approval_policy_or_sandbox_mode,
             notify: cfg.notify,
+            after_tool_use: cfg.after_tool_use,
+            after_tool_use_failure_behavior: cfg.after_tool_use_failure_behavior.unwrap_or_default(),
             user_instructions,
             base_instructions,
             personality,
@@ -4876,6 +4906,10 @@ model_verbosity = "high"
                 did_user_set_custom_approval_policy_or_sandbox_mode: true,
                 user_instructions: None,
                 notify: None,
+
+                after_tool_use: None,
+
+                after_tool_use_failure_behavior: HookFailureBehavior::Continue,
                 cwd: fixture.cwd(),
                 cli_auth_credentials_store_mode: Default::default(),
                 mcp_servers: Constrained::allow_any(HashMap::new()),
@@ -5004,6 +5038,10 @@ model_verbosity = "high"
             did_user_set_custom_approval_policy_or_sandbox_mode: true,
             user_instructions: None,
             notify: None,
+
+            after_tool_use: None,
+
+            after_tool_use_failure_behavior: HookFailureBehavior::Continue,
             cwd: fixture.cwd(),
             cli_auth_credentials_store_mode: Default::default(),
             mcp_servers: Constrained::allow_any(HashMap::new()),
@@ -5130,6 +5168,10 @@ model_verbosity = "high"
             did_user_set_custom_approval_policy_or_sandbox_mode: true,
             user_instructions: None,
             notify: None,
+
+            after_tool_use: None,
+
+            after_tool_use_failure_behavior: HookFailureBehavior::Continue,
             cwd: fixture.cwd(),
             cli_auth_credentials_store_mode: Default::default(),
             mcp_servers: Constrained::allow_any(HashMap::new()),
@@ -5242,6 +5284,10 @@ model_verbosity = "high"
             did_user_set_custom_approval_policy_or_sandbox_mode: true,
             user_instructions: None,
             notify: None,
+
+            after_tool_use: None,
+
+            after_tool_use_failure_behavior: HookFailureBehavior::Continue,
             cwd: fixture.cwd(),
             cli_auth_credentials_store_mode: Default::default(),
             mcp_servers: Constrained::allow_any(HashMap::new()),
