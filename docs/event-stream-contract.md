@@ -13,6 +13,63 @@ Codex interactive mode supports an explicit JSONL event stream contract intended
   - Pins schema parsing/serialization behavior to a supported version.
   - Currently supported: `1`, `2`.
   - Current default if omitted: `2`.
+- `--control-socket <absolute-path>`
+  - Binds a local Unix domain socket for programmatic control.
+  - Existing socket files at that path are removed only when they are actual sockets.
+  - Socket file permissions are set to `0600`.
+
+## Control Socket Contract
+
+The control socket accepts newline-delimited JSON request objects and returns one newline-delimited JSON response per request.
+
+### Request Envelope
+
+All requests include:
+
+- `request_id` (string, required): caller-supplied correlation/idempotency key.
+- `expected_epoch` (string, optional): if provided and mismatched, request is rejected with `stale_epoch`.
+- `command` (string, required): one of:
+  - `get_epoch`
+  - `submit_message`
+  - `submit_approval`
+  - `submit_user_input`
+  - `shutdown`
+
+### Command Payloads
+
+- `submit_message`
+  - `message` (string, required)
+  - `thread_id` (UUID string, optional)
+- `submit_approval`
+  - `id` (string, required)
+  - `decision` (string, required): `approved | approved_for_session | denied | abort`
+  - `approval_kind` (string, optional): `exec` (default) or `patch`
+  - `thread_id` (UUID string, optional)
+  - `turn_id` (string, optional, exec approvals only)
+- `submit_user_input`
+  - `id` (string, required)
+  - `response` (object, required): `RequestUserInputResponse` shape
+  - `thread_id` (UUID string, optional)
+- `shutdown`
+  - `immediate` (bool, optional, default `false`)
+
+### Response Envelope
+
+All responses include:
+
+- `request_id` (string)
+- `ok` (bool)
+- `epoch` (string)
+- `result` (object, present when `ok=true`)
+- `error` (object, present when `ok=false`)
+  - `code` (string)
+  - `message` (string)
+
+### Idempotency and Epoch Semantics
+
+- Duplicate `request_id` values return the cached original response.
+- `expected_epoch` can be used to detect reconnect/restart races.
+- Epoch values are process-scoped and change when a new interactive process starts.
 
 ## Record Shape
 

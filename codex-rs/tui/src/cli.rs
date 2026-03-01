@@ -122,6 +122,10 @@ pub struct Cli {
     )]
     pub event_schema_version: Option<u32>,
 
+    /// Bind a local control socket for programmatic request/response control.
+    #[arg(long = "control-socket", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub control_socket: Option<PathBuf>,
+
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 }
