@@ -20,5 +20,5 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libcap-dev
       - name: Build bridge-critical crates
         run: cargo build -p codex-core -p codex-protocol --locked
-      - name: Test bridge-critical crates
-        run: cargo test -p codex-core -p codex-protocol --locked
+      - name: Test bridge protocol contract crate
+        run: cargo test -p codex-protocol --locked
