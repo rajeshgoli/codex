@@ -49,3 +49,5 @@ Tag notes must include:
 - compatibility notes for Session Manager
 
 Session Manager pins explicit fork tags and schema version in provider metadata.
+
+Bootstrap verification commit: 2026-03-01
