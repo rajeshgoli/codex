@@ -1,0 +1,1 @@
+{"schema_version":2,"ts":"2026-03-01T00:00:00.000Z","session_id":"01957117-d96d-7f17-af57-af28ec451245","seq":42,"session_epoch":1,"event_type":"turn_started","payload":{"turn_id":"turn_001","model_context_window":128000,"collaboration_mode_kind":"none"}}
