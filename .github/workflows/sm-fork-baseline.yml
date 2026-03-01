@@ -1,0 +1,22 @@
+name: sm-fork-baseline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rust-core:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - name: Build bridge-critical crates
+        run: cargo build -p codex-core -p codex-protocol --locked
+      - name: Test bridge-critical crates
+        run: cargo test -p codex-core -p codex-protocol --locked
