@@ -156,7 +156,8 @@ impl SessionLogger {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        if event_type == "session_configured"
+        if session_id_override.is_none()
+            && event_type == "session_configured"
             && let Some(session_id) = payload.get("session_id").and_then(Value::as_str)
         {
             state.session_id = Some(session_id.to_string());
