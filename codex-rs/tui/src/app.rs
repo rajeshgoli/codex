@@ -909,6 +909,7 @@ impl App {
             None
         };
         self.active_thread_id = Some(thread_id);
+        crate::session_log::set_active_session_id(thread_id);
         self.active_thread_rx = receiver;
         self.refresh_pending_thread_approvals().await;
     }
@@ -1046,7 +1047,7 @@ impl App {
         let submitted = if self.active_thread_id == Some(thread_id) {
             self.chat_widget.submit_op(op)
         } else {
-            crate::session_log::log_outbound_op(&op);
+            crate::session_log::log_outbound_op(&op, Some(&thread_id));
             match self.server.get_thread(thread_id).await {
                 Ok(thread) => match thread.submit(op).await {
                     Ok(_) => true,
@@ -1314,6 +1315,7 @@ impl App {
         };
 
         self.active_thread_id = Some(thread_id);
+        crate::session_log::set_active_session_id(thread_id);
         self.active_thread_rx = Some(receiver);
 
         let init = self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());

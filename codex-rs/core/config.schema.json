@@ -1983,6 +1983,23 @@
       },
       "type": "array"
     },
+    "after_tool_use": {
+      "default": null,
+      "description": "Optional external command to spawn after each tool call.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "after_tool_use_failure_behavior": {
+      "default": "continue",
+      "description": "Behavior when an after_tool_use hook fails.",
+      "enum": [
+        "continue",
+        "abort"
+      ],
+      "type": "string"
+    },
     "oss_provider": {
       "description": "Preferred OSS provider for local models, e.g. \"lmstudio\" or \"ollama\".",
       "type": "string"
