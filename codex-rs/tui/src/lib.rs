@@ -578,7 +578,13 @@ async fn run_ratatui_app(
     }
 
     // Initialize session event logging if enabled.
-    session_log::maybe_init(&initial_config, &cli)?;
+    if let Err(err) = session_log::maybe_init(&initial_config, &cli) {
+        restore();
+        let _ = tui.terminal.clear();
+        return Ok(AppExitInfo::fatal(format!(
+            "Failed to initialize session event logging: {err}"
+        )));
+    }
 
     let auth_manager = AuthManager::shared(
         initial_config.codex_home.clone(),

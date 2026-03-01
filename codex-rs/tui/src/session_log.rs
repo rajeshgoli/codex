@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::IsTerminal;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -72,6 +73,12 @@ impl SessionLogger {
         validate_schema_version(schema_version)?;
 
         if target == "-" {
+            if std::io::stdout().is_terminal() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--event-stream - is not supported while rendering the interactive TUI to stdout; use a file path",
+                ));
+            }
             self.writer
                 .get_or_init(|| Mutex::new(Box::new(std::io::stdout())));
         } else {
