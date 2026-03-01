@@ -73,14 +73,15 @@ impl SessionLogger {
         validate_schema_version(schema_version)?;
 
         if target == "-" {
-            if std::io::stdout().is_terminal() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "--event-stream - is not supported while rendering the interactive TUI to stdout; use a file path",
-                ));
-            }
-            self.writer
-                .get_or_init(|| Mutex::new(Box::new(std::io::stdout())));
+            // Interactive TUI rendering owns stdout when attached to a TTY.
+            // Route stream records to stderr in that mode to avoid mixing
+            // JSONL with terminal control output.
+            let stream: Box<dyn Write + Send> = if std::io::stdout().is_terminal() {
+                Box::new(std::io::stderr())
+            } else {
+                Box::new(std::io::stdout())
+            };
+            self.writer.get_or_init(|| Mutex::new(stream));
         } else {
             let mut opts = OpenOptions::new();
             opts.create(true).truncate(true).write(true);

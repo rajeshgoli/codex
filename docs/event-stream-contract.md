@@ -6,8 +6,9 @@ Codex interactive mode supports an explicit JSONL event stream contract intended
 
 - `--event-stream <path-or-stdout>`
   - Writes newline-delimited JSON records to a file path.
-  - Use `-` to emit records to stdout when stdout is not a TTY.
-  - In interactive TUI mode, stdout is reserved for terminal rendering, so `-` is rejected.
+  - Use `-` to emit records to stdio:
+    - non-TTY stdout: stream writes to stdout
+    - interactive TTY stdout: stream writes to stderr to avoid mixing JSONL with TUI control output
 - `--event-schema-version <int>`
   - Pins schema parsing/serialization behavior to a supported version.
   - Currently supported: `1`, `2`.
