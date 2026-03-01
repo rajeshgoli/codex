@@ -148,10 +148,6 @@ impl SessionLogger {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        if let Some(session_id) = session_id_override {
-            state.session_id = Some(session_id);
-        }
-
         if event_type == "session_configured"
             && let Some(session_id) = payload.get("session_id").and_then(Value::as_str)
         {
@@ -159,9 +155,8 @@ impl SessionLogger {
         }
 
         state.seq += 1;
-        let session_id = state
-            .session_id
-            .clone()
+        let session_id = session_id_override
+            .or_else(|| state.session_id.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
         let record = match state.schema_version {
@@ -201,6 +196,7 @@ impl SessionLogger {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
+        let event_type = normalize_contract_event_type(&event_type);
 
         if let Some(obj) = payload.as_object_mut() {
             obj.remove("type");
@@ -233,6 +229,14 @@ fn validate_schema_version(schema_version: u32) -> std::io::Result<()> {
             "unsupported event schema version `{schema_version}`; supported versions are {EVENT_SCHEMA_V1} and {EVENT_SCHEMA_V2}"
         ),
     ))
+}
+
+fn normalize_contract_event_type(event_type: &str) -> String {
+    match event_type {
+        "task_started" => "turn_started".to_string(),
+        "task_complete" => "turn_complete".to_string(),
+        _ => event_type.to_string(),
+    }
 }
 
 pub(crate) fn maybe_init(config: &Config, cli: &Cli) -> std::io::Result<()> {
@@ -282,7 +286,10 @@ pub(crate) fn maybe_init(config: &Config, cli: &Cli) -> std::io::Result<()> {
         p
     };
 
-    LOGGER.open_legacy(path)?;
+    if let Err(err) = LOGGER.open_legacy(path.clone()) {
+        tracing::error!("failed to open session log {:?}: {}", path, err);
+        return Ok(());
+    }
 
     LOGGER.write_json_line(&json!({
         "ts": now_ts(),
@@ -426,6 +433,7 @@ mod tests {
     use super::EVENT_SCHEMA_CURRENT;
     use super::EVENT_SCHEMA_V1;
     use super::EVENT_SCHEMA_V2;
+    use super::normalize_contract_event_type;
     use super::validate_schema_version;
 
     fn assert_common_fields(record: &Value) {
@@ -463,5 +471,12 @@ mod tests {
         assert!(validate_schema_version(EVENT_SCHEMA_V2 + 1).is_err());
         assert!(validate_schema_version(EVENT_SCHEMA_V1).is_ok());
         assert!(validate_schema_version(EVENT_SCHEMA_V2).is_ok());
+    }
+
+    #[test]
+    fn normalizes_legacy_turn_event_names() {
+        assert_eq!(normalize_contract_event_type("task_started"), "turn_started");
+        assert_eq!(normalize_contract_event_type("task_complete"), "turn_complete");
+        assert_eq!(normalize_contract_event_type("exec_command_begin"), "exec_command_begin");
     }
 }
