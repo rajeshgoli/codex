@@ -413,6 +413,14 @@ pub(crate) enum AppEvent {
         collaboration_mode: CollaborationModeMask,
     },
 
+    /// Submit a plain user message without altering collaboration mode.
+    ///
+    /// Used by programmatic control paths (for example control-socket injection)
+    /// that should be deterministic while still rendering the message in the UI.
+    SubmitExternalUserMessage {
+        text: String,
+    },
+
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),
 

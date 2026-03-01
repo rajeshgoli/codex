@@ -318,7 +318,7 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                 )
             } else {
                 match parse_thread_id(thread_id) {
-                    Ok(thread_id) => {
+                    Ok(Some(thread_id)) => {
                         let op = Op::UserInput {
                             items: vec![UserInput::Text {
                                 text: message,
@@ -326,7 +326,7 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                             }],
                             final_output_json_schema: None,
                         };
-                        match dispatch_op(state, thread_id, op) {
+                        match dispatch_op(state, Some(thread_id), op) {
                             Ok(()) => response_ok(
                                 &request_id,
                                 &state.epoch,
@@ -340,6 +340,22 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                             ),
                         }
                     }
+                    Ok(None) => match dispatch_app_event(
+                        state,
+                        AppEvent::SubmitExternalUserMessage { text: message },
+                    ) {
+                        Ok(()) => response_ok(
+                            &request_id,
+                            &state.epoch,
+                            json!({"status": "accepted", "operation": "submit_message"}),
+                        ),
+                        Err(err) => response_err(
+                            &request_id,
+                            &state.epoch,
+                            "event_channel_closed",
+                            err,
+                        ),
+                    },
                     Err(err) => response_err(
                         &request_id,
                         &state.epoch,
@@ -743,8 +759,8 @@ mod tests {
         assert_eq!(first.epoch, second.epoch);
 
         match rx.try_recv() {
-            Ok(AppEvent::CodexOp(Op::UserInput { .. })) => {}
-            other => panic!("expected one CodexOp user input event, got {other:?}"),
+            Ok(AppEvent::SubmitExternalUserMessage { text }) => assert_eq!(text, "hello"),
+            other => panic!("expected one external user message event, got {other:?}"),
         }
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
