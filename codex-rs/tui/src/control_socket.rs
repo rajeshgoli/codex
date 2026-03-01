@@ -489,8 +489,30 @@ fn remove_existing_socket_if_safe(path: &Path) -> std::io::Result<()> {
     }
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_socket() {
-        fs::remove_file(path)?;
-        return Ok(());
+        match UnixStream::connect(path) {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("control socket is already active at {}", path.display()),
+                ));
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::ConnectionRefused
+                    || err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                fs::remove_file(path)?;
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "control socket path exists and could not be verified as stale ({}): {err}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
