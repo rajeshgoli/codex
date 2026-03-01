@@ -577,8 +577,8 @@ async fn run_ratatui_app(
         }
     }
 
-    // Initialize high-fidelity session event logging if enabled.
-    session_log::maybe_init(&initial_config);
+    // Initialize session event logging if enabled.
+    session_log::maybe_init(&initial_config, &cli)?;
 
     let auth_manager = AuthManager::shared(
         initial_config.codex_home.clone(),
