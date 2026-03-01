@@ -267,12 +267,9 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
         );
     }
 
-    if let Some(cached) = state
-        .cache
-        .lock()
-        .expect("control cache lock poisoned")
-        .get(&request.request_id)
-    {
+    let request_id = request.request_id.clone();
+    let mut cache = state.cache.lock().expect("control cache lock poisoned");
+    if let Some(cached) = cache.get(&request_id) {
         return cached;
     }
 
@@ -288,17 +285,13 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                 state.epoch
             ),
         );
-        state
-            .cache
-            .lock()
-            .expect("control cache lock poisoned")
-            .insert(request.request_id, response.clone());
+        cache.insert(request_id, response.clone());
         return response;
     }
 
     let response = match request.command {
         ControlCommand::GetEpoch => response_ok(
-            &request.request_id,
+            &request_id,
             &state.epoch,
             json!({
                 "epoch": state.epoch,
@@ -307,7 +300,7 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
         ControlCommand::SubmitMessage { message, thread_id } => {
             if message.trim().is_empty() {
                 response_err(
-                    &request.request_id,
+                    &request_id,
                     &state.epoch,
                     "invalid_request",
                     "message must be non-empty",
@@ -324,12 +317,12 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                         };
                         match dispatch_op(state, thread_id, op) {
                             Ok(()) => response_ok(
-                                &request.request_id,
+                                &request_id,
                                 &state.epoch,
                                 json!({"status": "accepted", "operation": "submit_message"}),
                             ),
                             Err(err) => response_err(
-                                &request.request_id,
+                                &request_id,
                                 &state.epoch,
                                 "event_channel_closed",
                                 err,
@@ -337,7 +330,7 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                         }
                     }
                     Err(err) => response_err(
-                        &request.request_id,
+                        &request_id,
                         &state.epoch,
                         "invalid_request",
                         err,
@@ -364,12 +357,12 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                     };
                     match dispatch_op(state, thread_id, op) {
                         Ok(()) => response_ok(
-                            &request.request_id,
+                            &request_id,
                             &state.epoch,
                             json!({"status": "accepted", "operation": "submit_approval"}),
                         ),
                         Err(err) => response_err(
-                            &request.request_id,
+                            &request_id,
                             &state.epoch,
                             "event_channel_closed",
                             err,
@@ -377,14 +370,14 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                     }
                 }
                 None => response_err(
-                    &request.request_id,
+                    &request_id,
                     &state.epoch,
                     "invalid_request",
                     "decision must be one of: approved, approved_for_session, denied, abort",
                 ),
             },
             Err(err) => response_err(
-                &request.request_id,
+                &request_id,
                 &state.epoch,
                 "invalid_request",
                 err,
@@ -403,12 +396,12 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                     };
                     match dispatch_op(state, thread_id, op) {
                         Ok(()) => response_ok(
-                            &request.request_id,
+                            &request_id,
                             &state.epoch,
                             json!({"status": "accepted", "operation": "submit_user_input"}),
                         ),
                         Err(err) => response_err(
-                            &request.request_id,
+                            &request_id,
                             &state.epoch,
                             "event_channel_closed",
                             err,
@@ -416,14 +409,14 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                     }
                 }
                 Err(err) => response_err(
-                    &request.request_id,
+                    &request_id,
                     &state.epoch,
                     "invalid_request",
                     format!("response is invalid: {err}"),
                 ),
             },
             Err(err) => response_err(
-                &request.request_id,
+                &request_id,
                 &state.epoch,
                 "invalid_request",
                 err,
@@ -437,12 +430,12 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
             };
             match dispatch_app_event(state, AppEvent::Exit(exit_mode)) {
                 Ok(()) => response_ok(
-                    &request.request_id,
+                    &request_id,
                     &state.epoch,
                     json!({"status": "accepted", "operation": "shutdown", "immediate": immediate}),
                 ),
                 Err(err) => response_err(
-                    &request.request_id,
+                    &request_id,
                     &state.epoch,
                     "event_channel_closed",
                     err,
@@ -451,11 +444,7 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
         }
     };
 
-    state
-        .cache
-        .lock()
-        .expect("control cache lock poisoned")
-        .insert(request.request_id, response.clone());
+    cache.insert(request_id, response.clone());
     response
 }
 
