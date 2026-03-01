@@ -381,7 +381,7 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
     }
 }
 
-pub(crate) fn log_outbound_op(op: &Op) {
+pub(crate) fn log_outbound_op(op: &Op, thread_id_override: Option<&ThreadId>) {
     if !LOGGER.is_enabled() {
         return;
     }
@@ -395,7 +395,11 @@ pub(crate) fn log_outbound_op(op: &Op) {
                     return;
                 }
             };
-            LOGGER.write_event_stream_record("op_submitted", payload, None);
+            LOGGER.write_event_stream_record(
+                "op_submitted",
+                payload,
+                thread_id_override.map(ToString::to_string),
+            );
         }
         Some(LogMode::Legacy) => write_legacy_record("from_tui", "op", op),
         None => {}

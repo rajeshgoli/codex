@@ -1046,7 +1046,7 @@ impl App {
         let submitted = if self.active_thread_id == Some(thread_id) {
             self.chat_widget.submit_op(op)
         } else {
-            crate::session_log::log_outbound_op(&op);
+            crate::session_log::log_outbound_op(&op, Some(&thread_id));
             match self.server.get_thread(thread_id).await {
                 Ok(thread) => match thread.submit(op).await {
                     Ok(_) => true,
