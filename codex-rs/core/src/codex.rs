@@ -1513,6 +1513,11 @@ impl Session {
             ),
             hooks: Hooks::new(HooksConfig {
                 legacy_notify_argv: config.notify.clone(),
+                after_tool_use_argv: config.after_tool_use.clone(),
+                after_tool_use_abort_on_failure: matches!(
+                    config.after_tool_use_failure_behavior,
+                    crate::config::HookFailureBehavior::Abort
+                ),
             }),
             rollout: Mutex::new(rollout_recorder),
             user_shell: Arc::new(default_shell),
@@ -8451,6 +8456,11 @@ mod tests {
             ),
             hooks: Hooks::new(HooksConfig {
                 legacy_notify_argv: config.notify.clone(),
+                after_tool_use_argv: config.after_tool_use.clone(),
+                after_tool_use_abort_on_failure: matches!(
+                    config.after_tool_use_failure_behavior,
+                    crate::config::HookFailureBehavior::Abort
+                ),
             }),
             rollout: Mutex::new(None),
             user_shell: Arc::new(default_user_shell()),
@@ -8823,6 +8833,11 @@ mod tests {
             ),
             hooks: Hooks::new(HooksConfig {
                 legacy_notify_argv: config.notify.clone(),
+                after_tool_use_argv: config.after_tool_use.clone(),
+                after_tool_use_abort_on_failure: matches!(
+                    config.after_tool_use_failure_behavior,
+                    crate::config::HookFailureBehavior::Abort
+                ),
             }),
             rollout: Mutex::new(None),
             user_shell: Arc::new(default_user_shell()),

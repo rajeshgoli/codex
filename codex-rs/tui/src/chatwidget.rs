@@ -8028,7 +8028,7 @@ impl ChatWidget {
     /// Forward an `Op` directly to codex.
     pub(crate) fn submit_op(&mut self, op: Op) -> bool {
         // Record outbound operation for session replay fidelity.
-        crate::session_log::log_outbound_op(&op);
+        crate::session_log::log_outbound_op(&op, None);
         if matches!(&op, Op::Review { .. }) && !self.bottom_pane.is_task_running() {
             self.bottom_pane.set_task_running(true);
         }
