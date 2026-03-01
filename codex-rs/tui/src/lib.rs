@@ -112,6 +112,7 @@ mod clipboard_copy;
 mod clipboard_paste;
 mod collaboration_modes;
 mod color;
+mod control_socket;
 pub(crate) mod custom_terminal;
 pub use custom_terminal::Terminal;
 mod cwd_prompt;
@@ -1401,6 +1402,7 @@ async fn run_ratatui_app(
         prompt,
         shared,
         no_alt_screen,
+        control_socket,
         ..
     } = cli;
     let images = shared.into_inner().images;
@@ -1442,6 +1444,7 @@ async fn run_ratatui_app(
         prompt,
         images,
         session_selection,
+        control_socket,
         feedback,
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
         should_show_trust_screen_flag, // Preserve the startup-time trust NUX signal before onboarding

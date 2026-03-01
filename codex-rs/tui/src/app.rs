@@ -643,6 +643,7 @@ impl App {
         initial_prompt: Option<String>,
         initial_images: Vec<PathBuf>,
         session_selection: SessionSelection,
+        control_socket: Option<PathBuf>,
         feedback: codex_feedback::CodexFeedback,
         is_first_run: bool,
         entered_trust_nux: bool,
@@ -985,6 +986,13 @@ impl App {
         #[cfg(debug_assertions)]
         let pre_loop_exit_reason: Option<ExitReason> = None;
 
+        let mut control_socket_handle = control_socket
+            .map(|socket_path| {
+                crate::control_socket::ControlSocketHandle::start(socket_path, app_event_tx.clone())
+            })
+            .transpose()
+            .wrap_err("failed to initialize control socket")?;
+
         let exit_reason_result = if let Some(exit_reason) = pre_loop_exit_reason {
             Ok(exit_reason)
         } else {
@@ -1049,6 +1057,9 @@ impl App {
                 }
             }
         };
+        if let Some(mut handle) = control_socket_handle.take() {
+            handle.shutdown();
+        }
         if let Err(err) = app_server.shutdown().await {
             tracing::warn!(error = %err, "failed to shut down embedded app server");
         }
