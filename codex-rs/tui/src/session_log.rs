@@ -382,6 +382,27 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
     }
 }
 
+pub(crate) fn set_active_session_id(thread_id: ThreadId) {
+    if !LOGGER.is_enabled() {
+        return;
+    }
+
+    if !matches!(LOGGER.mode(), Some(LogMode::EventStream)) {
+        return;
+    }
+
+    let Some(state_mutex) = LOGGER.event_stream_state.get() else {
+        return;
+    };
+
+    let mut state = match state_mutex.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    state.session_id = Some(thread_id.to_string());
+}
+
 pub(crate) fn log_outbound_op(op: &Op, thread_id_override: Option<&ThreadId>) {
     if !LOGGER.is_enabled() {
         return;
