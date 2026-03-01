@@ -1071,8 +1071,14 @@ async fn run_ratatui_app(
         }
     }
 
-    // Initialize high-fidelity session event logging if enabled.
-    session_log::maybe_init(&initial_config);
+    // Initialize session event logging if enabled.
+    if let Err(err) = session_log::maybe_init(&initial_config, &cli) {
+        restore();
+        let _ = tui.terminal.clear();
+        return Ok(AppExitInfo::fatal(format!(
+            "Failed to initialize session event logging: {err}"
+        )));
+    }
 
     let mut app_server = Some(
         match start_app_server(
