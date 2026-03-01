@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::sync::atomic::AtomicUsize;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -44,6 +45,8 @@ use std::os::unix::net::UnixStream;
 
 const REQUEST_CACHE_CAPACITY: usize = 2048;
 const REQUEST_MAX_CHARS: usize = 1 << 20;
+const REQUEST_ID_MAX_CHARS: usize = 256;
+const MAX_CONNECTION_WORKERS: usize = 64;
 
 pub(crate) struct ControlSocketHandle {
     shutdown: Arc<AtomicBool>,
@@ -264,6 +267,14 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
             &state.epoch,
             "invalid_request",
             "request_id must be a non-empty string",
+        );
+    }
+    if request.request_id.len() > REQUEST_ID_MAX_CHARS {
+        return response_err(
+            "",
+            &state.epoch,
+            "invalid_request",
+            format!("request_id exceeds max length of {REQUEST_ID_MAX_CHARS} characters"),
         );
     }
 
@@ -525,11 +536,22 @@ fn remove_existing_socket_if_safe(path: &Path) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn run_listener_loop(listener: UnixListener, state: Arc<ControlState>, shutdown: Arc<AtomicBool>) {
+    let active_workers = Arc::new(AtomicUsize::new(0));
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
+                if active_workers.load(Ordering::Acquire) >= MAX_CONNECTION_WORKERS {
+                    tracing::warn!(
+                        "control socket worker limit reached ({}); dropping connection",
+                        MAX_CONNECTION_WORKERS
+                    );
+                    drop(stream);
+                    continue;
+                }
+                active_workers.fetch_add(1, Ordering::AcqRel);
                 let connection_state = Arc::clone(&state);
                 let connection_shutdown = Arc::clone(&shutdown);
+                let connection_workers = Arc::clone(&active_workers);
                 if let Err(err) = std::thread::Builder::new()
                     .name("codex-control-conn".to_string())
                     .spawn(move || {
@@ -538,8 +560,10 @@ fn run_listener_loop(listener: UnixListener, state: Arc<ControlState>, shutdown:
                         {
                             tracing::warn!("control socket connection error: {err}");
                         }
+                        connection_workers.fetch_sub(1, Ordering::AcqRel);
                     })
                 {
+                    active_workers.fetch_sub(1, Ordering::AcqRel);
                     tracing::warn!("failed to spawn control socket worker: {err}");
                 }
             }
