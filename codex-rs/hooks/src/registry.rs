@@ -23,6 +23,8 @@ pub struct HooksConfig {
     pub config_layer_stack: Option<ConfigLayerStack>,
     pub shell_program: Option<String>,
     pub shell_args: Vec<String>,
+    pub after_tool_use_argv: Option<Vec<String>>,
+    pub after_tool_use_abort_on_failure: bool,
 }
 
 #[derive(Clone)]
@@ -54,9 +56,15 @@ impl Hooks {
                 args: config.shell_args,
             },
         );
+        let after_tool_use = config
+            .after_tool_use_argv
+            .filter(|argv| !argv.is_empty() && !argv[0].is_empty())
+            .map(|argv| crate::after_tool_use_hook(argv, config.after_tool_use_abort_on_failure))
+            .into_iter()
+            .collect();
         Self {
             after_agent,
-            after_tool_use: Vec::new(),
+            after_tool_use,
             engine,
         }
     }

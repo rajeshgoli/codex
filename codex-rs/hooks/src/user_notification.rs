@@ -77,6 +77,48 @@ pub fn notify_hook(argv: Vec<String>) -> Hook {
     }
 }
 
+pub fn after_tool_use_hook(argv: Vec<String>, abort_on_failure: bool) -> Hook {
+    let argv = Arc::new(argv);
+    Hook {
+        name: "after_tool_use".to_string(),
+        func: Arc::new(move |payload: &HookPayload| {
+            let argv = Arc::clone(&argv);
+            Box::pin(async move {
+                let mut command = match command_from_argv(&argv) {
+                    Some(command) => command,
+                    None => return HookResult::Success,
+                };
+                let payload_json = match serde_json::to_string(payload) {
+                    Ok(value) => value,
+                    Err(err) => return failure_result(abort_on_failure, err.into()),
+                };
+                command.arg(payload_json);
+                command
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+
+                match command.status().await {
+                    Ok(status) if status.success() => HookResult::Success,
+                    Ok(status) => failure_result(
+                        abort_on_failure,
+                        std::io::Error::other(format!("hook exited with status {status}")).into(),
+                    ),
+                    Err(err) => failure_result(abort_on_failure, err.into()),
+                }
+            })
+        }),
+    }
+}
+
+fn failure_result(abort_on_failure: bool, err: Box<dyn std::error::Error + Send + Sync>) -> HookResult {
+    if abort_on_failure {
+        HookResult::FailedAbort(err)
+    } else {
+        HookResult::FailedContinue(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Result;

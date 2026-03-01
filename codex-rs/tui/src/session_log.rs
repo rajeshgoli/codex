@@ -156,7 +156,8 @@ impl SessionLogger {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        if event_type == "session_configured"
+        if session_id_override.is_none()
+            && event_type == "session_configured"
             && let Some(session_id) = payload.get("session_id").and_then(Value::as_str)
         {
             state.session_id = Some(session_id.to_string());
@@ -381,7 +382,28 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
     }
 }
 
-pub(crate) fn log_outbound_op(op: &Op) {
+pub(crate) fn set_active_session_id(thread_id: ThreadId) {
+    if !LOGGER.is_enabled() {
+        return;
+    }
+
+    if !matches!(LOGGER.mode(), Some(LogMode::EventStream)) {
+        return;
+    }
+
+    let Some(state_mutex) = LOGGER.event_stream_state.get() else {
+        return;
+    };
+
+    let mut state = match state_mutex.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    state.session_id = Some(thread_id.to_string());
+}
+
+pub(crate) fn log_outbound_op(op: &Op, thread_id_override: Option<&ThreadId>) {
     if !LOGGER.is_enabled() {
         return;
     }
@@ -395,7 +417,11 @@ pub(crate) fn log_outbound_op(op: &Op) {
                     return;
                 }
             };
-            LOGGER.write_event_stream_record("op_submitted", payload, None);
+            LOGGER.write_event_stream_record(
+                "op_submitted",
+                payload,
+                thread_id_override.map(ToString::to_string),
+            );
         }
         Some(LogMode::Legacy) => write_legacy_record("from_tui", "op", op),
         None => {}

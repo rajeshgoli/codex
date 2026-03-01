@@ -1813,6 +1813,11 @@ impl Session {
             config_layer_stack: Some(config.config_layer_stack.clone()),
             shell_program: Some(hook_shell_program),
             shell_args: hook_shell_argv,
+            after_tool_use_argv: config.after_tool_use.clone(),
+            after_tool_use_abort_on_failure: matches!(
+                config.after_tool_use_failure_behavior,
+                crate::config::HookFailureBehavior::Abort
+            ),
         });
         for warning in hooks.startup_warnings() {
             post_session_configured_events.push(Event {
