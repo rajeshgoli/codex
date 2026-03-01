@@ -96,7 +96,7 @@ impl ControlSocketHandle {
                 .name("codex-control-socket".to_string())
                 .spawn(move || {
                     run_listener_loop(listener, state, shutdown_for_thread);
-                    if let Err(err) = fs::remove_file(&socket_path_for_thread) {
+                    if let Err(err) = remove_socket_file_if_socket(&socket_path_for_thread) {
                         tracing::debug!(
                             "control socket cleanup ignored for {}: {err}",
                             socket_path_for_thread.display()
@@ -119,6 +119,14 @@ impl ControlSocketHandle {
         {
             tracing::debug!("control socket thread join failed: {err:?}");
         }
+        #[cfg(unix)]
+        if let Err(err) = remove_socket_file_if_socket(&self.socket_path) {
+            tracing::debug!(
+                "control socket post-shutdown cleanup ignored for {}: {err}",
+                self.socket_path.display()
+            );
+        }
+        #[cfg(not(unix))]
         if let Err(err) = std::fs::remove_file(&self.socket_path) {
             tracing::debug!(
                 "control socket post-shutdown cleanup ignored for {}: {err}",
@@ -342,7 +350,7 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                     }
                     Ok(None) => match dispatch_app_event(
                         state,
-                        AppEvent::SubmitExternalUserMessage { text: message },
+                        AppEvent::SubmitExternalLiteralUserMessage { text: message },
                     ) {
                         Ok(()) => response_ok(
                             &request_id,
@@ -548,6 +556,27 @@ fn remove_existing_socket_if_safe(path: &Path) -> std::io::Result<()> {
             path.display()
         ),
     ))
+}
+
+#[cfg(unix)]
+fn remove_socket_file_if_socket(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_socket() {
+                fs::remove_file(path)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to remove non-socket path: {}",
+                        path.display()
+                    ),
+                ))
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(unix)]
@@ -759,7 +788,9 @@ mod tests {
         assert_eq!(first.epoch, second.epoch);
 
         match rx.try_recv() {
-            Ok(AppEvent::SubmitExternalUserMessage { text }) => assert_eq!(text, "hello"),
+            Ok(AppEvent::SubmitExternalLiteralUserMessage { text }) => {
+                assert_eq!(text, "hello")
+            }
             other => panic!("expected one external user message event, got {other:?}"),
         }
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));

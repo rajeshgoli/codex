@@ -7515,20 +7515,35 @@ impl ChatWidget {
         }
     }
 
-    pub(crate) fn submit_external_user_message(&mut self, text: String) {
-        let should_queue = self.is_plan_streaming_in_tui();
-        let user_message = UserMessage {
-            text,
-            local_images: Vec::new(),
-            remote_image_urls: Vec::new(),
-            text_elements: Vec::new(),
-            mention_bindings: Vec::new(),
-        };
-        if should_queue {
-            self.queue_user_message(user_message);
-        } else {
-            self.submit_user_message(user_message);
+    pub(crate) fn submit_external_literal_user_message(&mut self, text: String) {
+        if text.is_empty() {
+            return;
         }
+
+        let submitted = self.submit_op(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: text.clone(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        });
+        if !submitted {
+            return;
+        }
+
+        self.last_rendered_user_message_event = Some(Self::rendered_user_message_event_from_parts(
+            text.clone(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        self.add_to_history(history_cell::new_user_prompt(
+            text,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        self.needs_final_message_separator = false;
     }
 
     /// True when the UI is in the regular composer state with no running task,

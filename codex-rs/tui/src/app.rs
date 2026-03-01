@@ -3079,8 +3079,8 @@ impl App {
                 self.chat_widget
                     .submit_user_message_with_mode(text, collaboration_mode);
             }
-            AppEvent::SubmitExternalUserMessage { text } => {
-                self.chat_widget.submit_external_user_message(text);
+            AppEvent::SubmitExternalLiteralUserMessage { text } => {
+                self.chat_widget.submit_external_literal_user_message(text);
             }
             AppEvent::ManageSkillsClosed => {
                 self.chat_widget.handle_manage_skills_closed();

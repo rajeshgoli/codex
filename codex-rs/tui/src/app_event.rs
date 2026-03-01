@@ -413,11 +413,11 @@ pub(crate) enum AppEvent {
         collaboration_mode: CollaborationModeMask,
     },
 
-    /// Submit a plain user message without altering collaboration mode.
+    /// Submit a plain user message from an external control path.
     ///
-    /// Used by programmatic control paths (for example control-socket injection)
-    /// that should be deterministic while still rendering the message in the UI.
-    SubmitExternalUserMessage {
+    /// This preserves literal message semantics (for example leading `!` remains
+    /// text) while still rendering the injected input in the transcript.
+    SubmitExternalLiteralUserMessage {
         text: String,
     },
 
