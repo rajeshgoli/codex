@@ -413,6 +413,14 @@ pub(crate) enum AppEvent {
         collaboration_mode: CollaborationModeMask,
     },
 
+    /// Submit a plain user message from an external control path.
+    ///
+    /// This preserves literal message semantics (for example leading `!` remains
+    /// text) while still rendering the injected input in the transcript.
+    SubmitExternalLiteralUserMessage {
+        text: String,
+    },
+
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),
 
