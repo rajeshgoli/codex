@@ -2,21 +2,26 @@
 Runtime: shell
 
 Executes shell requests under the orchestrator: asks for approval when needed,
-builds a CommandSpec, and runs it under the current SandboxAttempt.
+builds sandbox transform inputs, and runs them under the current SandboxAttempt.
 */
 #[cfg(unix)]
-mod unix_escalation;
+pub(crate) mod unix_escalation;
+pub(crate) mod zsh_fork_backend;
 
 use crate::command_canonicalization::canonicalize_command_for_approval;
+use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecToolCallOutput;
-use crate::features::Feature;
+use crate::guardian::GuardianApprovalRequest;
+use crate::guardian::review_approval_request;
+use crate::guardian::routes_approval_to_guardian;
 use crate::powershell::prefix_powershell_script_with_utf8;
+use crate::sandboxing::ExecOptions;
 use crate::sandboxing::SandboxPermissions;
 use crate::sandboxing::execute_env;
 use crate::shell::ShellType;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
-use crate::tools::runtimes::build_command_spec;
+use crate::tools::runtimes::build_sandbox_command;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalCtx;
@@ -24,7 +29,6 @@ use crate::tools::sandboxing::ExecApprovalRequirement;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::SandboxOverride;
 use crate::tools::sandboxing::Sandboxable;
-use crate::tools::sandboxing::SandboxablePreference;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
@@ -33,6 +37,7 @@ use crate::tools::sandboxing::with_cached_approval;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
+use codex_sandboxing::SandboxablePreference;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -47,6 +52,8 @@ pub struct ShellRequest {
     pub network: Option<NetworkProxy>,
     pub sandbox_permissions: SandboxPermissions,
     pub additional_permissions: Option<PermissionProfile>,
+    #[cfg(unix)]
+    pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
 }
@@ -80,7 +87,6 @@ pub(crate) enum ShellRuntimeBackend {
 
 #[derive(Default)]
 pub struct ShellRuntime {
-    #[cfg_attr(not(unix), allow(dead_code))]
     backend: ShellRuntimeBackend,
 }
 
@@ -141,21 +147,35 @@ impl Approvable<ShellRequest> for ShellRuntime {
         let keys = self.approval_keys(req);
         let command = req.command.clone();
         let cwd = req.cwd.clone();
-        let reason = ctx
-            .retry_reason
-            .clone()
-            .or_else(|| req.justification.clone());
+        let retry_reason = ctx.retry_reason.clone();
+        let reason = retry_reason.clone().or_else(|| req.justification.clone());
         let session = ctx.session;
         let turn = ctx.turn;
         let call_id = ctx.call_id.to_string();
         Box::pin(async move {
+            if routes_approval_to_guardian(turn) {
+                return review_approval_request(
+                    session,
+                    turn,
+                    GuardianApprovalRequest::Shell {
+                        id: call_id,
+                        command,
+                        cwd,
+                        sandbox_permissions: req.sandbox_permissions,
+                        additional_permissions: req.additional_permissions.clone(),
+                        justification: req.justification.clone(),
+                    },
+                    retry_reason,
+                )
+                .await;
+            }
             with_cached_approval(&session.services, "shell", keys, move || async move {
                 let available_decisions = None;
                 session
                     .request_command_approval(
                         turn,
                         call_id,
-                        None,
+                        /*approval_id*/ None,
                         command,
                         cwd,
                         reason,
@@ -164,6 +184,7 @@ impl Approvable<ShellRequest> for ShellRuntime {
                             .proposed_execpolicy_amendment()
                             .cloned(),
                         req.additional_permissions.clone(),
+                        /*skill_metadata*/ None,
                         available_decisions,
                     )
                     .await
@@ -207,17 +228,14 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             &req.cwd,
             &req.explicit_env_overrides,
         );
-        let command = if matches!(session_shell.shell_type, ShellType::PowerShell)
-            && ctx.session.features().enabled(Feature::PowershellUtf8)
-        {
+        let command = if matches!(session_shell.shell_type, ShellType::PowerShell) {
             prefix_powershell_script_with_utf8(&command)
         } else {
             command
         };
 
-        #[cfg(unix)]
         if self.backend == ShellRuntimeBackend::ShellCommandZshFork {
-            match unix_escalation::try_run_zsh_fork(req, attempt, ctx, &command).await? {
+            match zsh_fork_backend::maybe_run_shell_command(req, attempt, ctx, &command).await? {
                 Some(out) => return Ok(out),
                 None => {
                     tracing::warn!(
@@ -227,17 +245,18 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             }
         }
 
-        let spec = build_command_spec(
+        let command = build_sandbox_command(
             &command,
             &req.cwd,
             &req.env,
-            req.timeout_ms.into(),
-            req.sandbox_permissions,
             req.additional_permissions.clone(),
-            req.justification.clone(),
         )?;
+        let options = ExecOptions {
+            expiration: req.timeout_ms.into(),
+            capture_policy: ExecCapturePolicy::ShellTool,
+        };
         let env = attempt
-            .env_for(spec, req.network.as_ref())
+            .env_for(command, options, req.network.as_ref())
             .map_err(|err| ToolError::Codex(err.into()))?;
         let out = execute_env(env, Self::stdout_stream(ctx))
             .await

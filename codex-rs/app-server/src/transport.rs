@@ -4,6 +4,23 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingError;
 use crate::outgoing_message::OutgoingMessage;
+use crate::outgoing_message::QueuedOutgoingMessage;
+use axum::Router;
+use axum::body::Body;
+use axum::extract::ConnectInfo;
+use axum::extract::State;
+use axum::extract::ws::Message as WebSocketMessage;
+use axum::extract::ws::WebSocket;
+use axum::extract::ws::WebSocketUpgrade;
+use axum::http::Request;
+use axum::http::StatusCode;
+use axum::http::header::ORIGIN;
+use axum::middleware;
+use axum::middleware::Next;
+use axum::response::IntoResponse;
+use axum::response::Response;
+use axum::routing::any;
+use axum::routing::get;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::ServerRequest;
@@ -28,12 +45,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::io::{self};
 use tokio::net::TcpListener;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_tungstenite::accept_async_with_config;
-use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::error;
@@ -55,9 +68,15 @@ fn print_websocket_startup_banner(addr: SocketAddr) {
     let title = colorize("codex app-server (WebSockets)", Style::new().bold().cyan());
     let listening_label = colorize("listening on:", Style::new().dimmed());
     let listen_url = colorize(&format!("ws://{addr}"), Style::new().green());
+    let ready_label = colorize("readyz:", Style::new().dimmed());
+    let ready_url = colorize(&format!("http://{addr}/readyz"), Style::new().green());
+    let health_label = colorize("healthz:", Style::new().dimmed());
+    let health_url = colorize(&format!("http://{addr}/healthz"), Style::new().green());
     let note_label = colorize("note:", Style::new().dimmed());
     eprintln!("{title}");
     eprintln!("  {listening_label} {listen_url}");
+    eprintln!("  {ready_label} {ready_url}");
+    eprintln!("  {health_label} {health_url}");
     if addr.ip().is_loopback() {
         eprintln!(
             "  {note_label} binds localhost only (use SSH port-forwarding for remote access)"
@@ -67,6 +86,44 @@ fn print_websocket_startup_banner(addr: SocketAddr) {
             "  {note_label} this is a raw WS server; consider running behind TLS/auth for real remote use"
         );
     }
+}
+
+#[derive(Clone)]
+struct WebSocketListenerState {
+    transport_event_tx: mpsc::Sender<TransportEvent>,
+    connection_counter: Arc<AtomicU64>,
+}
+
+async fn health_check_handler() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn reject_requests_with_origin_header(
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if request.headers().contains_key(ORIGIN) {
+        warn!(
+            method = %request.method(),
+            uri = %request.uri(),
+            "rejecting websocket listener request with Origin header"
+        );
+        Err(StatusCode::FORBIDDEN)
+    } else {
+        Ok(next.run(request).await)
+    }
+}
+
+async fn websocket_upgrade_handler(
+    websocket: WebSocketUpgrade,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    State(state): State<WebSocketListenerState>,
+) -> impl IntoResponse {
+    let connection_id = ConnectionId(state.connection_counter.fetch_add(1, Ordering::Relaxed));
+    info!(%peer_addr, "websocket client connected");
+    websocket.on_upgrade(move |stream| async move {
+        run_websocket_connection(connection_id, stream, state.transport_event_tx).await;
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,7 +188,7 @@ impl FromStr for AppServerTransport {
 pub(crate) enum TransportEvent {
     ConnectionOpened {
         connection_id: ConnectionId,
-        writer: mpsc::Sender<OutgoingMessage>,
+        writer: mpsc::Sender<QueuedOutgoingMessage>,
         disconnect_sender: Option<CancellationToken>,
     },
     ConnectionClosed {
@@ -169,13 +226,13 @@ pub(crate) struct OutboundConnectionState {
     pub(crate) initialized: Arc<AtomicBool>,
     pub(crate) experimental_api_enabled: Arc<AtomicBool>,
     pub(crate) opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
-    pub(crate) writer: mpsc::Sender<OutgoingMessage>,
+    pub(crate) writer: mpsc::Sender<QueuedOutgoingMessage>,
     disconnect_sender: Option<CancellationToken>,
 }
 
 impl OutboundConnectionState {
     pub(crate) fn new(
-        writer: mpsc::Sender<OutgoingMessage>,
+        writer: mpsc::Sender<QueuedOutgoingMessage>,
         initialized: Arc<AtomicBool>,
         experimental_api_enabled: Arc<AtomicBool>,
         opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
@@ -206,7 +263,7 @@ pub(crate) async fn start_stdio_connection(
     stdio_handles: &mut Vec<JoinHandle<()>>,
 ) -> IoResult<()> {
     let connection_id = ConnectionId(0);
-    let (writer_tx, mut writer_rx) = mpsc::channel::<OutgoingMessage>(CHANNEL_CAPACITY);
+    let (writer_tx, mut writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(CHANNEL_CAPACITY);
     let writer_tx_for_reader = writer_tx.clone();
     transport_event_tx
         .send(TransportEvent::ConnectionOpened {
@@ -253,14 +310,17 @@ pub(crate) async fn start_stdio_connection(
 
     stdio_handles.push(tokio::spawn(async move {
         let mut stdout = io::stdout();
-        while let Some(outgoing_message) = writer_rx.recv().await {
-            let Some(mut json) = serialize_outgoing_message(outgoing_message) else {
+        while let Some(queued_message) = writer_rx.recv().await {
+            let Some(mut json) = serialize_outgoing_message(queued_message.message) else {
                 continue;
             };
             json.push('\n');
             if let Err(err) = stdout.write_all(json.as_bytes()).await {
                 error!("Failed to write to stdout: {err}");
                 break;
+            }
+            if let Some(write_complete_tx) = queued_message.write_complete_tx {
+                let _ = write_complete_tx.send(());
             }
         }
         info!("stdout writer exited (channel closed)");
@@ -279,55 +339,36 @@ pub(crate) async fn start_websocket_acceptor(
     print_websocket_startup_banner(local_addr);
     info!("app-server websocket listening on ws://{local_addr}");
 
-    let connection_counter = Arc::new(AtomicU64::new(1));
+    let router = Router::new()
+        .route("/readyz", get(health_check_handler))
+        .route("/healthz", get(health_check_handler))
+        .fallback(any(websocket_upgrade_handler))
+        .layer(middleware::from_fn(reject_requests_with_origin_header))
+        .with_state(WebSocketListenerState {
+            transport_event_tx,
+            connection_counter: Arc::new(AtomicU64::new(1)),
+        });
+    let server = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_token.cancelled().await;
+    });
     Ok(tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown_token.cancelled() => {
-                    info!("websocket acceptor shutting down");
-                    break;
-                }
-                accept_result = listener.accept() => {
-                    match accept_result {
-                        Ok((stream, peer_addr)) => {
-                            info!(%peer_addr, "websocket client connected");
-                            let connection_id =
-                                ConnectionId(connection_counter.fetch_add(1, Ordering::Relaxed));
-                            let transport_event_tx_for_connection = transport_event_tx.clone();
-                            tokio::spawn(async move {
-                                run_websocket_connection(
-                                    connection_id,
-                                    stream,
-                                    transport_event_tx_for_connection,
-                                )
-                                .await;
-                            });
-                        }
-                        Err(err) => {
-                            error!("failed to accept websocket connection: {err}");
-                        }
-                    }
-                }
-            }
+        if let Err(err) = server.await {
+            error!("websocket acceptor failed: {err}");
         }
+        info!("websocket acceptor shutting down");
     }))
 }
 
 async fn run_websocket_connection(
     connection_id: ConnectionId,
-    stream: TcpStream,
+    websocket_stream: WebSocket,
     transport_event_tx: mpsc::Sender<TransportEvent>,
 ) {
-    let websocket_stream =
-        match accept_async_with_config(stream, Some(WebSocketConfig::default())).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                warn!("failed to complete websocket handshake: {err}");
-                return;
-            }
-        };
-
-    let (writer_tx, writer_rx) = mpsc::channel::<OutgoingMessage>(CHANNEL_CAPACITY);
+    let (writer_tx, writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(CHANNEL_CAPACITY);
     let writer_tx_for_reader = writer_tx.clone();
     let disconnect_token = CancellationToken::new();
     if transport_event_tx
@@ -377,11 +418,8 @@ async fn run_websocket_connection(
 }
 
 async fn run_websocket_outbound_loop(
-    mut websocket_writer: futures::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<TcpStream>,
-        WebSocketMessage,
-    >,
-    mut writer_rx: mpsc::Receiver<OutgoingMessage>,
+    mut websocket_writer: futures::stream::SplitSink<WebSocket, WebSocketMessage>,
+    mut writer_rx: mpsc::Receiver<QueuedOutgoingMessage>,
     mut writer_control_rx: mpsc::Receiver<WebSocketMessage>,
     disconnect_token: CancellationToken,
 ) {
@@ -398,15 +436,18 @@ async fn run_websocket_outbound_loop(
                     break;
                 }
             }
-            outgoing_message = writer_rx.recv() => {
-                let Some(outgoing_message) = outgoing_message else {
+            queued_message = writer_rx.recv() => {
+                let Some(queued_message) = queued_message else {
                     break;
                 };
-                let Some(json) = serialize_outgoing_message(outgoing_message) else {
+                let Some(json) = serialize_outgoing_message(queued_message.message) else {
                     continue;
                 };
                 if websocket_writer.send(WebSocketMessage::Text(json.into())).await.is_err() {
                     break;
+                }
+                if let Some(write_complete_tx) = queued_message.write_complete_tx {
+                    let _ = write_complete_tx.send(());
                 }
             }
         }
@@ -414,11 +455,9 @@ async fn run_websocket_outbound_loop(
 }
 
 async fn run_websocket_inbound_loop(
-    mut websocket_reader: futures::stream::SplitStream<
-        tokio_tungstenite::WebSocketStream<TcpStream>,
-    >,
+    mut websocket_reader: futures::stream::SplitStream<WebSocket>,
     transport_event_tx: mpsc::Sender<TransportEvent>,
-    writer_tx_for_reader: mpsc::Sender<OutgoingMessage>,
+    writer_tx_for_reader: mpsc::Sender<QueuedOutgoingMessage>,
     writer_control_tx: mpsc::Sender<WebSocketMessage>,
     connection_id: ConnectionId,
     disconnect_token: CancellationToken,
@@ -435,7 +474,7 @@ async fn run_websocket_inbound_loop(
                             &transport_event_tx,
                             &writer_tx_for_reader,
                             connection_id,
-                            &text,
+                            text.as_ref(),
                         )
                         .await
                         {
@@ -457,7 +496,6 @@ async fn run_websocket_inbound_loop(
                     Some(Ok(WebSocketMessage::Binary(_))) => {
                         warn!("dropping unsupported binary websocket message");
                     }
-                    Some(Ok(WebSocketMessage::Frame(_))) => {}
                     Some(Err(err)) => {
                         warn!("websocket receive error: {err}");
                         break;
@@ -470,7 +508,7 @@ async fn run_websocket_inbound_loop(
 
 async fn forward_incoming_message(
     transport_event_tx: &mpsc::Sender<TransportEvent>,
-    writer: &mpsc::Sender<OutgoingMessage>,
+    writer: &mpsc::Sender<QueuedOutgoingMessage>,
     connection_id: ConnectionId,
     payload: &str,
 ) -> bool {
@@ -487,7 +525,7 @@ async fn forward_incoming_message(
 
 async fn enqueue_incoming_message(
     transport_event_tx: &mpsc::Sender<TransportEvent>,
-    writer: &mpsc::Sender<OutgoingMessage>,
+    writer: &mpsc::Sender<QueuedOutgoingMessage>,
     connection_id: ConnectionId,
     message: JSONRPCMessage,
 ) -> bool {
@@ -510,7 +548,7 @@ async fn enqueue_incoming_message(
                     data: None,
                 },
             });
-            match writer.try_send(overload_error) {
+            match writer.try_send(QueuedOutgoingMessage::new(overload_error)) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Closed(_)) => false,
                 Err(mpsc::error::TrySendError::Full(_overload_error)) => {
@@ -557,9 +595,6 @@ fn should_skip_notification_for_connection(
             let method = notification.to_string();
             opted_out_notification_methods.contains(method.as_str())
         }
-        OutgoingMessage::Notification(notification) => {
-            opted_out_notification_methods.contains(notification.method.as_str())
-        }
         _ => false,
     }
 }
@@ -579,6 +614,7 @@ async fn send_message_to_connection(
     connections: &mut HashMap<ConnectionId, OutboundConnectionState>,
     connection_id: ConnectionId,
     message: OutgoingMessage,
+    write_complete_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> bool {
     let Some(connection_state) = connections.get(&connection_id) else {
         warn!("dropping message for disconnected connection: {connection_id:?}");
@@ -590,8 +626,12 @@ async fn send_message_to_connection(
     }
 
     let writer = connection_state.writer.clone();
+    let queued_message = QueuedOutgoingMessage {
+        message,
+        write_complete_tx,
+    };
     if connection_state.can_disconnect() {
-        match writer.try_send(message) {
+        match writer.try_send(queued_message) {
             Ok(()) => false,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 warn!(
@@ -603,7 +643,7 @@ async fn send_message_to_connection(
                 disconnect_connection(connections, connection_id)
             }
         }
-    } else if writer.send(message).await.is_err() {
+    } else if writer.send(queued_message).await.is_err() {
         disconnect_connection(connections, connection_id)
     } else {
         false
@@ -642,8 +682,11 @@ pub(crate) async fn route_outgoing_envelope(
         OutgoingEnvelope::ToConnection {
             connection_id,
             message,
+            write_complete_tx,
         } => {
-            let _ = send_message_to_connection(connections, connection_id, message).await;
+            let _ =
+                send_message_to_connection(connections, connection_id, message, write_complete_tx)
+                    .await;
         }
         OutgoingEnvelope::Broadcast { message } => {
             let target_connections: Vec<ConnectionId> = connections
@@ -660,8 +703,13 @@ pub(crate) async fn route_outgoing_envelope(
                 .collect();
 
             for connection_id in target_connections {
-                let _ =
-                    send_message_to_connection(connections, connection_id, message.clone()).await;
+                let _ = send_message_to_connection(
+                    connections,
+                    connection_id,
+                    message.clone(),
+                    /*write_complete_tx*/ None,
+                )
+                .await;
             }
         }
     }
@@ -671,6 +719,9 @@ pub(crate) async fn route_outgoing_envelope(
 mod tests {
     use super::*;
     use crate::error_code::OVERLOADED_ERROR_CODE;
+    use codex_app_server_protocol::CommandExecutionRequestApprovalSkillMetadata;
+    use codex_app_server_protocol::ConfigWarningNotification;
+    use codex_app_server_protocol::ServerNotification;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -744,6 +795,7 @@ mod tests {
             id: codex_app_server_protocol::RequestId::Integer(7),
             method: "config/read".to_string(),
             params: Some(json!({ "includeLayers": false })),
+            trace: None,
         });
         assert!(
             enqueue_incoming_message(&transport_event_tx, &writer_tx, connection_id, request).await
@@ -768,7 +820,8 @@ mod tests {
             .recv()
             .await
             .expect("request should receive overload error");
-        let overload_json = serde_json::to_value(overload).expect("serialize overload error");
+        let overload_json =
+            serde_json::to_value(overload.message).expect("serialize overload error");
         assert_eq!(
             overload_json,
             json!({
@@ -872,11 +925,15 @@ mod tests {
             .expect("transport queue should accept first message");
 
         writer_tx
-            .send(OutgoingMessage::Notification(
-                crate::outgoing_message::OutgoingNotification {
-                    method: "queued".to_string(),
-                    params: None,
-                },
+            .send(QueuedOutgoingMessage::new(
+                OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                    ConfigWarningNotification {
+                        summary: "queued".to_string(),
+                        details: None,
+                        path: None,
+                        range: None,
+                    },
+                )),
             ))
             .await
             .expect("writer queue should accept first message");
@@ -885,6 +942,7 @@ mod tests {
             id: codex_app_server_protocol::RequestId::Integer(7),
             method: "config/read".to_string(),
             params: Some(json!({ "includeLayers": false })),
+            trace: None,
         });
 
         let enqueue_result = tokio::time::timeout(
@@ -899,8 +957,18 @@ mod tests {
             .recv()
             .await
             .expect("writer queue should still contain original message");
-        let queued_json = serde_json::to_value(queued_outgoing).expect("serialize queued message");
-        assert_eq!(queued_json, json!({ "method": "queued" }));
+        let queued_json =
+            serde_json::to_value(queued_outgoing.message).expect("serialize queued message");
+        assert_eq!(
+            queued_json,
+            json!({
+                "method": "configWarning",
+                "params": {
+                    "summary": "queued",
+                    "details": null,
+                },
+            })
+        );
     }
 
     #[tokio::test]
@@ -908,9 +976,8 @@ mod tests {
         let connection_id = ConnectionId(7);
         let (writer_tx, mut writer_rx) = mpsc::channel(1);
         let initialized = Arc::new(AtomicBool::new(true));
-        let opted_out_notification_methods = Arc::new(RwLock::new(HashSet::from([
-            "codex/event/task_started".to_string(),
-        ])));
+        let opted_out_notification_methods =
+            Arc::new(RwLock::new(HashSet::from(["configWarning".to_string()])));
 
         let mut connections = HashMap::new();
         connections.insert(
@@ -928,12 +995,15 @@ mod tests {
             &mut connections,
             OutgoingEnvelope::ToConnection {
                 connection_id,
-                message: OutgoingMessage::Notification(
-                    crate::outgoing_message::OutgoingNotification {
-                        method: "codex/event/task_started".to_string(),
-                        params: None,
+                message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                    ConfigWarningNotification {
+                        summary: "task_started".to_string(),
+                        details: None,
+                        path: None,
+                        range: None,
                     },
-                ),
+                )),
+                write_complete_tx: None,
             },
         )
         .await;
@@ -942,6 +1012,92 @@ mod tests {
             writer_rx.try_recv().is_err(),
             "opted-out notification should be dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn to_connection_notifications_are_dropped_for_opted_out_clients() {
+        let connection_id = ConnectionId(10);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+
+        let mut connections = HashMap::new();
+        connections.insert(
+            connection_id,
+            OutboundConnectionState::new(
+                writer_tx,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(RwLock::new(HashSet::from(["configWarning".to_string()]))),
+                None,
+            ),
+        );
+
+        route_outgoing_envelope(
+            &mut connections,
+            OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                    ConfigWarningNotification {
+                        summary: "task_started".to_string(),
+                        details: None,
+                        path: None,
+                        range: None,
+                    },
+                )),
+                write_complete_tx: None,
+            },
+        )
+        .await;
+
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "opted-out notifications should not reach clients"
+        );
+    }
+
+    #[tokio::test]
+    async fn to_connection_notifications_are_preserved_for_non_opted_out_clients() {
+        let connection_id = ConnectionId(11);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+
+        let mut connections = HashMap::new();
+        connections.insert(
+            connection_id,
+            OutboundConnectionState::new(
+                writer_tx,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(RwLock::new(HashSet::new())),
+                None,
+            ),
+        );
+
+        route_outgoing_envelope(
+            &mut connections,
+            OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                    ConfigWarningNotification {
+                        summary: "task_started".to_string(),
+                        details: None,
+                        path: None,
+                        range: None,
+                    },
+                )),
+                write_complete_tx: None,
+            },
+        )
+        .await;
+
+        let message = writer_rx
+            .recv()
+            .await
+            .expect("notification should reach non-opted-out clients");
+        assert!(matches!(
+            message.message,
+            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                ConfigWarningNotification { summary, .. }
+            )) if summary == "task_started"
+        ));
     }
 
     #[tokio::test]
@@ -989,11 +1145,15 @@ mod tests {
                                 macos: None,
                             },
                         ),
+                        skill_metadata: Some(CommandExecutionRequestApprovalSkillMetadata {
+                            path_to_skills_md: PathBuf::from("/tmp/SKILLS.md"),
+                        }),
                         proposed_execpolicy_amendment: None,
                         proposed_network_policy_amendments: None,
                         available_decisions: None,
                     },
                 }),
+                write_complete_tx: None,
             },
         )
         .await;
@@ -1002,8 +1162,9 @@ mod tests {
             .recv()
             .await
             .expect("request should be delivered to the connection");
-        let json = serde_json::to_value(message).expect("request should serialize");
+        let json = serde_json::to_value(message.message).expect("request should serialize");
         assert_eq!(json["params"].get("additionalPermissions"), None);
+        assert_eq!(json["params"].get("skillMetadata"), None);
     }
 
     #[tokio::test]
@@ -1051,11 +1212,15 @@ mod tests {
                                 macos: None,
                             },
                         ),
+                        skill_metadata: Some(CommandExecutionRequestApprovalSkillMetadata {
+                            path_to_skills_md: PathBuf::from("/tmp/SKILLS.md"),
+                        }),
                         proposed_execpolicy_amendment: None,
                         proposed_network_policy_amendments: None,
                         available_decisions: None,
                     },
                 }),
+                write_complete_tx: None,
             },
         )
         .await;
@@ -1064,7 +1229,7 @@ mod tests {
             .recv()
             .await
             .expect("request should be delivered to the connection");
-        let json = serde_json::to_value(message).expect("request should serialize");
+        let json = serde_json::to_value(message.message).expect("request should serialize");
         let allowed_path = absolute_path("/tmp/allowed").to_string_lossy().into_owned();
         assert_eq!(
             json["params"]["additionalPermissions"],
@@ -1075,6 +1240,12 @@ mod tests {
                     "write": null,
                 },
                 "macos": null,
+            })
+        );
+        assert_eq!(
+            json["params"]["skillMetadata"],
+            json!({
+                "pathToSkillsMd": "/tmp/SKILLS.md",
             })
         );
     }
@@ -1111,20 +1282,26 @@ mod tests {
             ),
         );
 
-        let queued_message =
-            OutgoingMessage::Notification(crate::outgoing_message::OutgoingNotification {
-                method: "codex/event/already-buffered".to_string(),
-                params: None,
-            });
+        let queued_message = OutgoingMessage::AppServerNotification(
+            ServerNotification::ConfigWarning(ConfigWarningNotification {
+                summary: "already-buffered".to_string(),
+                details: None,
+                path: None,
+                range: None,
+            }),
+        );
         slow_writer_tx
-            .try_send(queued_message)
+            .try_send(QueuedOutgoingMessage::new(queued_message))
             .expect("channel should have room");
 
-        let broadcast_message =
-            OutgoingMessage::Notification(crate::outgoing_message::OutgoingNotification {
-                method: "codex/event/test".to_string(),
-                params: None,
-            });
+        let broadcast_message = OutgoingMessage::AppServerNotification(
+            ServerNotification::ConfigWarning(ConfigWarningNotification {
+                summary: "test".to_string(),
+                details: None,
+                path: None,
+                range: None,
+            }),
+        );
         timeout(
             Duration::from_millis(100),
             route_outgoing_envelope(
@@ -1135,30 +1312,28 @@ mod tests {
             ),
         )
         .await
-        .expect("broadcast should not block on a full writer");
+        .expect("broadcast should return even when one connection is slow");
         assert!(!connections.contains_key(&slow_connection_id));
         assert!(slow_disconnect_token.is_cancelled());
         assert!(!fast_disconnect_token.is_cancelled());
         let fast_message = fast_writer_rx
             .try_recv()
-            .expect("fast connection should receive broadcast");
+            .expect("fast connection should receive the broadcast notification");
         assert!(matches!(
-            fast_message,
-            OutgoingMessage::Notification(crate::outgoing_message::OutgoingNotification {
-                method,
-                params: None,
-            }) if method == "codex/event/test"
+            fast_message.message,
+            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                ConfigWarningNotification { summary, .. }
+            )) if summary == "test"
         ));
 
         let slow_message = slow_writer_rx
             .try_recv()
             .expect("slow connection should retain its original buffered message");
         assert!(matches!(
-            slow_message,
-            OutgoingMessage::Notification(crate::outgoing_message::OutgoingNotification {
-                method,
-                params: None,
-            }) if method == "codex/event/already-buffered"
+            slow_message.message,
+            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                ConfigWarningNotification { summary, .. }
+            )) if summary == "already-buffered"
         ));
     }
 
@@ -1167,11 +1342,15 @@ mod tests {
         let connection_id = ConnectionId(3);
         let (writer_tx, mut writer_rx) = mpsc::channel(1);
         writer_tx
-            .send(OutgoingMessage::Notification(
-                crate::outgoing_message::OutgoingNotification {
-                    method: "queued".to_string(),
-                    params: None,
-                },
+            .send(QueuedOutgoingMessage::new(
+                OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                    ConfigWarningNotification {
+                        summary: "queued".to_string(),
+                        details: None,
+                        path: None,
+                        range: None,
+                    },
+                )),
             ))
             .await
             .expect("channel should accept the first queued message");
@@ -1193,12 +1372,15 @@ mod tests {
                 &mut connections,
                 OutgoingEnvelope::ToConnection {
                     connection_id,
-                    message: OutgoingMessage::Notification(
-                        crate::outgoing_message::OutgoingNotification {
-                            method: "second".to_string(),
-                            params: None,
-                        },
+                    message: OutgoingMessage::AppServerNotification(
+                        ServerNotification::ConfigWarning(ConfigWarningNotification {
+                            summary: "second".to_string(),
+                            details: None,
+                            path: None,
+                            range: None,
+                        }),
                     ),
+                    write_complete_tx: None,
                 },
             )
             .await
@@ -1208,29 +1390,25 @@ mod tests {
             .await
             .expect("first queued message should be readable")
             .expect("first queued message should exist");
-        let second = timeout(Duration::from_millis(100), writer_rx.recv())
-            .await
-            .expect("second message should eventually be delivered")
-            .expect("second message should exist");
-
         timeout(Duration::from_millis(100), route_task)
             .await
-            .expect("routing should finish after writer drains")
+            .expect("routing should finish after the first queued message is drained")
             .expect("routing task should succeed");
 
         assert!(matches!(
-            first,
-            OutgoingMessage::Notification(crate::outgoing_message::OutgoingNotification {
-                method,
-                params: None,
-            }) if method == "queued"
+            first.message,
+            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                ConfigWarningNotification { summary, .. }
+            )) if summary == "queued"
         ));
+        let second = writer_rx
+            .try_recv()
+            .expect("second notification should be delivered once the queue has room");
         assert!(matches!(
-            second,
-            OutgoingMessage::Notification(crate::outgoing_message::OutgoingNotification {
-                method,
-                params: None,
-            }) if method == "second"
+            second.message,
+            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                ConfigWarningNotification { summary, .. }
+            )) if summary == "second"
         ));
     }
 }
