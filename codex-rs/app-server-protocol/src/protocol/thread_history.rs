@@ -18,6 +18,7 @@ use crate::protocol::v2::TurnError;
 use crate::protocol::v2::TurnStatus;
 use crate::protocol::v2::UserInput;
 use crate::protocol::v2::WebSearchAction;
+use codex_protocol::items::parse_hook_prompt_message;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::AgentReasoningRawContentEvent;
@@ -30,6 +31,8 @@ use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
+use codex_protocol::protocol::ImageGenerationBeginEvent;
+use codex_protocol::protocol::ImageGenerationEndEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::McpToolCallBeginEvent;
@@ -71,6 +74,8 @@ pub struct ThreadHistoryBuilder {
     turns: Vec<Turn>,
     current_turn: Option<PendingTurn>,
     next_item_index: i64,
+    current_rollout_index: usize,
+    next_rollout_index: usize,
 }
 
 impl Default for ThreadHistoryBuilder {
@@ -85,6 +90,8 @@ impl ThreadHistoryBuilder {
             turns: Vec::new(),
             current_turn: None,
             next_item_index: 1,
+            current_rollout_index: 0,
+            next_rollout_index: 0,
         }
     }
 
@@ -108,6 +115,19 @@ impl ThreadHistoryBuilder {
         self.current_turn.is_some()
     }
 
+    pub fn active_turn_id_if_explicit(&self) -> Option<String> {
+        self.current_turn
+            .as_ref()
+            .filter(|turn| turn.opened_explicitly)
+            .map(|turn| turn.id.clone())
+    }
+
+    pub fn active_turn_start_index(&self) -> Option<usize> {
+        self.current_turn
+            .as_ref()
+            .map(|turn| turn.rollout_start_index)
+    }
+
     /// Shared reducer for persisted rollout replay and in-memory current-turn
     /// tracking used by running thread resume/rejoin.
     ///
@@ -116,9 +136,11 @@ impl ThreadHistoryBuilder {
     pub fn handle_event(&mut self, event: &EventMsg) {
         match event {
             EventMsg::UserMessage(payload) => self.handle_user_message(payload),
-            EventMsg::AgentMessage(payload) => {
-                self.handle_agent_message(payload.message.clone(), payload.phase.clone())
-            }
+            EventMsg::AgentMessage(payload) => self.handle_agent_message(
+                payload.message.clone(),
+                payload.phase.clone(),
+                payload.memory_citation.clone().map(Into::into),
+            ),
             EventMsg::AgentReasoning(payload) => self.handle_agent_reasoning(payload),
             EventMsg::AgentReasoningRawContent(payload) => {
                 self.handle_agent_reasoning_raw_content(payload)
@@ -141,6 +163,8 @@ impl ThreadHistoryBuilder {
             EventMsg::McpToolCallBegin(payload) => self.handle_mcp_tool_call_begin(payload),
             EventMsg::McpToolCallEnd(payload) => self.handle_mcp_tool_call_end(payload),
             EventMsg::ViewImageToolCall(payload) => self.handle_view_image_tool_call(payload),
+            EventMsg::ImageGenerationBegin(payload) => self.handle_image_generation_begin(payload),
+            EventMsg::ImageGenerationEnd(payload) => self.handle_image_generation_end(payload),
             EventMsg::CollabAgentSpawnBegin(payload) => {
                 self.handle_collab_agent_spawn_begin(payload)
             }
@@ -162,6 +186,7 @@ impl ThreadHistoryBuilder {
             EventMsg::ExitedReviewMode(payload) => self.handle_exited_review_mode(payload),
             EventMsg::ItemStarted(payload) => self.handle_item_started(payload),
             EventMsg::ItemCompleted(payload) => self.handle_item_completed(payload),
+            EventMsg::HookStarted(_) | EventMsg::HookCompleted(_) => {}
             EventMsg::Error(payload) => self.handle_error(payload),
             EventMsg::TokenCount(_) => {}
             EventMsg::ThreadRolledBack(payload) => self.handle_thread_rollback(payload),
@@ -174,13 +199,40 @@ impl ThreadHistoryBuilder {
     }
 
     pub fn handle_rollout_item(&mut self, item: &RolloutItem) {
+        self.current_rollout_index = self.next_rollout_index;
+        self.next_rollout_index += 1;
         match item {
             RolloutItem::EventMsg(event) => self.handle_event(event),
             RolloutItem::Compacted(payload) => self.handle_compacted(payload),
-            RolloutItem::TurnContext(_)
-            | RolloutItem::SessionMeta(_)
-            | RolloutItem::ResponseItem(_) => {}
+            RolloutItem::ResponseItem(item) => self.handle_response_item(item),
+            RolloutItem::TurnContext(_) | RolloutItem::SessionMeta(_) => {}
         }
+    }
+
+    fn handle_response_item(&mut self, item: &codex_protocol::models::ResponseItem) {
+        let codex_protocol::models::ResponseItem::Message {
+            role, content, id, ..
+        } = item
+        else {
+            return;
+        };
+
+        if role != "user" {
+            return;
+        }
+
+        let Some(hook_prompt) = parse_hook_prompt_message(id.as_ref(), content) else {
+            return;
+        };
+
+        self.ensure_turn().items.push(ThreadItem::HookPrompt {
+            id: hook_prompt.id,
+            fragments: hook_prompt
+                .fragments
+                .into_iter()
+                .map(crate::protocol::v2::HookPromptFragment::from)
+                .collect(),
+        });
     }
 
     fn handle_user_message(&mut self, payload: &UserMessageEvent) {
@@ -196,22 +248,30 @@ impl ThreadHistoryBuilder {
         let mut turn = self
             .current_turn
             .take()
-            .unwrap_or_else(|| self.new_turn(None));
+            .unwrap_or_else(|| self.new_turn(/*id*/ None));
         let id = self.next_item_id();
         let content = self.build_user_inputs(payload);
         turn.items.push(ThreadItem::UserMessage { id, content });
         self.current_turn = Some(turn);
     }
 
-    fn handle_agent_message(&mut self, text: String, phase: Option<MessagePhase>) {
+    fn handle_agent_message(
+        &mut self,
+        text: String,
+        phase: Option<MessagePhase>,
+        memory_citation: Option<crate::protocol::v2::MemoryCitation>,
+    ) {
         if text.is_empty() {
             return;
         }
 
         let id = self.next_item_id();
-        self.ensure_turn()
-            .items
-            .push(ThreadItem::AgentMessage { id, text, phase });
+        self.ensure_turn().items.push(ThreadItem::AgentMessage {
+            id,
+            text,
+            phase,
+            memory_citation,
+        });
     }
 
     fn handle_agent_reasoning(&mut self, payload: &AgentReasoningEvent) {
@@ -266,9 +326,11 @@ impl ThreadHistoryBuilder {
                 );
             }
             codex_protocol::items::TurnItem::UserMessage(_)
+            | codex_protocol::items::TurnItem::HookPrompt(_)
             | codex_protocol::items::TurnItem::AgentMessage(_)
             | codex_protocol::items::TurnItem::Reasoning(_)
             | codex_protocol::items::TurnItem::WebSearch(_)
+            | codex_protocol::items::TurnItem::ImageGeneration(_)
             | codex_protocol::items::TurnItem::ContextCompaction(_) => {}
         }
     }
@@ -285,9 +347,11 @@ impl ThreadHistoryBuilder {
                 );
             }
             codex_protocol::items::TurnItem::UserMessage(_)
+            | codex_protocol::items::TurnItem::HookPrompt(_)
             | codex_protocol::items::TurnItem::AgentMessage(_)
             | codex_protocol::items::TurnItem::Reasoning(_)
             | codex_protocol::items::TurnItem::WebSearch(_)
+            | codex_protocol::items::TurnItem::ImageGeneration(_)
             | codex_protocol::items::TurnItem::ContextCompaction(_) => {}
         }
     }
@@ -324,6 +388,7 @@ impl ThreadHistoryBuilder {
             command,
             cwd: payload.cwd.clone(),
             process_id: payload.process_id.clone(),
+            source: payload.source.into(),
             status: CommandExecutionStatus::InProgress,
             command_actions,
             aggregated_output: None,
@@ -354,6 +419,7 @@ impl ThreadHistoryBuilder {
             command,
             cwd: payload.cwd.clone(),
             process_id: payload.process_id.clone(),
+            source: payload.source.into(),
             status,
             command_actions,
             aggregated_output,
@@ -516,6 +582,28 @@ impl ThreadHistoryBuilder {
         self.upsert_item_in_current_turn(item);
     }
 
+    fn handle_image_generation_begin(&mut self, payload: &ImageGenerationBeginEvent) {
+        let item = ThreadItem::ImageGeneration {
+            id: payload.call_id.clone(),
+            status: String::new(),
+            revised_prompt: None,
+            result: String::new(),
+            saved_path: None,
+        };
+        self.upsert_item_in_current_turn(item);
+    }
+
+    fn handle_image_generation_end(&mut self, payload: &ImageGenerationEndEvent) {
+        let item = ThreadItem::ImageGeneration {
+            id: payload.call_id.clone(),
+            status: payload.status.clone(),
+            revised_prompt: payload.revised_prompt.clone(),
+            result: payload.result.clone(),
+            saved_path: payload.saved_path.clone(),
+        };
+        self.upsert_item_in_current_turn(item);
+    }
+
     fn handle_collab_agent_spawn_begin(
         &mut self,
         payload: &codex_protocol::protocol::CollabAgentSpawnBeginEvent,
@@ -527,6 +615,8 @@ impl ThreadHistoryBuilder {
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: Vec::new(),
             prompt: Some(payload.prompt.clone()),
+            model: Some(payload.model.clone()),
+            reasoning_effort: Some(payload.reasoning_effort),
             agents_states: HashMap::new(),
         };
         self.upsert_item_in_current_turn(item);
@@ -560,6 +650,8 @@ impl ThreadHistoryBuilder {
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids,
             prompt: Some(payload.prompt.clone()),
+            model: Some(payload.model.clone()),
+            reasoning_effort: Some(payload.reasoning_effort),
             agents_states,
         });
     }
@@ -575,6 +667,8 @@ impl ThreadHistoryBuilder {
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
             prompt: Some(payload.prompt.clone()),
+            model: None,
+            reasoning_effort: None,
             agents_states: HashMap::new(),
         };
         self.upsert_item_in_current_turn(item);
@@ -597,6 +691,8 @@ impl ThreadHistoryBuilder {
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![receiver_id.clone()],
             prompt: Some(payload.prompt.clone()),
+            model: None,
+            reasoning_effort: None,
             agents_states: [(receiver_id, received_status)].into_iter().collect(),
         });
     }
@@ -616,6 +712,8 @@ impl ThreadHistoryBuilder {
                 .map(ToString::to_string)
                 .collect(),
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             agents_states: HashMap::new(),
         };
         self.upsert_item_in_current_turn(item);
@@ -649,6 +747,8 @@ impl ThreadHistoryBuilder {
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids,
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             agents_states,
         });
     }
@@ -664,6 +764,8 @@ impl ThreadHistoryBuilder {
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             agents_states: HashMap::new(),
         };
         self.upsert_item_in_current_turn(item);
@@ -688,6 +790,8 @@ impl ThreadHistoryBuilder {
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![receiver_id],
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             agents_states,
         });
     }
@@ -703,6 +807,8 @@ impl ThreadHistoryBuilder {
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             agents_states: HashMap::new(),
         };
         self.upsert_item_in_current_turn(item);
@@ -730,6 +836,8 @@ impl ThreadHistoryBuilder {
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![receiver_id],
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             agents_states,
         });
     }
@@ -885,12 +993,13 @@ impl ThreadHistoryBuilder {
             status: TurnStatus::Completed,
             opened_explicitly: false,
             saw_compaction: false,
+            rollout_start_index: self.current_rollout_index,
         }
     }
 
     fn ensure_turn(&mut self) -> &mut PendingTurn {
         if self.current_turn.is_none() {
-            let turn = self.new_turn(None);
+            let turn = self.new_turn(/*id*/ None);
             return self.current_turn.insert(turn);
         }
 
@@ -1048,6 +1157,8 @@ struct PendingTurn {
     /// True when this turn includes a persisted `RolloutItem::Compacted`, which
     /// should keep the turn from being dropped even without normal items.
     saw_compaction: bool,
+    /// Index of the rollout item that opened this turn during replay.
+    rollout_start_index: usize,
 }
 
 impl PendingTurn {
@@ -1087,10 +1198,13 @@ impl From<&PendingTurn> for Turn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::v2::CommandExecutionSource;
     use codex_protocol::ThreadId;
     use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
+    use codex_protocol::items::HookPromptFragment as CoreHookPromptFragment;
     use codex_protocol::items::TurnItem as CoreTurnItem;
     use codex_protocol::items::UserMessageItem as CoreUserMessageItem;
+    use codex_protocol::items::build_hook_prompt_message;
     use codex_protocol::models::MessagePhase as CoreMessagePhase;
     use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
     use codex_protocol::parse_command::ParsedCommand;
@@ -1131,6 +1245,7 @@ mod tests {
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "Hi there".into(),
                 phase: None,
+                memory_citation: None,
             }),
             EventMsg::AgentReasoning(AgentReasoningEvent {
                 text: "thinking".into(),
@@ -1147,6 +1262,7 @@ mod tests {
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "Reply two".into(),
                 phase: None,
+                memory_citation: None,
             }),
         ];
 
@@ -1182,6 +1298,7 @@ mod tests {
                 id: "item-2".into(),
                 text: "Hi there".into(),
                 phase: None,
+                memory_citation: None,
             }
         );
         assert_eq!(
@@ -1213,6 +1330,7 @@ mod tests {
                 id: "item-5".into(),
                 text: "Reply two".into(),
                 phase: None,
+                memory_citation: None,
             }
         );
     }
@@ -1271,6 +1389,7 @@ mod tests {
         let events = vec![EventMsg::AgentMessage(AgentMessageEvent {
             message: "Final reply".into(),
             phase: Some(CoreMessagePhase::FinalAnswer),
+            memory_citation: None,
         })];
 
         let items = events
@@ -1285,6 +1404,62 @@ mod tests {
                 id: "item-1".into(),
                 text: "Final reply".into(),
                 phase: Some(MessagePhase::FinalAnswer),
+                memory_citation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn replays_image_generation_end_events_into_turn_history() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-image".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "generate an image".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::EventMsg(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
+                call_id: "ig_123".into(),
+                status: "completed".into(),
+                revised_prompt: Some("final prompt".into()),
+                result: "Zm9v".into(),
+                saved_path: Some("/tmp/ig_123.png".into()),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-image".into(),
+                last_agent_message: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0],
+            Turn {
+                id: "turn-image".into(),
+                status: TurnStatus::Completed,
+                error: None,
+                items: vec![
+                    ThreadItem::UserMessage {
+                        id: "item-1".into(),
+                        content: vec![UserInput::Text {
+                            text: "generate an image".into(),
+                            text_elements: Vec::new(),
+                        }],
+                    },
+                    ThreadItem::ImageGeneration {
+                        id: "ig_123".into(),
+                        status: "completed".into(),
+                        revised_prompt: Some("final prompt".into()),
+                        result: "Zm9v".into(),
+                        saved_path: Some("/tmp/ig_123.png".into()),
+                    },
+                ],
             }
         );
     }
@@ -1307,6 +1482,7 @@ mod tests {
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "interlude".into(),
                 phase: None,
+                memory_citation: None,
             }),
             EventMsg::AgentReasoning(AgentReasoningEvent {
                 text: "second summary".into(),
@@ -1352,6 +1528,7 @@ mod tests {
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "Working...".into(),
                 phase: None,
+                memory_citation: None,
             }),
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some("turn-1".into()),
@@ -1366,6 +1543,7 @@ mod tests {
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "Second attempt complete.".into(),
                 phase: None,
+                memory_citation: None,
             }),
         ];
 
@@ -1395,6 +1573,7 @@ mod tests {
                 id: "item-2".into(),
                 text: "Working...".into(),
                 phase: None,
+                memory_citation: None,
             }
         );
 
@@ -1417,6 +1596,7 @@ mod tests {
                 id: "item-4".into(),
                 text: "Second attempt complete.".into(),
                 phase: None,
+                memory_citation: None,
             }
         );
     }
@@ -1433,6 +1613,7 @@ mod tests {
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "A1".into(),
                 phase: None,
+                memory_citation: None,
             }),
             EventMsg::UserMessage(UserMessageEvent {
                 message: "Second".into(),
@@ -1443,6 +1624,7 @@ mod tests {
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "A2".into(),
                 phase: None,
+                memory_citation: None,
             }),
             EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
             EventMsg::UserMessage(UserMessageEvent {
@@ -1454,6 +1636,7 @@ mod tests {
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "A3".into(),
                 phase: None,
+                memory_citation: None,
             }),
         ];
 
@@ -1482,6 +1665,7 @@ mod tests {
                     id: "item-2".into(),
                     text: "A1".into(),
                     phase: None,
+                    memory_citation: None,
                 },
             ]
         );
@@ -1499,6 +1683,7 @@ mod tests {
                     id: "item-4".into(),
                     text: "A3".into(),
                     phase: None,
+                    memory_citation: None,
                 },
             ]
         );
@@ -1516,6 +1701,7 @@ mod tests {
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "A1".into(),
                 phase: None,
+                memory_citation: None,
             }),
             EventMsg::UserMessage(UserMessageEvent {
                 message: "Two".into(),
@@ -1526,6 +1712,7 @@ mod tests {
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "A2".into(),
                 phase: None,
+                memory_citation: None,
             }),
             EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 99 }),
         ];
@@ -1670,6 +1857,7 @@ mod tests {
                 command: "echo 'hello world'".into(),
                 cwd: PathBuf::from("/tmp"),
                 process_id: Some("pid-1".into()),
+                source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
                 command_actions: vec![CommandAction::Unknown {
                     command: "echo hello world".into(),
@@ -1818,6 +2006,7 @@ mod tests {
                 command: "ls".into(),
                 cwd: PathBuf::from("/tmp"),
                 process_id: Some("pid-2".into()),
+                source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Declined,
                 command_actions: vec![CommandAction::Unknown {
                     command: "ls".into(),
@@ -1912,6 +2101,7 @@ mod tests {
                 command: "echo done".into(),
                 cwd: PathBuf::from("/tmp"),
                 process_id: Some("pid-42".into()),
+                source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
                 command_actions: vec![CommandAction::Unknown {
                     command: "echo done".into(),
@@ -2162,6 +2352,7 @@ mod tests {
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "still in b".into(),
                 phase: None,
+                memory_citation: None,
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-b".into(),
@@ -2216,6 +2407,7 @@ mod tests {
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "still in b".into(),
                 phase: None,
+                memory_citation: None,
             }),
         ];
 
@@ -2298,10 +2490,137 @@ mod tests {
                 sender_thread_id: "00000000-0000-0000-0000-000000000001".into(),
                 receiver_thread_ids: vec!["00000000-0000-0000-0000-000000000002".into()],
                 prompt: None,
+                model: None,
+                reasoning_effort: None,
                 agents_states: [(
                     "00000000-0000-0000-0000-000000000002".into(),
                     CollabAgentState {
                         status: crate::protocol::v2::CollabAgentStatus::Completed,
+                        message: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }
+        );
+    }
+
+    #[test]
+    fn reconstructs_collab_spawn_end_item_with_model_metadata() {
+        let sender_thread_id = ThreadId::try_from("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let spawned_thread_id = ThreadId::try_from("00000000-0000-0000-0000-000000000002")
+            .expect("valid receiver thread id");
+        let events = vec![
+            EventMsg::UserMessage(UserMessageEvent {
+                message: "spawn agent".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            }),
+            EventMsg::CollabAgentSpawnEnd(codex_protocol::protocol::CollabAgentSpawnEndEvent {
+                call_id: "spawn-1".into(),
+                sender_thread_id,
+                new_thread_id: Some(spawned_thread_id),
+                new_agent_nickname: Some("Scout".into()),
+                new_agent_role: Some("explorer".into()),
+                prompt: "inspect the repo".into(),
+                model: "gpt-5.4-mini".into(),
+                reasoning_effort: codex_protocol::openai_models::ReasoningEffort::Medium,
+                status: AgentStatus::Running,
+            }),
+        ];
+
+        let items = events
+            .into_iter()
+            .map(RolloutItem::EventMsg)
+            .collect::<Vec<_>>();
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 2);
+        assert_eq!(
+            turns[0].items[1],
+            ThreadItem::CollabAgentToolCall {
+                id: "spawn-1".into(),
+                tool: CollabAgentTool::SpawnAgent,
+                status: CollabAgentToolCallStatus::Completed,
+                sender_thread_id: "00000000-0000-0000-0000-000000000001".into(),
+                receiver_thread_ids: vec!["00000000-0000-0000-0000-000000000002".into()],
+                prompt: Some("inspect the repo".into()),
+                model: Some("gpt-5.4-mini".into()),
+                reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::Medium),
+                agents_states: [(
+                    "00000000-0000-0000-0000-000000000002".into(),
+                    CollabAgentState {
+                        status: crate::protocol::v2::CollabAgentStatus::Running,
+                        message: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }
+        );
+    }
+
+    #[test]
+    fn reconstructs_interrupted_send_input_as_completed_collab_call() {
+        // `send_input(interrupt=true)` first stops the child's active turn, then redirects it with
+        // new input. The transient interrupted status should remain visible in agent state, but the
+        // collab tool call itself is still a successful redirect rather than a failed operation.
+        let sender = ThreadId::try_from("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let receiver = ThreadId::try_from("00000000-0000-0000-0000-000000000002")
+            .expect("valid receiver thread id");
+        let events = vec![
+            EventMsg::UserMessage(UserMessageEvent {
+                message: "redirect".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            }),
+            EventMsg::CollabAgentInteractionBegin(
+                codex_protocol::protocol::CollabAgentInteractionBeginEvent {
+                    call_id: "send-1".into(),
+                    sender_thread_id: sender,
+                    receiver_thread_id: receiver,
+                    prompt: "new task".into(),
+                },
+            ),
+            EventMsg::CollabAgentInteractionEnd(
+                codex_protocol::protocol::CollabAgentInteractionEndEvent {
+                    call_id: "send-1".into(),
+                    sender_thread_id: sender,
+                    receiver_thread_id: receiver,
+                    receiver_agent_nickname: None,
+                    receiver_agent_role: None,
+                    prompt: "new task".into(),
+                    status: AgentStatus::Interrupted,
+                },
+            ),
+        ];
+
+        let items = events
+            .into_iter()
+            .map(RolloutItem::EventMsg)
+            .collect::<Vec<_>>();
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 2);
+        assert_eq!(
+            turns[0].items[1],
+            ThreadItem::CollabAgentToolCall {
+                id: "send-1".into(),
+                tool: CollabAgentTool::SendInput,
+                status: CollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender.to_string(),
+                receiver_thread_ids: vec![receiver.to_string()],
+                prompt: Some("new task".into()),
+                model: None,
+                reasoning_effort: None,
+                agents_states: [(
+                    receiver.to_string(),
+                    CollabAgentState {
+                        status: crate::protocol::v2::CollabAgentStatus::Interrupted,
                         message: None,
                     },
                 )]
@@ -2323,6 +2642,7 @@ mod tests {
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "done".into(),
                 phase: None,
+                memory_citation: None,
             }),
             EventMsg::Error(ErrorEvent {
                 message: "rollback failed".into(),
@@ -2433,5 +2753,81 @@ mod tests {
                 additional_details: None,
             })
         );
+    }
+
+    #[test]
+    fn rebuilds_hook_prompt_items_from_rollout_response_items() {
+        let hook_prompt = build_hook_prompt_message(&[
+            CoreHookPromptFragment::from_single_hook("Retry with tests.", "hook-run-1"),
+            CoreHookPromptFragment::from_single_hook("Then summarize cleanly.", "hook-run-2"),
+        ])
+        .expect("hook prompt message");
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "hello".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::ResponseItem(hook_prompt),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                last_agent_message: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 2);
+        assert_eq!(
+            turns[0].items[1],
+            ThreadItem::HookPrompt {
+                id: turns[0].items[1].id().to_string(),
+                fragments: vec![
+                    crate::protocol::v2::HookPromptFragment {
+                        text: "Retry with tests.".into(),
+                        hook_run_id: "hook-run-1".into(),
+                    },
+                    crate::protocol::v2::HookPromptFragment {
+                        text: "Then summarize cleanly.".into(),
+                        hook_run_id: "hook-run-2".into(),
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_plain_user_response_items_in_rollout_replay() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::ResponseItem(codex_protocol::models::ResponseItem::Message {
+                id: Some("msg-1".into()),
+                role: "user".into(),
+                content: vec![codex_protocol::models::ContentItem::InputText {
+                    text: "plain text".into(),
+                }],
+                end_turn: None,
+                phase: None,
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                last_agent_message: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].items.is_empty());
     }
 }

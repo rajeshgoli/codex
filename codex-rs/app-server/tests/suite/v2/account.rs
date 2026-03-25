@@ -83,6 +83,9 @@ sandbox_mode = "danger-full-access"
 
 model_provider = "mock_provider"
 
+[features]
+shell_snapshot = false
+
 [model_providers.mock_provider]
 name = "Mock provider for test"
 base_url = "{base_url}"
@@ -131,6 +134,7 @@ async fn logout_account_removes_auth_and_notifies() -> Result<()> {
         payload.auth_mode.is_none(),
         "auth_method should be None after logout"
     );
+    assert_eq!(payload.plan_type, None);
 
     assert!(
         !codex_home.path().join("auth.json").exists(),
@@ -201,6 +205,7 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
         bail!("unexpected notification: {parsed:?}");
     };
     assert_eq!(payload.auth_mode, Some(AuthMode::ChatgptAuthTokens));
+    assert_eq!(payload.plan_type, Some(AccountPlanType::Pro));
 
     let get_id = mcp
         .send_get_account_request(GetAccountParams {
@@ -843,6 +848,7 @@ async fn login_account_api_key_succeeds_and_notifies() -> Result<()> {
         bail!("unexpected notification: {parsed:?}");
     };
     pretty_assertions::assert_eq!(payload.auth_mode, Some(AuthMode::ApiKey));
+    pretty_assertions::assert_eq!(payload.plan_type, None);
 
     assert!(codex_home.path().join("auth.json").exists());
     Ok(())

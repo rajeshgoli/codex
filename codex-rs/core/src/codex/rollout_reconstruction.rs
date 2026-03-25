@@ -1,11 +1,12 @@
 use super::*;
+use crate::context_manager::is_user_turn_boundary;
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
 // the resume/fork hydration metadata derived from the same replay.
 #[derive(Debug)]
 pub(super) struct RolloutReconstruction {
     pub(super) history: Vec<ResponseItem>,
-    pub(super) previous_model: Option<String>,
+    pub(super) previous_turn_settings: Option<PreviousTurnSettings>,
     pub(super) reference_context_item: Option<TurnContextItem>,
 }
 
@@ -29,7 +30,7 @@ enum TurnReferenceContextItem {
 struct ActiveReplaySegment<'a> {
     turn_id: Option<String>,
     counts_as_user_turn: bool,
-    previous_model: Option<String>,
+    previous_turn_settings: Option<PreviousTurnSettings>,
     reference_context_item: TurnReferenceContextItem,
     base_replacement_history: Option<&'a [ResponseItem]>,
 }
@@ -42,7 +43,7 @@ fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&s
 fn finalize_active_segment<'a>(
     active_segment: ActiveReplaySegment<'a>,
     base_replacement_history: &mut Option<&'a [ResponseItem]>,
-    previous_model: &mut Option<String>,
+    previous_turn_settings: &mut Option<PreviousTurnSettings>,
     reference_context_item: &mut TurnReferenceContextItem,
     pending_rollback_turns: &mut usize,
 ) {
@@ -64,9 +65,9 @@ fn finalize_active_segment<'a>(
         *base_replacement_history = Some(segment_base_replacement_history);
     }
 
-    // `previous_model` comes from the newest surviving user turn that established one.
-    if previous_model.is_none() && active_segment.counts_as_user_turn {
-        *previous_model = active_segment.previous_model;
+    // `previous_turn_settings` come from the newest surviving user turn that established them.
+    if previous_turn_settings.is_none() && active_segment.counts_as_user_turn {
+        *previous_turn_settings = active_segment.previous_turn_settings;
     }
 
     // `reference_context_item` comes from the newest surviving user turn baseline, or
@@ -94,7 +95,7 @@ impl Session {
         // are both known; then replay only the buffered surviving tail forward to preserve exact
         // history semantics.
         let mut base_replacement_history: Option<&[ResponseItem]> = None;
-        let mut previous_model = None;
+        let mut previous_turn_settings = None;
         let mut reference_context_item = TurnReferenceContextItem::NeverSet;
         // Rollback is "drop the newest N user turns". While scanning in reverse, that becomes
         // "skip the next N user-turn segments we finalize".
@@ -170,7 +171,10 @@ impl Session {
                         active_segment.turn_id.as_deref(),
                         ctx.turn_id.as_deref(),
                     ) {
-                        active_segment.previous_model = Some(ctx.model.clone());
+                        active_segment.previous_turn_settings = Some(PreviousTurnSettings {
+                            model: ctx.model.clone(),
+                            realtime_active: ctx.realtime_active,
+                        });
                         if matches!(
                             active_segment.reference_context_item,
                             TurnReferenceContextItem::NeverSet
@@ -192,19 +196,22 @@ impl Session {
                         finalize_active_segment(
                             active_segment,
                             &mut base_replacement_history,
-                            &mut previous_model,
+                            &mut previous_turn_settings,
                             &mut reference_context_item,
                             &mut pending_rollback_turns,
                         );
                     }
                 }
-                RolloutItem::ResponseItem(_)
-                | RolloutItem::EventMsg(_)
-                | RolloutItem::SessionMeta(_) => {}
+                RolloutItem::ResponseItem(response_item) => {
+                    let active_segment =
+                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    active_segment.counts_as_user_turn |= is_user_turn_boundary(response_item);
+                }
+                RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => {}
             }
 
             if base_replacement_history.is_some()
-                && previous_model.is_some()
+                && previous_turn_settings.is_some()
                 && !matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
             {
                 // At this point we have both eager resume metadata values and the replacement-
@@ -218,7 +225,7 @@ impl Session {
             finalize_active_segment(
                 active_segment,
                 &mut base_replacement_history,
-                &mut previous_model,
+                &mut previous_turn_settings,
                 &mut reference_context_item,
                 &mut pending_rollback_turns,
             );
@@ -287,7 +294,7 @@ impl Session {
 
         RolloutReconstruction {
             history: history.raw_items().to_vec(),
-            previous_model,
+            previous_turn_settings,
             reference_context_item,
         }
     }

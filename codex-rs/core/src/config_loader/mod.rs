@@ -6,12 +6,11 @@ mod macos;
 mod tests;
 
 use crate::config::ConfigToml;
-use crate::config::deserialize_config_toml_with_base;
 use crate::config_loader::layer_io::LoadedConfigLayers;
-use crate::git_info::resolve_root_git_project_for_trust;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigRequirementsWithSources;
+use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::protocol::AskForApproval;
@@ -25,7 +24,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use toml::Value as TomlValue;
 
+pub use codex_config::AppRequirementToml;
+pub use codex_config::AppsRequirementsToml;
 pub use codex_config::CloudRequirementsLoadError;
+pub use codex_config::CloudRequirementsLoadErrorCode;
 pub use codex_config::CloudRequirementsLoader;
 pub use codex_config::ConfigError;
 pub use codex_config::ConfigLayerEntry;
@@ -35,6 +37,7 @@ pub use codex_config::ConfigLoadError;
 pub use codex_config::ConfigRequirements;
 pub use codex_config::ConfigRequirementsToml;
 pub use codex_config::ConstrainedWithSource;
+pub use codex_config::FeatureRequirementsToml;
 pub use codex_config::LoaderOverrides;
 pub use codex_config::McpServerIdentity;
 pub use codex_config::McpServerRequirement;
@@ -206,7 +209,7 @@ pub async fn load_config_layers_state(
                     return Err(io_error_from_config_error(
                         io::ErrorKind::InvalidData,
                         config_error,
-                        None,
+                        /*source*/ None,
                     ));
                 }
                 return Err(err);
@@ -576,6 +579,11 @@ struct ProjectTrustContext {
     user_config_file: AbsolutePathBuf,
 }
 
+#[derive(Deserialize)]
+struct ProjectTrustConfigToml {
+    projects: Option<std::collections::HashMap<String, crate::config::ProjectConfig>>,
+}
+
 struct ProjectTrustDecision {
     trust_level: Option<TrustLevel>,
     trust_key: String,
@@ -666,10 +674,16 @@ async fn project_trust_context(
     config_base_dir: &Path,
     user_config_file: &AbsolutePathBuf,
 ) -> io::Result<ProjectTrustContext> {
-    let config_toml = deserialize_config_toml_with_base(merged_config.clone(), config_base_dir)?;
+    let project_trust_config: ProjectTrustConfigToml = {
+        let _guard = AbsolutePathBufGuard::new(config_base_dir);
+        merged_config
+            .clone()
+            .try_into()
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
+    };
 
     let project_root = find_project_root(cwd, project_root_markers).await?;
-    let projects = config_toml.projects.unwrap_or_default();
+    let projects = project_trust_config.projects.unwrap_or_default();
 
     let project_root_key = project_root.as_path().to_string_lossy().to_string();
     let repo_root = resolve_root_git_project_for_trust(cwd.as_path());
@@ -839,15 +853,20 @@ async fn load_project_layers(
                             &dot_codex_abs,
                             &layer_dir,
                             TomlValue::Table(toml::map::Map::new()),
-                            true,
+                            /*config_toml_exists*/ true,
                         ));
                         continue;
                     }
                 };
                 let config =
                     resolve_relative_paths_in_config_toml(config, dot_codex_abs.as_path())?;
-                let entry =
-                    project_layer_entry(trust_context, &dot_codex_abs, &layer_dir, config, true);
+                let entry = project_layer_entry(
+                    trust_context,
+                    &dot_codex_abs,
+                    &layer_dir,
+                    config,
+                    /*config_toml_exists*/ true,
+                );
                 layers.push(entry);
             }
             Err(err) => {
@@ -860,7 +879,7 @@ async fn load_project_layers(
                         &dot_codex_abs,
                         &layer_dir,
                         TomlValue::Table(toml::map::Map::new()),
-                        false,
+                        /*config_toml_exists*/ false,
                     ));
                 } else {
                     let config_file_display = config_file.as_path().display();
