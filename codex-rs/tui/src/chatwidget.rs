@@ -7588,6 +7588,10 @@ impl ChatWidget {
         self.user_turn_pending_start || self.bottom_pane.is_task_running()
     }
 
+    pub(crate) fn mark_user_turn_pending_start(&mut self) {
+        self.user_turn_pending_start = true;
+    }
+
     fn only_user_shell_commands_running(&self) -> bool {
         self.agent_turn_running
             && !self.running_commands.is_empty()
@@ -10901,7 +10905,7 @@ impl ChatWidget {
         if !self.submit_op(op) {
             return;
         }
-        self.user_turn_pending_start = true;
+        self.mark_user_turn_pending_start();
         if let Some(history_op) = history_op {
             self.submit_op(history_op);
         }
@@ -10922,7 +10926,7 @@ impl ChatWidget {
         if !self.submit_op(op) {
             return;
         }
-        self.user_turn_pending_start = true;
+        self.mark_user_turn_pending_start();
         if let Some(history_op) = history_op {
             self.submit_op(history_op);
         }

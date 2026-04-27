@@ -1528,6 +1528,9 @@ impl App {
                     if let Some((op, history_op, submitted_text)) = prepared {
                         let render_in_active_history = Some(thread_id) == self.active_thread_id;
                         self.submit_thread_op(app_server, thread_id, op).await?;
+                        if render_in_active_history {
+                            self.chat_widget.mark_user_turn_pending_start();
+                        }
                         if let Some(history_op) = history_op {
                             self.submit_thread_op(app_server, thread_id, history_op)
                                 .await?;
