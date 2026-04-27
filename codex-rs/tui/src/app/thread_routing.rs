@@ -429,7 +429,7 @@ impl App {
         thread_id: ThreadId,
         op: AppCommand,
     ) -> Result<()> {
-        crate::session_log::log_outbound_op(&op);
+        crate::session_log::log_outbound_op(&op, Some(&thread_id));
 
         if self
             .try_resolve_app_server_request(app_server, thread_id, &op)

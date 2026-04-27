@@ -64,6 +64,8 @@ impl App {
         app_server_client: &AppServerSession,
         notification: ServerNotification,
     ) {
+        crate::session_log::log_server_notification(&notification);
+
         match &notification {
             ServerNotification::ServerRequestResolved(notification) => {
                 if let Some(request) = self
