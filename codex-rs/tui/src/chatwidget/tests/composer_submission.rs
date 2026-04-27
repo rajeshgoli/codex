@@ -35,6 +35,7 @@ async fn external_literal_message_submits_user_turn() {
 
     chat.submit_external_literal_user_message("!literal from sm send".to_string());
 
+    assert!(chat.is_user_turn_pending_or_running());
     let items = match next_submit_op(&mut op_rx) {
         Op::UserTurn { items, .. } => items,
         other => panic!("expected Op::UserTurn, got {other:?}"),
@@ -109,6 +110,7 @@ async fn external_literal_message_queued_before_config_preserves_bang_literal() 
 
     chat.maybe_send_next_queued_input();
 
+    assert!(chat.is_user_turn_pending_or_running());
     loop {
         match op_rx.try_recv() {
             Ok(Op::UserTurn { items, .. }) => {

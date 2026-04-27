@@ -10901,6 +10901,7 @@ impl ChatWidget {
         if !self.submit_op(op) {
             return;
         }
+        self.user_turn_pending_start = true;
         if let Some(history_op) = history_op {
             self.submit_op(history_op);
         }
@@ -10921,6 +10922,7 @@ impl ChatWidget {
         if !self.submit_op(op) {
             return;
         }
+        self.user_turn_pending_start = true;
         if let Some(history_op) = history_op {
             self.submit_op(history_op);
         }
