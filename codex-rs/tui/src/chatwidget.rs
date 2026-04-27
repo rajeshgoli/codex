@@ -1157,7 +1157,7 @@ impl ThreadComposerState {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ThreadInputState {
     composer: Option<ThreadComposerState>,
-    pending_steers: VecDeque<UserMessage>,
+    pending_steers: VecDeque<PendingSteer>,
     rejected_steers_queue: VecDeque<UserMessage>,
     queued_user_messages: VecDeque<QueuedUserMessage>,
     user_turn_pending_start: bool,
@@ -1193,7 +1193,10 @@ impl ThreadInputState {
     }
 
     pub(crate) fn record_pending_external_literal_steer(&mut self, text: String) {
-        self.pending_steers.push_back(UserMessage::from(text));
+        self.pending_steers.push_back(PendingSteer::new(
+            UserMessage::from(text),
+            QueuedInputAction::LiteralUserTurn,
+        ));
     }
 
     pub(crate) fn enqueue_rejected_steer(&mut self) -> bool {
@@ -1204,7 +1207,7 @@ impl ThreadInputState {
             return false;
         };
         self.queued_user_messages.push_front(QueuedUserMessage::new(
-            pending_steer,
+            pending_steer.user_message,
             QueuedInputAction::LiteralUserTurn,
         ));
         true
@@ -1237,10 +1240,28 @@ impl From<&str> for UserMessage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
 struct PendingSteer {
     user_message: UserMessage,
     compare_key: PendingSteerCompareKey,
     rejection_action: QueuedInputAction,
+}
+
+impl PendingSteer {
+    fn new(user_message: UserMessage, rejection_action: QueuedInputAction) -> Self {
+        Self {
+            compare_key: Self::compare_key_for_message(&user_message),
+            user_message,
+            rejection_action,
+        }
+    }
+
+    fn compare_key_for_message(user_message: &UserMessage) -> PendingSteerCompareKey {
+        PendingSteerCompareKey {
+            message: user_message.text.clone(),
+            image_count: user_message.local_images.len() + user_message.remote_image_urls.len(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3599,11 +3620,7 @@ impl ChatWidget {
         };
         Some(ThreadInputState {
             composer: composer.has_content().then_some(composer),
-            pending_steers: self
-                .pending_steers
-                .iter()
-                .map(|pending| pending.user_message.clone())
-                .collect(),
+            pending_steers: self.pending_steers.iter().cloned().collect(),
             rejected_steers_queue: self.rejected_steers_queue.clone(),
             queued_user_messages: self.queued_user_messages.clone(),
             user_turn_pending_start: self.user_turn_pending_start,
@@ -3648,19 +3665,7 @@ impl ChatWidget {
                 );
                 self.bottom_pane.set_composer_pending_pastes(Vec::new());
             }
-            self.pending_steers = input_state
-                .pending_steers
-                .into_iter()
-                .map(|user_message| PendingSteer {
-                    compare_key: PendingSteerCompareKey {
-                        message: user_message.text.clone(),
-                        image_count: user_message.local_images.len()
-                            + user_message.remote_image_urls.len(),
-                    },
-                    user_message,
-                    rejection_action: QueuedInputAction::Plain,
-                })
-                .collect();
+            self.pending_steers = input_state.pending_steers.into_iter().collect();
             self.rejected_steers_queue = input_state.rejected_steers_queue;
             self.queued_user_messages = input_state.queued_user_messages;
         } else {
