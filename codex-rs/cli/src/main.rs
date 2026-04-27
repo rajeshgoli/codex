@@ -1629,8 +1629,6 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         web_search,
         prompt,
         config_overrides,
-        images,
-        add_dir,
         event_stream,
         event_schema_version,
         ..
@@ -1643,12 +1641,6 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     }
     if web_search {
         interactive.web_search = true;
-    }
-    if !images.is_empty() {
-        interactive.images = images;
-    }
-    if !add_dir.is_empty() {
-        interactive.add_dir.extend(add_dir);
     }
     if event_stream.is_some() {
         interactive.event_stream = event_stream;

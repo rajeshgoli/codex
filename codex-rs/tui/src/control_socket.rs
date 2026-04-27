@@ -25,8 +25,6 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
-use std::io::BufRead;
-#[cfg(unix)]
 use std::io::BufReader;
 #[cfg(unix)]
 use std::io::ErrorKind;
@@ -343,7 +341,9 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                                 text: message,
                                 text_elements: Vec::new(),
                             }],
+                            environments: None,
                             final_output_json_schema: None,
+                            responsesapi_client_metadata: None,
                         };
                         match dispatch_op(state, Some(thread_id), op) {
                             Ok(()) => response_ok(

@@ -210,6 +210,7 @@ fn validate_schema_version(schema_version: u32) -> std::io::Result<()> {
     ))
 }
 
+#[cfg(test)]
 fn normalize_contract_event_type(event_type: &str) -> String {
     match event_type {
         "task_started" => "turn_started".to_string(),
