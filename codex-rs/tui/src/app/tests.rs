@@ -4763,7 +4763,7 @@ async fn interrupt_without_active_turn_is_treated_as_handled() {
         .await
         .expect("interrupt submission should not fail");
 
-    assert_eq!(handled, true);
+    assert_eq!(handled.map(|result| result.is_accepted()), Some(true));
 }
 
 #[tokio::test]

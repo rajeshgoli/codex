@@ -6,6 +6,36 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ThreadOpSubmitResult {
+    accepted: bool,
+    steered: bool,
+}
+
+impl ThreadOpSubmitResult {
+    fn accepted(steered: bool) -> Self {
+        Self {
+            accepted: true,
+            steered,
+        }
+    }
+
+    fn rejected() -> Self {
+        Self {
+            accepted: false,
+            steered: false,
+        }
+    }
+
+    pub(super) fn is_accepted(self) -> bool {
+        self.accepted
+    }
+
+    pub(super) fn is_steered(self) -> bool {
+        self.steered
+    }
+}
+
 impl App {
     pub(super) async fn shutdown_current_thread(&mut self, app_server: &mut AppServerSession) {
         if let Some(thread_id) = self.chat_widget.thread_id() {
@@ -146,6 +176,26 @@ impl App {
                 ThreadInputState::for_target_session(&session, agent_turn_running)
             })
             .record_pending_external_literal_steer(text);
+    }
+
+    pub(super) async fn cancel_pending_external_literal_steer_for_thread(
+        &mut self,
+        thread_id: ThreadId,
+        text: &str,
+    ) {
+        if Some(thread_id) == self.active_thread_id {
+            self.chat_widget.cancel_pending_external_literal_steer(text);
+            return;
+        }
+
+        let Some(channel) = self.thread_event_channels.get(&thread_id) else {
+            return;
+        };
+        let mut store = channel.store.lock().await;
+        let Some(input_state) = store.input_state.as_mut() else {
+            return;
+        };
+        input_state.cancel_pending_external_literal_steer(text);
     }
 
     pub(super) async fn enqueue_rejected_steer_for_thread(&mut self, thread_id: ThreadId) -> bool {
@@ -423,35 +473,35 @@ impl App {
         app_server: &mut AppServerSession,
         thread_id: ThreadId,
         op: AppCommand,
-    ) -> Result<bool> {
+    ) -> Result<ThreadOpSubmitResult> {
         crate::session_log::log_outbound_op(&op, Some(&thread_id));
 
         if self.try_handle_local_history_op(thread_id, &op).await? {
-            return Ok(true);
+            return Ok(ThreadOpSubmitResult::accepted(false));
         }
 
         if self
             .try_resolve_app_server_request(app_server, thread_id, &op)
             .await?
         {
-            return Ok(true);
+            return Ok(ThreadOpSubmitResult::accepted(false));
         }
 
-        if self
+        if let Some(result) = self
             .try_submit_active_thread_op_via_app_server(app_server, thread_id, &op)
             .await?
         {
-            if ThreadEventStore::op_can_change_pending_replay_state(&op) {
+            if result.is_accepted() && ThreadEventStore::op_can_change_pending_replay_state(&op) {
                 self.note_thread_outbound_op(thread_id, &op).await;
                 self.refresh_pending_thread_approvals().await;
                 self.refresh_side_parent_status_from_store(thread_id).await;
             }
-            return Ok(true);
+            return Ok(result);
         }
 
         self.chat_widget
             .add_error_message(format!("Not available in TUI yet for thread {thread_id}."));
-        Ok(false)
+        Ok(ThreadOpSubmitResult::rejected())
     }
 
     /// Spawn a background task that fetches MCP server status from the app-server
@@ -525,7 +575,7 @@ impl App {
         app_server: &mut AppServerSession,
         thread_id: ThreadId,
         op: &AppCommand,
-    ) -> Result<bool> {
+    ) -> Result<Option<ThreadOpSubmitResult>> {
         match op.view() {
             AppCommandView::Interrupt => {
                 if let Some(turn_id) = self.active_turn_id_for_thread(thread_id).await {
@@ -533,7 +583,7 @@ impl App {
                 } else {
                     app_server.startup_interrupt(thread_id).await?;
                 }
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
             AppCommandView::UserTurn {
                 items,
@@ -559,16 +609,16 @@ impl App {
                             .turn_steer(thread_id, steer_turn_id.clone(), items.to_vec())
                             .await
                         {
-                            Ok(_) => return Ok(true),
+                            Ok(_) => return Ok(Some(ThreadOpSubmitResult::accepted(true))),
                             Err(error) => {
                                 if let Some(turn_error) =
                                     active_turn_not_steerable_turn_error(&error)
                                 {
                                     if !self.enqueue_rejected_steer_for_thread(thread_id).await {
                                         self.chat_widget.add_error_message(turn_error.message);
-                                        return Ok(false);
+                                        return Ok(Some(ThreadOpSubmitResult::rejected()));
                                     }
-                                    return Ok(true);
+                                    return Ok(Some(ThreadOpSubmitResult::accepted(true)));
                                 }
                                 match active_turn_steer_race(&error) {
                                     Some(ActiveTurnSteerRace::Missing) => {
@@ -637,7 +687,7 @@ impl App {
                         )
                         .await?;
                 }
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
             AppCommandView::ListSkills { cwds, force_reload } => {
                 self.handle_skills_list_result(
@@ -650,17 +700,17 @@ impl App {
                         .await,
                     "failed to refresh skills",
                 );
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
             AppCommandView::Compact => {
                 app_server.thread_compact_start(thread_id).await?;
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
             AppCommandView::SetThreadName { name } => {
                 app_server
                     .thread_set_name(thread_id, name.to_string())
                     .await?;
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
             AppCommandView::ThreadRollback { num_turns } => {
                 let response = match app_server.thread_rollback(thread_id, num_turns).await {
@@ -672,60 +722,62 @@ impl App {
                 };
                 self.handle_thread_rollback_response(thread_id, num_turns, &response)
                     .await;
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
             AppCommandView::Review { review_request } => {
                 app_server
                     .review_start(thread_id, review_request.clone())
                     .await?;
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
             AppCommandView::CleanBackgroundTerminals => {
                 app_server
                     .thread_background_terminals_clean(thread_id)
                     .await?;
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
             AppCommandView::RealtimeConversationStart(params) => {
                 app_server
                     .thread_realtime_start(thread_id, params.clone())
                     .await?;
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
             AppCommandView::RealtimeConversationAudio(params) => {
                 app_server
                     .thread_realtime_audio(thread_id, params.clone())
                     .await?;
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
             AppCommandView::RealtimeConversationText(params) => {
                 app_server
                     .thread_realtime_text(thread_id, params.clone())
                     .await?;
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
             AppCommandView::RealtimeConversationClose => {
                 app_server.thread_realtime_stop(thread_id).await?;
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
             AppCommandView::RunUserShellCommand { command } => {
                 app_server
                     .thread_shell_command(thread_id, command.to_string())
                     .await?;
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
             AppCommandView::ReloadUserConfig => {
                 app_server.reload_user_config().await?;
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
-            AppCommandView::OverrideTurnContext { .. } => Ok(true),
+            AppCommandView::OverrideTurnContext { .. } => {
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
+            }
             AppCommandView::Other(Op::ApproveGuardianDeniedAction { event }) => {
                 app_server
                     .thread_approve_guardian_denied_action(thread_id, event)
                     .await?;
-                Ok(true)
+                Ok(Some(ThreadOpSubmitResult::accepted(false)))
             }
-            _ => Ok(false),
+            _ => Ok(None),
         }
     }
 

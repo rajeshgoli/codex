@@ -1199,6 +1199,15 @@ impl ThreadInputState {
         ));
     }
 
+    pub(crate) fn cancel_pending_external_literal_steer(&mut self, text: &str) {
+        if self.pending_steers.back().is_some_and(|pending| {
+            pending.rejection_action == QueuedInputAction::LiteralUserTurn
+                && pending.user_message.text == text
+        }) {
+            self.pending_steers.pop_back();
+        }
+    }
+
     pub(crate) fn enqueue_rejected_steer(&mut self) -> bool {
         let Some(pending_steer) = self.pending_steers.pop_front() else {
             tracing::warn!(
@@ -11103,6 +11112,16 @@ impl ChatWidget {
         });
         self.saw_plan_item_this_turn = false;
         self.refresh_pending_input_preview();
+    }
+
+    pub(crate) fn cancel_pending_external_literal_steer(&mut self, text: &str) {
+        if self.pending_steers.back().is_some_and(|pending| {
+            pending.rejection_action == QueuedInputAction::LiteralUserTurn
+                && pending.user_message.text == text
+        }) {
+            self.pending_steers.pop_back();
+            self.refresh_pending_input_preview();
+        }
     }
 
     fn prepare_external_literal_user_message_with_queueing(

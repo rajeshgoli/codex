@@ -1527,28 +1527,33 @@ impl App {
                     };
                     if let Some((op, history_op, submitted_text)) = prepared {
                         let render_in_active_history = Some(thread_id) == self.active_thread_id;
-                        let submitted_as_steer =
-                            self.active_turn_id_for_thread(thread_id).await.is_some();
-                        if submitted_as_steer {
-                            self.record_pending_external_literal_steer_for_thread(
+                        self.record_pending_external_literal_steer_for_thread(
+                            thread_id,
+                            submitted_text.clone(),
+                        )
+                        .await;
+                        let result = self.submit_thread_op(app_server, thread_id, op).await?;
+                        if !result.is_steered() {
+                            self.cancel_pending_external_literal_steer_for_thread(
                                 thread_id,
-                                submitted_text.clone(),
+                                &submitted_text,
                             )
                             .await;
                         }
-                        let accepted = self.submit_thread_op(app_server, thread_id, op).await?;
-                        if !accepted {
+                        if !result.is_accepted() {
                             return Ok(AppRunControl::Continue);
                         }
                         if render_in_active_history {
                             self.chat_widget.mark_user_turn_pending_start();
                         }
-                        if !submitted_as_steer && let Some(history_op) = history_op {
+                        if !result.is_steered()
+                            && let Some(history_op) = history_op
+                        {
                             let _ = self
                                 .submit_thread_op(app_server, thread_id, history_op)
                                 .await?;
                         }
-                        if render_in_active_history && !submitted_as_steer {
+                        if render_in_active_history && !result.is_steered() {
                             self.chat_widget
                                 .render_external_literal_user_message(submitted_text);
                         }
