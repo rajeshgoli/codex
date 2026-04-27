@@ -61,6 +61,10 @@ impl ChatWidget {
         );
     }
 
+    pub(crate) fn is_user_turn_pending_start(&self) -> bool {
+        self.user_turn_pending_start
+    }
+
     pub(crate) fn prepare_external_literal_user_message(
         &mut self,
         text: String,
@@ -296,15 +300,24 @@ impl ThreadInputState {
         self.user_turn_pending_start || self.task_running
     }
 
+    pub(crate) fn is_user_turn_pending_start(&self) -> bool {
+        self.user_turn_pending_start
+    }
+
     pub(crate) fn mark_user_turn_pending_start(&mut self) {
         self.user_turn_pending_start = true;
     }
 
-    pub(crate) fn queue_external_literal_user_message(&mut self, text: String) {
-        self.queued_user_messages.push_back(QueuedUserMessage::new(
-            UserMessage::from(text),
-            QueuedInputAction::LiteralUserTurn,
-        ));
+    pub(crate) fn mark_user_turn_started(&mut self) {
+        self.user_turn_pending_start = false;
+        self.task_running = true;
+        self.agent_turn_running = true;
+    }
+
+    pub(crate) fn mark_user_turn_completed(&mut self) {
+        self.user_turn_pending_start = false;
+        self.task_running = false;
+        self.agent_turn_running = false;
     }
 
     pub(crate) fn enqueue_rejected_steer(&mut self) -> bool {

@@ -379,7 +379,7 @@ async fn targeted_external_literal_input_state_records_rejected_steer() {
 }
 
 #[tokio::test]
-async fn targeted_external_literal_input_state_tracks_pending_start_and_queues_followups() {
+async fn targeted_external_literal_input_state_tracks_background_turn_lifecycle() {
     let target_thread_id = ThreadId::new();
     let target_session = ThreadSessionState {
         thread_id: target_thread_id,
@@ -405,20 +405,19 @@ async fn targeted_external_literal_input_state_tracks_pending_start_and_queues_f
         ThreadInputState::for_target_session(&target_session, /*agent_turn_running*/ false);
 
     assert!(!input_state.is_user_turn_pending_or_running());
+    assert!(!input_state.is_user_turn_pending_start());
 
     input_state.mark_user_turn_pending_start();
     assert!(input_state.is_user_turn_pending_or_running());
+    assert!(input_state.is_user_turn_pending_start());
 
-    input_state.queue_external_literal_user_message("!literal followup".to_string());
+    input_state.mark_user_turn_started();
+    assert!(input_state.is_user_turn_pending_or_running());
+    assert!(!input_state.is_user_turn_pending_start());
 
-    assert_eq!(
-        input_state
-            .queued_user_messages
-            .iter()
-            .map(|message| (message.text.as_str(), message.action))
-            .collect::<Vec<_>>(),
-        vec![("!literal followup", QueuedInputAction::LiteralUserTurn)]
-    );
+    input_state.mark_user_turn_completed();
+    assert!(!input_state.is_user_turn_pending_or_running());
+    assert!(!input_state.is_user_turn_pending_start());
 }
 
 #[tokio::test]
