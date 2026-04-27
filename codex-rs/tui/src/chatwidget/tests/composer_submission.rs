@@ -48,6 +48,27 @@ async fn external_literal_message_submits_user_turn() {
 }
 
 #[tokio::test]
+async fn targeted_external_literal_message_does_not_queue_before_session_configured() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    let prepared = chat
+        .prepare_targeted_external_literal_user_message("targeted before configured".to_string())
+        .expect("targeted external message should prepare immediately");
+
+    match prepared.0.into_core() {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "targeted before configured".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(chat.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
 async fn submission_preserves_text_elements_and_local_images() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

@@ -1494,8 +1494,9 @@ impl App {
                     self.chat_widget.submit_external_literal_user_message(text);
                     return Ok(AppRunControl::Continue);
                 }
-                if let Some((op, history_op, submitted_text)) =
-                    self.chat_widget.prepare_external_literal_user_message(text)
+                if let Some((op, history_op, submitted_text)) = self
+                    .chat_widget
+                    .prepare_targeted_external_literal_user_message(text)
                 {
                     if let Some(thread_id) = target_thread_id {
                         let render_in_active_history = Some(thread_id) == self.active_thread_id;

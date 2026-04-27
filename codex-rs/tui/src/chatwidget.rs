@@ -10908,10 +10908,29 @@ impl ChatWidget {
         &mut self,
         text: String,
     ) -> Option<(AppCommand, Option<AppCommand>, String)> {
+        self.prepare_external_literal_user_message_with_queueing(
+            text, /*queue_if_unconfigured*/ true,
+        )
+    }
+
+    pub(crate) fn prepare_targeted_external_literal_user_message(
+        &mut self,
+        text: String,
+    ) -> Option<(AppCommand, Option<AppCommand>, String)> {
+        self.prepare_external_literal_user_message_with_queueing(
+            text, /*queue_if_unconfigured*/ false,
+        )
+    }
+
+    fn prepare_external_literal_user_message_with_queueing(
+        &mut self,
+        text: String,
+        queue_if_unconfigured: bool,
+    ) -> Option<(AppCommand, Option<AppCommand>, String)> {
         if text.is_empty() {
             return None;
         }
-        if !self.is_session_configured() {
+        if queue_if_unconfigured && !self.is_session_configured() {
             tracing::warn!(
                 "cannot submit external user message before session is configured; queueing"
             );
