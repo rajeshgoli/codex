@@ -7562,6 +7562,13 @@ impl ChatWidget {
                     self.submit_user_message(queued_message.into_user_message());
                     break;
                 }
+                QueuedInputAction::LiteralUserTurn => {
+                    self.submit_user_message_with_shell_escape_policy(
+                        queued_message.into_user_message(),
+                        ShellEscapePolicy::Disallow,
+                    );
+                    break;
+                }
                 QueuedInputAction::ParseSlash => {
                     let drain = self.submit_queued_slash_prompt(queued_message.into_user_message());
                     if drain == QueueDrain::Stop {
@@ -11000,14 +11007,16 @@ impl ChatWidget {
             tracing::warn!(
                 "cannot submit external user message before session is configured; queueing"
             );
-            self.queued_user_messages
-                .push_front(QueuedUserMessage::from(UserMessage {
+            self.queued_user_messages.push_front(QueuedUserMessage::new(
+                UserMessage {
                     text,
                     local_images: Vec::new(),
                     remote_image_urls: Vec::new(),
                     text_elements: Vec::new(),
                     mention_bindings: Vec::new(),
-                }));
+                },
+                QueuedInputAction::LiteralUserTurn,
+            ));
             self.refresh_pending_input_preview();
             return None;
         }
