@@ -379,6 +379,49 @@ async fn targeted_external_literal_input_state_records_rejected_steer() {
 }
 
 #[tokio::test]
+async fn targeted_external_literal_input_state_tracks_pending_start_and_queues_followups() {
+    let target_thread_id = ThreadId::new();
+    let target_session = ThreadSessionState {
+        thread_id: target_thread_id,
+        forked_from_id: None,
+        fork_parent_title: None,
+        thread_name: Some("target".to_string()),
+        model: "target-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::OnRequest,
+        approvals_reviewer: ApprovalsReviewer::AutoReview,
+        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+        permission_profile: None,
+        cwd: test_path_buf("/workspace/target").abs(),
+        instruction_source_paths: Vec::new(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        history_log_id: 0,
+        history_entry_count: 0,
+        network_proxy: None,
+        rollout_path: None,
+    };
+    let mut input_state =
+        ThreadInputState::for_target_session(&target_session, /*agent_turn_running*/ false);
+
+    assert!(!input_state.is_user_turn_pending_or_running());
+
+    input_state.mark_user_turn_pending_start();
+    assert!(input_state.is_user_turn_pending_or_running());
+
+    input_state.queue_external_literal_user_message("!literal followup".to_string());
+
+    assert_eq!(
+        input_state
+            .queued_user_messages
+            .iter()
+            .map(|message| (message.text.as_str(), message.action))
+            .collect::<Vec<_>>(),
+        vec![("!literal followup", QueuedInputAction::LiteralUserTurn)]
+    );
+}
+
+#[tokio::test]
 async fn submission_preserves_text_elements_and_local_images() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

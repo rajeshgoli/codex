@@ -1208,6 +1208,21 @@ impl ThreadInputState {
         }
     }
 
+    pub(crate) fn is_user_turn_pending_or_running(&self) -> bool {
+        self.user_turn_pending_start || self.task_running
+    }
+
+    pub(crate) fn mark_user_turn_pending_start(&mut self) {
+        self.user_turn_pending_start = true;
+    }
+
+    pub(crate) fn queue_external_literal_user_message(&mut self, text: String) {
+        self.queued_user_messages.push_back(QueuedUserMessage::new(
+            UserMessage::from(text),
+            QueuedInputAction::LiteralUserTurn,
+        ));
+    }
+
     pub(crate) fn enqueue_rejected_steer(&mut self) -> bool {
         let Some(pending_steer) = self.pending_steers.pop_front() else {
             tracing::warn!(

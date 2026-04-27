@@ -198,6 +198,28 @@ impl App {
         input_state.cancel_pending_external_literal_steer(text);
     }
 
+    pub(super) async fn mark_user_turn_pending_start_for_thread(&mut self, thread_id: ThreadId) {
+        if Some(thread_id) == self.active_thread_id {
+            self.chat_widget.mark_user_turn_pending_start();
+            return;
+        }
+
+        let Some(channel) = self.thread_event_channels.get(&thread_id) else {
+            return;
+        };
+        let mut store = channel.store.lock().await;
+        let Some(session) = store.session.clone() else {
+            return;
+        };
+        let agent_turn_running = store.active_turn_id().is_some();
+        store
+            .input_state
+            .get_or_insert_with(|| {
+                ThreadInputState::for_target_session(&session, agent_turn_running)
+            })
+            .mark_user_turn_pending_start();
+    }
+
     pub(super) async fn enqueue_rejected_steer_for_thread(&mut self, thread_id: ThreadId) -> bool {
         if Some(thread_id) == self.active_thread_id {
             return self.chat_widget.enqueue_rejected_steer();

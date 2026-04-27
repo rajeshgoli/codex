@@ -1499,30 +1499,45 @@ impl App {
                         self.chat_widget
                             .prepare_targeted_external_literal_user_message(text)
                     } else {
-                        let target_state =
-                            if let Some(channel) = self.thread_event_channels.get(&thread_id) {
-                                let store = channel.store.lock().await;
-                                store
-                                    .session
-                                    .clone()
-                                    .map(|session| (session, store.input_state.clone()))
-                            } else {
-                                None
-                            };
-                        match target_state {
-                            Some((session, input_state)) => self
-                                .chat_widget
-                                .prepare_targeted_external_literal_user_message_for_thread(
-                                    text,
-                                    &session,
-                                    input_state.as_ref(),
-                                ),
+                        let target_state = match self.thread_event_channels.get(&thread_id) {
+                            Some(channel) => {
+                                let mut store = channel.store.lock().await;
+                                match store.session.clone() {
+                                    Some(session) => {
+                                        let agent_turn_running = store.active_turn_id().is_some();
+                                        let input_state =
+                                            store.input_state.get_or_insert_with(|| {
+                                                ThreadInputState::for_target_session(
+                                                    &session,
+                                                    agent_turn_running,
+                                                )
+                                            });
+                                        if input_state.is_user_turn_pending_or_running() {
+                                            input_state.queue_external_literal_user_message(text);
+                                            None
+                                        } else {
+                                            Some((session, input_state.clone(), text))
+                                        }
+                                    }
+                                    None => None,
+                                }
+                            }
                             None => {
                                 self.chat_widget.add_error_message(format!(
                                     "Target thread {thread_id} is not available for external input."
                                 ));
                                 None
                             }
+                        };
+                        match target_state {
+                            Some((session, input_state, text)) => self
+                                .chat_widget
+                                .prepare_targeted_external_literal_user_message_for_thread(
+                                    text,
+                                    &session,
+                                    Some(&input_state),
+                                ),
+                            None => None,
                         }
                     };
                     if let Some((op, history_op, submitted_text)) = prepared {
@@ -1543,8 +1558,9 @@ impl App {
                         if !result.is_accepted() {
                             return Ok(AppRunControl::Continue);
                         }
-                        if render_in_active_history {
-                            self.chat_widget.mark_user_turn_pending_start();
+                        if !result.is_steered() {
+                            self.mark_user_turn_pending_start_for_thread(thread_id)
+                                .await;
                         }
                         if !result.is_steered()
                             && let Some(history_op) = history_op
