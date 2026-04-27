@@ -1527,6 +1527,13 @@ impl App {
                     };
                     if let Some((op, history_op, submitted_text)) = prepared {
                         let render_in_active_history = Some(thread_id) == self.active_thread_id;
+                        if self.active_turn_id_for_thread(thread_id).await.is_some() {
+                            self.record_pending_external_literal_steer_for_thread(
+                                thread_id,
+                                submitted_text.clone(),
+                            )
+                            .await;
+                        }
                         let accepted = self.submit_thread_op(app_server, thread_id, op).await?;
                         if !accepted {
                             return Ok(AppRunControl::Continue);

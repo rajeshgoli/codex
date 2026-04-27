@@ -1167,6 +1167,47 @@ pub(crate) struct ThreadInputState {
     agent_turn_running: bool,
 }
 
+impl ThreadInputState {
+    pub(crate) fn for_target_session(
+        session: &ThreadSessionState,
+        agent_turn_running: bool,
+    ) -> Self {
+        Self {
+            composer: None,
+            pending_steers: VecDeque::new(),
+            rejected_steers_queue: VecDeque::new(),
+            queued_user_messages: VecDeque::new(),
+            user_turn_pending_start: false,
+            current_collaboration_mode: CollaborationMode {
+                mode: ModeKind::Default,
+                settings: Settings {
+                    model: session.model.clone(),
+                    reasoning_effort: session.reasoning_effort,
+                    developer_instructions: None,
+                },
+            },
+            active_collaboration_mask: None,
+            task_running: agent_turn_running,
+            agent_turn_running,
+        }
+    }
+
+    pub(crate) fn record_pending_external_literal_steer(&mut self, text: String) {
+        self.pending_steers.push_back(UserMessage::from(text));
+    }
+
+    pub(crate) fn enqueue_rejected_steer(&mut self) -> bool {
+        let Some(pending_steer) = self.pending_steers.pop_front() else {
+            tracing::warn!(
+                "received active-turn-not-steerable error without a matching target pending steer"
+            );
+            return false;
+        };
+        self.rejected_steers_queue.push_back(pending_steer);
+        true
+    }
+}
+
 impl From<String> for UserMessage {
     fn from(text: String) -> Self {
         Self {
@@ -10967,7 +11008,14 @@ impl ChatWidget {
         }];
         let base_mode = input_state
             .map(|state| state.current_collaboration_mode.clone())
-            .unwrap_or_else(|| self.current_collaboration_mode.clone());
+            .unwrap_or_else(|| CollaborationMode {
+                mode: ModeKind::Default,
+                settings: Settings {
+                    model: session.model.clone(),
+                    reasoning_effort: session.reasoning_effort,
+                    developer_instructions: None,
+                },
+            });
         let effective_mode = input_state
             .and_then(|state| state.active_collaboration_mask.as_ref())
             .map(|mask| base_mode.apply_mask(mask))
@@ -11016,6 +11064,18 @@ impl ChatWidget {
         let history_op = Some(AppCommand::from(Op::AddToHistory { text: text.clone() }));
 
         Some((op, history_op, text))
+    }
+
+    pub(crate) fn record_pending_external_literal_steer(&mut self, text: String) {
+        self.pending_steers.push_back(PendingSteer {
+            user_message: UserMessage::from(text.clone()),
+            compare_key: PendingSteerCompareKey {
+                message: text,
+                image_count: 0,
+            },
+        });
+        self.saw_plan_item_this_turn = false;
+        self.refresh_pending_input_preview();
     }
 
     fn prepare_external_literal_user_message_with_queueing(

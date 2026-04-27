@@ -122,6 +122,49 @@ impl App {
         store.active_turn_id().map(ToOwned::to_owned)
     }
 
+    pub(super) async fn record_pending_external_literal_steer_for_thread(
+        &mut self,
+        thread_id: ThreadId,
+        text: String,
+    ) {
+        if Some(thread_id) == self.active_thread_id {
+            self.chat_widget.record_pending_external_literal_steer(text);
+            return;
+        }
+
+        let Some(channel) = self.thread_event_channels.get(&thread_id) else {
+            return;
+        };
+        let mut store = channel.store.lock().await;
+        let Some(session) = store.session.clone() else {
+            return;
+        };
+        let agent_turn_running = store.active_turn_id().is_some();
+        store
+            .input_state
+            .get_or_insert_with(|| {
+                ThreadInputState::for_target_session(&session, agent_turn_running)
+            })
+            .record_pending_external_literal_steer(text);
+    }
+
+    pub(super) async fn enqueue_rejected_steer_for_thread(&mut self, thread_id: ThreadId) -> bool {
+        if Some(thread_id) == self.active_thread_id {
+            return self.chat_widget.enqueue_rejected_steer();
+        }
+
+        let Some(channel) = self.thread_event_channels.get(&thread_id) else {
+            tracing::warn!("received active-turn-not-steerable error for unknown thread");
+            return false;
+        };
+        let mut store = channel.store.lock().await;
+        let Some(input_state) = store.input_state.as_mut() else {
+            tracing::warn!("received active-turn-not-steerable error without target input state");
+            return false;
+        };
+        input_state.enqueue_rejected_steer()
+    }
+
     pub(super) fn thread_label(&self, thread_id: ThreadId) -> String {
         let is_primary = self.primary_thread_id == Some(thread_id);
         let fallback_label = if is_primary {
@@ -521,7 +564,7 @@ impl App {
                                 if let Some(turn_error) =
                                     active_turn_not_steerable_turn_error(&error)
                                 {
-                                    if !self.chat_widget.enqueue_rejected_steer() {
+                                    if !self.enqueue_rejected_steer_for_thread(thread_id).await {
                                         self.chat_widget.add_error_message(turn_error.message);
                                         return Ok(false);
                                     }

@@ -336,6 +336,49 @@ async fn targeted_external_literal_message_uses_target_thread_context() {
 }
 
 #[tokio::test]
+async fn targeted_external_literal_input_state_records_rejected_steer() {
+    let target_thread_id = ThreadId::new();
+    let target_cwd = test_path_buf("/workspace/target").abs();
+    let target_session = ThreadSessionState {
+        thread_id: target_thread_id,
+        forked_from_id: None,
+        fork_parent_title: None,
+        thread_name: Some("target".to_string()),
+        model: "target-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::OnRequest,
+        approvals_reviewer: ApprovalsReviewer::AutoReview,
+        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+        permission_profile: Some(PermissionProfile::from_legacy_sandbox_policy(
+            &SandboxPolicy::new_workspace_write_policy(),
+            target_cwd.as_path(),
+        )),
+        cwd: target_cwd,
+        instruction_source_paths: Vec::new(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        history_log_id: 0,
+        history_entry_count: 0,
+        network_proxy: None,
+        rollout_path: None,
+    };
+    let mut input_state =
+        ThreadInputState::for_target_session(&target_session, /*agent_turn_running*/ true);
+
+    input_state.record_pending_external_literal_steer("target steer".to_string());
+
+    assert!(input_state.enqueue_rejected_steer());
+    assert_eq!(
+        input_state
+            .rejected_steers_queue
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["target steer"]
+    );
+}
+
+#[tokio::test]
 async fn submission_preserves_text_elements_and_local_images() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
