@@ -371,7 +371,8 @@ impl App {
             return Ok(());
         };
 
-        self.submit_thread_op(app_server, thread_id, op).await
+        let _ = self.submit_thread_op(app_server, thread_id, op).await?;
+        Ok(())
     }
 
     pub(super) async fn submit_thread_op(
@@ -379,18 +380,18 @@ impl App {
         app_server: &mut AppServerSession,
         thread_id: ThreadId,
         op: AppCommand,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         crate::session_log::log_outbound_op(&op, Some(&thread_id));
 
         if self.try_handle_local_history_op(thread_id, &op).await? {
-            return Ok(());
+            return Ok(true);
         }
 
         if self
             .try_resolve_app_server_request(app_server, thread_id, &op)
             .await?
         {
-            return Ok(());
+            return Ok(true);
         }
 
         if self
@@ -402,12 +403,12 @@ impl App {
                 self.refresh_pending_thread_approvals().await;
                 self.refresh_side_parent_status_from_store(thread_id).await;
             }
-            return Ok(());
+            return Ok(true);
         }
 
         self.chat_widget
             .add_error_message(format!("Not available in TUI yet for thread {thread_id}."));
-        Ok(())
+        Ok(false)
     }
 
     /// Spawn a background task that fetches MCP server status from the app-server
@@ -522,6 +523,7 @@ impl App {
                                 {
                                     if !self.chat_widget.enqueue_rejected_steer() {
                                         self.chat_widget.add_error_message(turn_error.message);
+                                        return Ok(false);
                                     }
                                     return Ok(true);
                                 }
