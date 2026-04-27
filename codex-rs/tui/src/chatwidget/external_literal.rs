@@ -107,13 +107,16 @@ impl ChatWidget {
                     developer_instructions: None,
                 },
             });
+        let has_collaboration_mask = input_state
+            .and_then(|state| state.active_collaboration_mask.as_ref())
+            .is_some();
         let effective_mode = input_state
             .and_then(|state| state.active_collaboration_mask.as_ref())
             .map(|mask| base_mode.apply_mask(mask))
             .unwrap_or(base_mode)
             .with_updates(
-                Some(session.model.clone()),
-                Some(session.reasoning_effort),
+                (!has_collaboration_mask).then(|| session.model.clone()),
+                (!has_collaboration_mask).then_some(session.reasoning_effort),
                 /*developer_instructions*/ None,
             );
         if effective_mode.model().trim().is_empty() {
@@ -331,9 +334,13 @@ impl ThreadInputState {
             QueuedInputAction::Plain => self
                 .rejected_steers_queue
                 .push_back(pending_steer.user_message),
-            QueuedInputAction::LiteralUserTurn
-            | QueuedInputAction::ParseSlash
-            | QueuedInputAction::RunShell => {
+            QueuedInputAction::LiteralUserTurn => {
+                self.queued_user_messages.push_back(QueuedUserMessage::new(
+                    pending_steer.user_message,
+                    QueuedInputAction::LiteralUserTurn,
+                ));
+            }
+            QueuedInputAction::ParseSlash | QueuedInputAction::RunShell => {
                 self.queued_user_messages.push_front(QueuedUserMessage::new(
                     pending_steer.user_message,
                     pending_steer.rejection_action,

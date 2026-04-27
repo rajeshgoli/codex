@@ -336,6 +336,86 @@ async fn targeted_external_literal_message_uses_target_thread_context() {
 }
 
 #[tokio::test]
+async fn targeted_external_literal_message_preserves_target_collaboration_mask() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("active-model")).await;
+
+    let target_session = ThreadSessionState {
+        thread_id: ThreadId::new(),
+        forked_from_id: None,
+        fork_parent_title: None,
+        thread_name: Some("target".to_string()),
+        model: "target-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::OnRequest,
+        approvals_reviewer: ApprovalsReviewer::AutoReview,
+        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+        permission_profile: None,
+        cwd: test_path_buf("/workspace/target").abs(),
+        instruction_source_paths: Vec::new(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        history_log_id: 0,
+        history_entry_count: 0,
+        network_proxy: None,
+        rollout_path: None,
+    };
+    let mut input_state =
+        ThreadInputState::for_target_session(&target_session, /*agent_turn_running*/ false);
+    input_state.current_collaboration_mode = CollaborationMode {
+        mode: ModeKind::Default,
+        settings: Settings {
+            model: "base-model".to_string(),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            developer_instructions: None,
+        },
+    };
+    input_state.active_collaboration_mask = Some(CollaborationModeMask {
+        name: "custom".to_string(),
+        mode: Some(ModeKind::Plan),
+        model: Some("masked-model".to_string()),
+        reasoning_effort: Some(Some(ReasoningEffort::Minimal)),
+        developer_instructions: None,
+    });
+
+    let prepared = chat
+        .prepare_targeted_external_literal_user_message_for_thread(
+            "targeted to inactive thread".to_string(),
+            &target_session,
+            Some(&input_state),
+        )
+        .expect("targeted external message should prepare with target mask");
+
+    match prepared.0.into_core() {
+        Op::UserTurn { model, effort, .. } => {
+            assert_eq!(model, "masked-model");
+            assert_eq!(effort, Some(ReasoningEffortConfig::Minimal));
+        }
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn external_literal_rejected_steers_preserve_fifo_order() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("active-model")).await;
+
+    chat.record_pending_external_literal_steer("first literal".to_string());
+    chat.record_pending_external_literal_steer("second literal".to_string());
+
+    assert!(chat.enqueue_rejected_steer());
+    assert!(chat.enqueue_rejected_steer());
+    assert_eq!(
+        chat.queued_user_messages
+            .iter()
+            .map(|message| (message.text.as_str(), message.action))
+            .collect::<Vec<_>>(),
+        vec![
+            ("first literal", QueuedInputAction::LiteralUserTurn),
+            ("second literal", QueuedInputAction::LiteralUserTurn),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn targeted_external_literal_input_state_records_rejected_steer() {
     let target_thread_id = ThreadId::new();
     let target_cwd = test_path_buf("/workspace/target").abs();
@@ -365,8 +445,10 @@ async fn targeted_external_literal_input_state_records_rejected_steer() {
     let mut input_state =
         ThreadInputState::for_target_session(&target_session, /*agent_turn_running*/ true);
 
-    input_state.record_pending_external_literal_steer("!literal target steer".to_string());
+    input_state.record_pending_external_literal_steer("!literal target steer 1".to_string());
+    input_state.record_pending_external_literal_steer("!literal target steer 2".to_string());
 
+    assert!(input_state.enqueue_rejected_steer());
     assert!(input_state.enqueue_rejected_steer());
     assert_eq!(
         input_state
@@ -374,7 +456,16 @@ async fn targeted_external_literal_input_state_records_rejected_steer() {
             .iter()
             .map(|message| (message.text.as_str(), message.action))
             .collect::<Vec<_>>(),
-        vec![("!literal target steer", QueuedInputAction::LiteralUserTurn)]
+        vec![
+            (
+                "!literal target steer 1",
+                QueuedInputAction::LiteralUserTurn
+            ),
+            (
+                "!literal target steer 2",
+                QueuedInputAction::LiteralUserTurn
+            ),
+        ]
     );
 }
 

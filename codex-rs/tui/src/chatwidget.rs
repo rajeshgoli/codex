@@ -2791,7 +2791,7 @@ impl ChatWidget {
                 .rejected_steers_queue
                 .push_back(pending_steer.user_message),
             QueuedInputAction::LiteralUserTurn => {
-                self.queued_user_messages.push_front(QueuedUserMessage::new(
+                self.queued_user_messages.push_back(QueuedUserMessage::new(
                     pending_steer.user_message,
                     QueuedInputAction::LiteralUserTurn,
                 ))

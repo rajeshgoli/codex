@@ -636,6 +636,10 @@ impl App {
                                 if let Some(turn_error) =
                                     active_turn_not_steerable_turn_error(&error)
                                 {
+                                    if Some(thread_id) != self.active_thread_id {
+                                        self.chat_widget.add_error_message(turn_error.message);
+                                        return Ok(Some(ThreadOpSubmitResult::rejected()));
+                                    }
                                     if !self.enqueue_rejected_steer_for_thread(thread_id).await {
                                         self.chat_widget.add_error_message(turn_error.message);
                                         return Ok(Some(ThreadOpSubmitResult::rejected()));

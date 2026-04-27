@@ -50,6 +50,8 @@
 //! - Preserves remote image URLs as separate attachments even when text is empty.
 //! - Tags queued inputs with [`QueuedInputAction`] so `ChatWidget` can replay slash commands,
 //!   shell escapes, plain prompts, or external literal user turns with their original semantics.
+//!   Keyboard submissions create plain/slash/shell actions; external control-socket submissions
+//!   use `LiteralUserTurn` so `ChatWidget` can retry them without reparsing their text.
 //!
 //! When these paths clear the visible textarea after a successful submit or slash-command
 //! dispatch, they intentionally preserve the textarea kill buffer. That lets users `Ctrl+K` part

@@ -130,6 +130,10 @@ Queued submissions carry an explicit replay action:
   control-socket payloads, including retries after rejected steers, where the original text must
   stay a literal user turn.
 
+Keyboard submissions choose `Plain`, `ParseSlash`, or `RunShell`. `LiteralUserTurn` is introduced
+by the external control-socket path in `ChatWidget`, not by typing in the composer, so automation
+payloads keep their original text when queued or retried.
+
 The composer also treats the textarea kill buffer as separate editing state from the visible draft.
 After submit or slash-command dispatch clears the textarea, the most recent `Ctrl+K` payload is
 still available for `Ctrl+Y`. This supports flows where a user kills part of a draft, runs a
