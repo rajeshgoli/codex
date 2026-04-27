@@ -1215,10 +1215,19 @@ impl ThreadInputState {
             );
             return false;
         };
-        self.queued_user_messages.push_front(QueuedUserMessage::new(
-            pending_steer.user_message,
-            QueuedInputAction::LiteralUserTurn,
-        ));
+        match pending_steer.rejection_action {
+            QueuedInputAction::Plain => self
+                .rejected_steers_queue
+                .push_back(pending_steer.user_message),
+            QueuedInputAction::LiteralUserTurn
+            | QueuedInputAction::ParseSlash
+            | QueuedInputAction::RunShell => {
+                self.queued_user_messages.push_front(QueuedUserMessage::new(
+                    pending_steer.user_message,
+                    pending_steer.rejection_action,
+                ));
+            }
+        }
         true
     }
 }
@@ -10991,9 +11000,21 @@ impl ChatWidget {
 
     fn submit_queued_external_literal_user_message(&mut self, queued_message: QueuedUserMessage) {
         let text = queued_message.into_user_message().text;
+        if text.is_empty() {
+            return;
+        }
+        if !self.is_session_configured() || self.is_user_turn_pending_or_running() {
+            tracing::warn!("cannot submit queued external user message immediately; requeueing");
+            self.queued_user_messages.push_front(QueuedUserMessage::new(
+                UserMessage::from(text),
+                QueuedInputAction::LiteralUserTurn,
+            ));
+            self.refresh_pending_input_preview();
+            return;
+        }
         let Some((op, history_op, submitted_text)) = self
             .prepare_external_literal_user_message_with_queueing(
-                text, /*queue_if_unconfigured*/ true,
+                text, /*queue_if_unconfigured*/ false,
             )
         else {
             return;

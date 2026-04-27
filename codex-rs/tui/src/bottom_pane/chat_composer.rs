@@ -48,6 +48,8 @@
 //! - Trims whitespace and rebases text elements accordingly.
 //! - Prunes local attached images so only placeholders that survive expansion are sent.
 //! - Preserves remote image URLs as separate attachments even when text is empty.
+//! - Tags queued inputs with [`QueuedInputAction`] so `ChatWidget` can replay slash commands,
+//!   shell escapes, plain prompts, or external literal user turns with their original semantics.
 //!
 //! When these paths clear the visible textarea after a successful submit or slash-command
 //! dispatch, they intentionally preserve the textarea kill buffer. That lets users `Ctrl+K` part
@@ -267,9 +269,16 @@ pub enum InputResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueuedInputAction {
+    /// Replay queued text through the normal user-message path.
     Plain,
+    /// Submit queued text as a literal `UserTurn` without slash, shell, or mention parsing.
+    ///
+    /// This is used for external control-socket messages whose payloads must stay literal even
+    /// when they are queued or retried after a rejected steer.
     LiteralUserTurn,
+    /// Re-parse the queued text as a slash-command candidate when it is dequeued.
     ParseSlash,
+    /// Re-parse the queued text as a shell escape when it is dequeued.
     RunShell,
 }
 

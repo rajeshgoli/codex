@@ -120,6 +120,16 @@ the input starts with `!` (shell command).
 The same preparation path is reused for slash commands with arguments (for example `/plan` and
 `/review`) so pasted content and text elements are preserved when extracting args.
 
+Queued submissions carry an explicit replay action:
+
+- `Plain` re-enters the normal user-message path.
+- `ParseSlash` defers slash validation until dequeue so slash-led prompts queued during a running
+  task are parsed against the then-current command availability.
+- `RunShell` defers `!` shell escape execution until dequeue.
+- `LiteralUserTurn` bypasses slash, shell, and mention parsing. It is reserved for external
+  control-socket payloads, including retries after rejected steers, where the original text must
+  stay a literal user turn.
+
 The composer also treats the textarea kill buffer as separate editing state from the visible draft.
 After submit or slash-command dispatch clears the textarea, the most recent `Ctrl+K` payload is
 still available for `Ctrl+Y`. This supports flows where a user kills part of a draft, runs a
