@@ -8,6 +8,9 @@ use std::sync::OnceLock;
 
 use crate::app_command::AppCommand;
 use crate::legacy_core::config::Config;
+use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::TurnStatus;
+use codex_protocol::ThreadId;
 use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
@@ -153,7 +156,8 @@ impl SessionLogger {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        if event_type == "session_configured"
+        if session_id_override.is_none()
+            && event_type == "session_configured"
             && let Some(session_id) = payload.get("session_id").and_then(Value::as_str)
         {
             state.session_id = Some(session_id.to_string());
@@ -213,6 +217,15 @@ fn normalize_contract_event_type(event_type: &str) -> String {
     match event_type {
         "task_started" => "turn_started".to_string(),
         "task_complete" => "turn_complete".to_string(),
+        "turn/started" => "turn_started".to_string(),
+        "turn/completed" => "turn_complete".to_string(),
+        "turn_completed" => "turn_complete".to_string(),
+        "turn_aborted" => "turn_aborted".to_string(),
+        "item/started" => "item_started".to_string(),
+        "item/completed" => "item_completed".to_string(),
+        "rawResponseItemCompleted" | "raw_response_item_completed" => {
+            "raw_response_item".to_string()
+        }
         _ => event_type.to_string(),
     }
 }
@@ -288,7 +301,12 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
     }
 
     match LOGGER.mode() {
-        Some(LogMode::EventStream) => {}
+        Some(LogMode::EventStream) => match event {
+            // SubmitThreadOp is logged at the submit point, where the routed
+            // thread id is known and duplicate queued-event records can be avoided.
+            AppEvent::SubmitThreadOp { .. } => {}
+            _ => {}
+        },
         Some(LogMode::Legacy) => match event {
             AppEvent::NewSession => {
                 LOGGER.write_json_line(&json!({
@@ -342,21 +360,41 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
     }
 }
 
-pub(crate) fn log_outbound_op(op: &AppCommand) {
+pub(crate) fn log_server_notification(notification: &ServerNotification) {
+    if !LOGGER.is_enabled() {
+        return;
+    }
+
+    if !matches!(LOGGER.mode(), Some(LogMode::EventStream)) {
+        return;
+    }
+
+    if let Some((event_type, payload, thread_id)) =
+        lifecycle_event_stream_record_from_notification(notification)
+    {
+        LOGGER.write_event_stream_record(&event_type, payload, Some(thread_id));
+        return;
+    }
+
+    let payload = match serde_json::to_value(notification) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("event stream serialize error: {err}");
+            return;
+        }
+    };
+
+    write_event_stream_protocol_payload(payload, notification_thread_id(notification));
+}
+
+pub(crate) fn log_outbound_op(op: &AppCommand, thread_id_override: Option<&ThreadId>) {
     if !LOGGER.is_enabled() {
         return;
     }
 
     match LOGGER.mode() {
         Some(LogMode::EventStream) => {
-            let payload = match serde_json::to_value(op) {
-                Ok(value) => value,
-                Err(err) => {
-                    tracing::warn!("event stream serialize error: {err}");
-                    return;
-                }
-            };
-            LOGGER.write_event_stream_record("op_submitted", payload, None);
+            write_event_stream_op(op, thread_id_override);
         }
         Some(LogMode::Legacy) => write_legacy_record("from_tui", "op", op),
         None => {}
@@ -393,6 +431,128 @@ where
         "kind": kind,
         "payload": obj,
     }));
+}
+
+fn write_event_stream_op<C>(op: C, thread_id_override: Option<&ThreadId>)
+where
+    C: Into<AppCommand>,
+{
+    let app_command: AppCommand = op.into();
+    let payload = match serde_json::to_value(&app_command) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("event stream serialize error: {err}");
+            return;
+        }
+    };
+
+    LOGGER.write_event_stream_record(
+        "op_submitted",
+        payload,
+        thread_id_override.map(ToString::to_string),
+    );
+}
+
+fn write_event_stream_protocol_payload(mut payload: Value, session_id_override: Option<String>) {
+    if payload.get("method").is_some() && payload.get("params").is_some() {
+        let event_type = payload
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let event_type = normalize_contract_event_type(&event_type);
+        let payload = payload.get("params").cloned().unwrap_or_else(|| json!({}));
+        LOGGER.write_event_stream_record(&event_type, payload, session_id_override);
+        return;
+    }
+
+    let event_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let event_type = normalize_contract_event_type(&event_type);
+
+    if let Some(obj) = payload.as_object_mut() {
+        obj.remove("type");
+    }
+
+    LOGGER.write_event_stream_record(&event_type, payload, session_id_override);
+}
+
+fn lifecycle_event_stream_record_from_notification(
+    notification: &ServerNotification,
+) -> Option<(String, Value, String)> {
+    match notification {
+        ServerNotification::TurnStarted(notification) => Some((
+            "turn_started".to_string(),
+            json!({
+                "turn_id": notification.turn.id,
+                "started_at": notification.turn.started_at,
+                "model_context_window": Value::Null,
+                "collaboration_mode_kind": "none",
+            }),
+            notification.thread_id.clone(),
+        )),
+        ServerNotification::TurnCompleted(notification) => {
+            let event_type = match notification.turn.status {
+                TurnStatus::Interrupted => "turn_aborted",
+                TurnStatus::Completed | TurnStatus::Failed | TurnStatus::InProgress => {
+                    "turn_complete"
+                }
+            };
+            let mut payload = json!({
+                "turn_id": notification.turn.id,
+                "completed_at": notification.turn.completed_at,
+                "duration_ms": notification.turn.duration_ms,
+            });
+            if event_type == "turn_complete" {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("last_agent_message".to_string(), Value::Null);
+                    obj.insert("time_to_first_token_ms".to_string(), Value::Null);
+                }
+            } else if let Some(obj) = payload.as_object_mut() {
+                obj.insert("reason".to_string(), json!("interrupted"));
+            }
+
+            Some((
+                event_type.to_string(),
+                payload,
+                notification.thread_id.clone(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn notification_thread_id(notification: &ServerNotification) -> Option<String> {
+    let payload = serde_json::to_value(notification).ok()?;
+    payload
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            payload
+                .get("params")
+                .and_then(|params| params.get("thread_id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            payload
+                .get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            payload
+                .get("params")
+                .and_then(|params| params.get("thread"))
+                .and_then(|thread| thread.get("id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
 }
 
 #[cfg(test)]
@@ -444,8 +604,34 @@ mod tests {
 
     #[test]
     fn normalizes_legacy_turn_event_names() {
-        assert_eq!(normalize_contract_event_type("task_started"), "turn_started");
-        assert_eq!(normalize_contract_event_type("task_complete"), "turn_complete");
-        assert_eq!(normalize_contract_event_type("exec_command_begin"), "exec_command_begin");
+        assert_eq!(
+            normalize_contract_event_type("task_started"),
+            "turn_started"
+        );
+        assert_eq!(
+            normalize_contract_event_type("task_complete"),
+            "turn_complete"
+        );
+        assert_eq!(
+            normalize_contract_event_type("turn/started"),
+            "turn_started"
+        );
+        assert_eq!(
+            normalize_contract_event_type("turn/completed"),
+            "turn_complete"
+        );
+        assert_eq!(normalize_contract_event_type("item/started"), "item_started");
+        assert_eq!(
+            normalize_contract_event_type("item/completed"),
+            "item_completed"
+        );
+        assert_eq!(
+            normalize_contract_event_type("rawResponseItemCompleted"),
+            "raw_response_item"
+        );
+        assert_eq!(
+            normalize_contract_event_type("exec_command_begin"),
+            "exec_command_begin"
+        );
     }
 }

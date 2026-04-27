@@ -413,7 +413,7 @@ impl App {
         thread_id: ThreadId,
         op: AppCommand,
     ) -> Result<()> {
-        crate::session_log::log_outbound_op(&op);
+        crate::session_log::log_outbound_op(&op, Some(&thread_id));
 
         if self.try_handle_local_history_op(thread_id, &op).await? {
             return Ok(());
