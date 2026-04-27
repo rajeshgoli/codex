@@ -1496,8 +1496,13 @@ impl App {
                 }
                 if let Some(thread_id) = target_thread_id {
                     let prepared = if Some(thread_id) == self.active_thread_id {
-                        self.chat_widget
-                            .prepare_targeted_external_literal_user_message(text)
+                        if self.chat_widget.is_user_turn_pending_or_running() {
+                            self.chat_widget.queue_external_literal_user_message(text);
+                            None
+                        } else {
+                            self.chat_widget
+                                .prepare_targeted_external_literal_user_message(text)
+                        }
                     } else {
                         let target_state = match self.thread_event_channels.get(&thread_id) {
                             Some(channel) => {
@@ -1519,7 +1524,12 @@ impl App {
                                             Some((session, input_state.clone(), text))
                                         }
                                     }
-                                    None => None,
+                                    None => {
+                                        self.chat_widget.add_error_message(format!(
+                                            "Target thread {thread_id} is not ready for external input."
+                                        ));
+                                        None
+                                    }
                                 }
                             }
                             None => {

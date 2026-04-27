@@ -5864,6 +5864,13 @@ impl ChatWidget {
         }
     }
 
+    pub(crate) fn queue_external_literal_user_message(&mut self, text: String) {
+        self.queue_user_message_with_options(
+            UserMessage::from(text),
+            QueuedInputAction::LiteralUserTurn,
+        );
+    }
+
     fn submit_shell_command(&mut self, command: &str) -> QueueDrain {
         let cmd = command.trim();
         if cmd.is_empty() {
