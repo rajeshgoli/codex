@@ -132,6 +132,27 @@ async fn external_literal_message_queued_before_config_preserves_bang_literal() 
 }
 
 #[tokio::test]
+async fn external_literal_messages_queued_before_config_preserve_fifo_order() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.submit_external_literal_user_message("first literal".to_string());
+    chat.submit_external_literal_user_message("second literal".to_string());
+
+    assert_eq!(
+        chat.queued_user_messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first literal", "second literal"]
+    );
+    assert!(
+        chat.queued_user_messages
+            .iter()
+            .all(|message| message.action == QueuedInputAction::LiteralUserTurn)
+    );
+}
+
+#[tokio::test]
 async fn targeted_external_literal_message_uses_target_thread_context() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("active-model")).await;
 
@@ -149,7 +170,7 @@ async fn targeted_external_literal_message_uses_target_thread_context() {
         model_provider_id: "test-provider".to_string(),
         service_tier: None,
         approval_policy: AskForApproval::OnRequest,
-        approvals_reviewer: ApprovalsReviewer::User,
+        approvals_reviewer: ApprovalsReviewer::AutoReview,
         sandbox_policy: target_sandbox.clone(),
         permission_profile: Some(target_permission_profile.clone()),
         cwd: target_cwd.clone(),
@@ -177,10 +198,12 @@ async fn targeted_external_literal_message_uses_target_thread_context() {
             permission_profile,
             model,
             effort,
+            approvals_reviewer,
             ..
         } => {
             assert_eq!(cwd, target_cwd.to_path_buf());
             assert_eq!(approval_policy, AskForApproval::OnRequest);
+            assert_eq!(approvals_reviewer, Some(ApprovalsReviewer::AutoReview));
             assert_eq!(sandbox_policy, target_sandbox);
             assert_eq!(permission_profile, Some(target_permission_profile));
             assert_eq!(model, "target-model");

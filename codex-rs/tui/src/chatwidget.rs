@@ -10989,7 +10989,8 @@ impl ChatWidget {
             /*final_output_json_schema*/ None,
             collaboration_mode,
             /*personality*/ None,
-        );
+        )
+        .with_approvals_reviewer(session.approvals_reviewer);
         let history_op = Some(AppCommand::from(Op::AddToHistory { text: text.clone() }));
 
         Some((op, history_op, text))
@@ -11007,7 +11008,7 @@ impl ChatWidget {
             tracing::warn!(
                 "cannot submit external user message before session is configured; queueing"
             );
-            self.queued_user_messages.push_front(QueuedUserMessage::new(
+            self.queued_user_messages.push_back(QueuedUserMessage::new(
                 UserMessage {
                     text,
                     local_images: Vec::new(),
