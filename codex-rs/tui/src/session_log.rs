@@ -551,8 +551,21 @@ fn notification_thread_id(notification: &ServerNotification) -> Option<String> {
         .map(ToString::to_string)
         .or_else(|| {
             payload
+                .get("threadId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            payload
                 .get("params")
                 .and_then(|params| params.get("thread_id").or_else(|| params.get("threadId")))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            payload
+                .get("params")
+                .and_then(|params| params.get("threadId"))
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
         })
