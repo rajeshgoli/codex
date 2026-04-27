@@ -1572,9 +1572,7 @@ impl App {
                             self.mark_user_turn_pending_start_for_thread(thread_id)
                                 .await;
                         }
-                        if !result.is_steered()
-                            && let Some(history_op) = history_op
-                        {
+                        if let Some(history_op) = history_op {
                             let _ = self
                                 .submit_thread_op(app_server, thread_id, history_op)
                                 .await?;
