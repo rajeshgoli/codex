@@ -334,9 +334,12 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                 )
             } else {
                 match parse_thread_id(thread_id) {
-                    Ok(_) => match dispatch_app_event(
+                    Ok(target_thread_id) => match dispatch_app_event(
                         state,
-                        AppEvent::SubmitExternalLiteralUserMessage { text: message },
+                        AppEvent::SubmitExternalLiteralUserMessage {
+                            text: message,
+                            target_thread_id,
+                        },
                     ) {
                         Ok(()) => response_ok(
                             &request_id,
@@ -747,8 +750,12 @@ mod tests {
         assert_eq!(first.epoch, second.epoch);
 
         match rx.try_recv() {
-            Ok(AppEvent::SubmitExternalLiteralUserMessage { text }) => {
-                assert_eq!(text, "hello")
+            Ok(AppEvent::SubmitExternalLiteralUserMessage {
+                text,
+                target_thread_id,
+            }) => {
+                assert_eq!(text, "hello");
+                assert_eq!(target_thread_id, None);
             }
             other => panic!("expected one external user message event, got {other:?}"),
         }
@@ -773,8 +780,12 @@ mod tests {
 
         assert!(response.ok);
         match rx.try_recv() {
-            Ok(AppEvent::SubmitExternalLiteralUserMessage { text }) => {
-                assert_eq!(text, "hello thread")
+            Ok(AppEvent::SubmitExternalLiteralUserMessage {
+                text,
+                target_thread_id,
+            }) => {
+                assert_eq!(text, "hello thread");
+                assert_eq!(target_thread_id, Some(thread_id));
             }
             other => panic!("expected external user message event, got {other:?}"),
         }

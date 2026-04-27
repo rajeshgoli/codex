@@ -1486,8 +1486,30 @@ impl App {
                 self.chat_widget
                     .submit_user_message_with_mode(text, collaboration_mode);
             }
-            AppEvent::SubmitExternalLiteralUserMessage { text } => {
-                self.chat_widget.submit_external_literal_user_message(text);
+            AppEvent::SubmitExternalLiteralUserMessage {
+                text,
+                target_thread_id,
+            } => {
+                if target_thread_id.is_none() {
+                    self.chat_widget.submit_external_literal_user_message(text);
+                    return Ok(AppRunControl::Continue);
+                }
+                if let Some((op, history_op, submitted_text)) =
+                    self.chat_widget.prepare_external_literal_user_message(text)
+                {
+                    if let Some(thread_id) = target_thread_id {
+                        let render_in_active_history = Some(thread_id) == self.active_thread_id;
+                        self.submit_thread_op(app_server, thread_id, op).await?;
+                        if let Some(history_op) = history_op {
+                            self.submit_thread_op(app_server, thread_id, history_op)
+                                .await?;
+                        }
+                        if render_in_active_history {
+                            self.chat_widget
+                                .render_external_literal_user_message(submitted_text);
+                        }
+                    }
+                }
             }
             AppEvent::ManageSkillsClosed => {
                 self.chat_widget.handle_manage_skills_closed();

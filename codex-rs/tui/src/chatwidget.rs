@@ -10888,21 +10888,115 @@ impl ChatWidget {
     }
 
     pub(crate) fn submit_external_literal_user_message(&mut self, text: String) {
-        if text.is_empty() {
+        let Some((op, history_op, submitted_text)) =
+            self.prepare_external_literal_user_message(text)
+        else {
+            return;
+        };
+
+        if !self.submit_op(op) {
             return;
         }
+        if let Some(history_op) = history_op {
+            self.submit_op(history_op);
+        }
 
-        let user_message = UserMessage {
-            text,
-            local_images: Vec::new(),
-            remote_image_urls: Vec::new(),
+        self.render_external_literal_user_message(submitted_text);
+    }
+
+    pub(crate) fn prepare_external_literal_user_message(
+        &mut self,
+        text: String,
+    ) -> Option<(AppCommand, Option<AppCommand>, String)> {
+        if text.is_empty() {
+            return None;
+        }
+        if !self.is_session_configured() {
+            tracing::warn!(
+                "cannot submit external user message before session is configured; queueing"
+            );
+            self.queued_user_messages
+                .push_front(QueuedUserMessage::from(UserMessage {
+                    text,
+                    local_images: Vec::new(),
+                    remote_image_urls: Vec::new(),
+                    text_elements: Vec::new(),
+                    mention_bindings: Vec::new(),
+                }));
+            self.refresh_pending_input_preview();
+            return None;
+        }
+
+        let items = vec![UserInput::Text {
+            text: text.clone(),
             text_elements: Vec::new(),
-            mention_bindings: Vec::new(),
+        }];
+        let effective_mode = self.effective_collaboration_mode();
+        if effective_mode.model().trim().is_empty() {
+            self.add_error_message(
+                "Thread model is unavailable. Wait for the thread to finish syncing or choose a model before sending input.".to_string(),
+            );
+            return None;
+        }
+        let collaboration_mode = if self.collaboration_modes_enabled() {
+            self.active_collaboration_mask
+                .as_ref()
+                .map(|_| effective_mode.clone())
+        } else {
+            None
         };
-        let _ = self.submit_user_message_with_shell_escape_policy(
-            user_message,
-            ShellEscapePolicy::Disallow,
+        let personality = self
+            .config
+            .personality
+            .filter(|_| self.config.features.enabled(Feature::Personality))
+            .filter(|_| self.current_model_supports_personality());
+        let service_tier = match self.config.service_tier {
+            Some(service_tier) => Some(Some(service_tier)),
+            None if self.config.notices.fast_default_opt_out == Some(true) => Some(None),
+            None => None,
+        };
+        let permission_profile = if matches!(
+            self.config.permissions.sandbox_policy.get(),
+            SandboxPolicy::ExternalSandbox { .. }
+        ) {
+            None
+        } else {
+            Some(self.config.permissions.permission_profile())
+        };
+        let op = AppCommand::user_turn(
+            items,
+            self.config.cwd.to_path_buf(),
+            self.config.permissions.approval_policy.value(),
+            self.config.permissions.sandbox_policy.get().clone(),
+            permission_profile,
+            effective_mode.model().to_string(),
+            effective_mode.reasoning_effort(),
+            /*summary*/ None,
+            service_tier,
+            /*final_output_json_schema*/ None,
+            collaboration_mode,
+            personality,
         );
+        let history_op = Some(AppCommand::from(Op::AddToHistory { text: text.clone() }));
+
+        Some((op, history_op, text))
+    }
+
+    pub(crate) fn render_external_literal_user_message(&mut self, text: String) {
+        self.last_rendered_user_message_event = Some(Self::rendered_user_message_event_from_parts(
+            text.clone(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        self.record_visible_user_turn_for_copy();
+        self.add_to_history(history_cell::new_user_prompt(
+            text,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        self.needs_final_message_separator = false;
     }
 
     /// True when the UI is in the regular composer state with no running task,
