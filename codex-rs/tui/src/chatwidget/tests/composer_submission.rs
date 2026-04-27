@@ -365,16 +365,16 @@ async fn targeted_external_literal_input_state_records_rejected_steer() {
     let mut input_state =
         ThreadInputState::for_target_session(&target_session, /*agent_turn_running*/ true);
 
-    input_state.record_pending_external_literal_steer("target steer".to_string());
+    input_state.record_pending_external_literal_steer("!literal target steer".to_string());
 
     assert!(input_state.enqueue_rejected_steer());
     assert_eq!(
         input_state
-            .rejected_steers_queue
+            .queued_user_messages
             .iter()
-            .map(|message| message.text.as_str())
+            .map(|message| (message.text.as_str(), message.action))
             .collect::<Vec<_>>(),
-        vec!["target steer"]
+        vec![("!literal target steer", QueuedInputAction::LiteralUserTurn)]
     );
 }
 

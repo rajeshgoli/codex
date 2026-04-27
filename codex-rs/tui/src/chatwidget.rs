@@ -1203,7 +1203,10 @@ impl ThreadInputState {
             );
             return false;
         };
-        self.rejected_steers_queue.push_back(pending_steer);
+        self.queued_user_messages.push_front(QueuedUserMessage::new(
+            pending_steer,
+            QueuedInputAction::LiteralUserTurn,
+        ));
         true
     }
 }
@@ -1237,6 +1240,7 @@ impl From<&str> for UserMessage {
 struct PendingSteer {
     user_message: UserMessage,
     compare_key: PendingSteerCompareKey,
+    rejection_action: QueuedInputAction,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2781,8 +2785,23 @@ impl ChatWidget {
             );
             return false;
         };
-        self.rejected_steers_queue
-            .push_back(pending_steer.user_message);
+        match pending_steer.rejection_action {
+            QueuedInputAction::Plain => self
+                .rejected_steers_queue
+                .push_back(pending_steer.user_message),
+            QueuedInputAction::LiteralUserTurn => {
+                self.queued_user_messages.push_front(QueuedUserMessage::new(
+                    pending_steer.user_message,
+                    QueuedInputAction::LiteralUserTurn,
+                ))
+            }
+            QueuedInputAction::ParseSlash | QueuedInputAction::RunShell => {
+                self.queued_user_messages.push_front(QueuedUserMessage::new(
+                    pending_steer.user_message,
+                    pending_steer.rejection_action,
+                ));
+            }
+        }
         self.refresh_pending_input_preview();
         true
     }
@@ -3639,6 +3658,7 @@ impl ChatWidget {
                             + user_message.remote_image_urls.len(),
                     },
                     user_message,
+                    rejection_action: QueuedInputAction::Plain,
                 })
                 .collect();
             self.rejected_steers_queue = input_state.rejected_steers_queue;
@@ -6039,6 +6059,7 @@ impl ChatWidget {
                 mention_bindings: mention_bindings.clone(),
             },
             compare_key: Self::pending_steer_compare_key_from_items(&items),
+            rejection_action: QueuedInputAction::Plain,
         });
         let personality = self
             .config
@@ -11073,6 +11094,7 @@ impl ChatWidget {
                 message: text,
                 image_count: 0,
             },
+            rejection_action: QueuedInputAction::LiteralUserTurn,
         });
         self.saw_plan_item_this_turn = false;
         self.refresh_pending_input_preview();

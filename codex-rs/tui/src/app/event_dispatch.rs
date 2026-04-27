@@ -1527,7 +1527,9 @@ impl App {
                     };
                     if let Some((op, history_op, submitted_text)) = prepared {
                         let render_in_active_history = Some(thread_id) == self.active_thread_id;
-                        if self.active_turn_id_for_thread(thread_id).await.is_some() {
+                        let submitted_as_steer =
+                            self.active_turn_id_for_thread(thread_id).await.is_some();
+                        if submitted_as_steer {
                             self.record_pending_external_literal_steer_for_thread(
                                 thread_id,
                                 submitted_text.clone(),
@@ -1541,12 +1543,12 @@ impl App {
                         if render_in_active_history {
                             self.chat_widget.mark_user_turn_pending_start();
                         }
-                        if let Some(history_op) = history_op {
+                        if !submitted_as_steer && let Some(history_op) = history_op {
                             let _ = self
                                 .submit_thread_op(app_server, thread_id, history_op)
                                 .await?;
                         }
-                        if render_in_active_history {
+                        if render_in_active_history && !submitted_as_steer {
                             self.chat_widget
                                 .render_external_literal_user_message(submitted_text);
                         }
