@@ -1,11 +1,15 @@
 mod engine;
-pub mod events;
+pub(crate) mod events;
 mod legacy_notify;
 mod registry;
 mod schema;
 mod types;
-mod user_notification;
 
+pub use events::permission_request::PermissionRequestDecision;
+pub use events::permission_request::PermissionRequestOutcome;
+pub use events::permission_request::PermissionRequestRequest;
+pub use events::post_tool_use::PostToolUseOutcome;
+pub use events::post_tool_use::PostToolUseRequest;
 pub use events::pre_tool_use::PreToolUseOutcome;
 pub use events::pre_tool_use::PreToolUseRequest;
 pub use events::session_start::SessionStartOutcome;
@@ -31,4 +35,3 @@ pub use types::HookResult;
 pub use types::HookToolInput;
 pub use types::HookToolInputLocalShell;
 pub use types::HookToolKind;
-pub use user_notification::after_tool_use_hook;

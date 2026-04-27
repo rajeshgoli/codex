@@ -2,7 +2,6 @@ use codex_network_proxy::NetworkProxy;
 use codex_network_proxy::PROXY_URL_ENV_KEYS;
 use codex_network_proxy::has_proxy_url_env_vars;
 use codex_network_proxy::proxy_url_env_value;
-use codex_protocol::models::MacOsSeatbeltProfileExtensions;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::SandboxPolicy;
@@ -10,13 +9,12 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::path::Path;
 use std::path::PathBuf;
 use tracing::warn;
 use url::Url;
-
-use crate::seatbelt_permissions::build_seatbelt_extensions;
 
 const MACOS_SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_base_policy.sbpl");
 const MACOS_SEATBELT_NETWORK_POLICY: &str = include_str!("seatbelt_network_policy.sbpl");
@@ -103,41 +101,54 @@ struct UnixSocketPathParam {
     path: AbsolutePathBuf,
 }
 
-fn proxy_policy_inputs(network: Option<&NetworkProxy>) -> ProxyPolicyInputs {
-    if let Some(network) = network {
-        let mut env = HashMap::new();
-        network.apply_to_env(&mut env);
-        let unix_domain_socket_policy = if network.dangerously_allow_all_unix_sockets() {
-            UnixDomainSocketPolicy::AllowAll
-        } else {
-            let allowed = network
-                .allow_unix_sockets()
-                .iter()
-                .filter_map(
-                    |socket_path| match normalize_path_for_sandbox(Path::new(socket_path)) {
-                        Some(path) => Some((path.to_string_lossy().to_string(), path)),
-                        None => {
-                            warn!(
-                                "ignoring network.allow_unix_sockets entry because it could not be normalized: {socket_path}"
-                            );
-                            None
-                        }
-                    },
-                )
-                .collect::<BTreeMap<_, _>>()
-                .into_values()
-                .collect();
-            UnixDomainSocketPolicy::Restricted { allowed }
-        };
-        return ProxyPolicyInputs {
-            ports: proxy_loopback_ports_from_env(&env),
-            has_proxy_config: has_proxy_url_env_vars(&env),
-            allow_local_binding: network.allow_local_binding(),
-            unix_domain_socket_policy,
-        };
-    }
+fn proxy_policy_inputs(
+    network: Option<&NetworkProxy>,
+    extra_allow_unix_sockets: &[AbsolutePathBuf],
+) -> ProxyPolicyInputs {
+    let extra_allowed = extra_allow_unix_sockets
+        .iter()
+        .filter_map(|socket_path| normalize_path_for_sandbox(socket_path.as_path()))
+        .collect::<Vec<_>>();
 
-    ProxyPolicyInputs::default()
+    match network {
+        Some(network) => {
+            let mut env = HashMap::new();
+            network.apply_to_env(&mut env);
+            let unix_domain_socket_policy = if network.dangerously_allow_all_unix_sockets() {
+                UnixDomainSocketPolicy::AllowAll
+            } else {
+                let mut allowed = network
+                    .allow_unix_sockets()
+                    .iter()
+                    .filter_map(|socket_path| {
+                        match normalize_path_for_sandbox(Path::new(socket_path)) {
+                            Some(path) => Some(path),
+                            None => {
+                                warn!(
+                                    "ignoring network.allow_unix_sockets entry because it could not be normalized: {socket_path}"
+                                );
+                                None
+                            }
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                allowed.extend(extra_allowed);
+                UnixDomainSocketPolicy::Restricted { allowed }
+            };
+            ProxyPolicyInputs {
+                ports: proxy_loopback_ports_from_env(&env),
+                has_proxy_config: has_proxy_url_env_vars(&env),
+                allow_local_binding: network.allow_local_binding(),
+                unix_domain_socket_policy,
+            }
+        }
+        None => ProxyPolicyInputs {
+            unix_domain_socket_policy: UnixDomainSocketPolicy::Restricted {
+                allowed: extra_allowed,
+            },
+            ..Default::default()
+        },
+    }
 }
 
 fn normalize_path_for_sandbox(path: &Path) -> Option<AbsolutePathBuf> {
@@ -247,15 +258,25 @@ fn dynamic_network_policy_for_network(
     enforce_managed_network: bool,
     proxy: &ProxyPolicyInputs,
 ) -> String {
-    let should_use_restricted_network_policy =
-        !proxy.ports.is_empty() || proxy.has_proxy_config || enforce_managed_network;
+    let has_some_unix_socket_access = match &proxy.unix_domain_socket_policy {
+        UnixDomainSocketPolicy::AllowAll => true,
+        UnixDomainSocketPolicy::Restricted { allowed } => !allowed.is_empty(),
+    };
+    let should_use_restricted_network_policy = !proxy.ports.is_empty()
+        || proxy.has_proxy_config
+        || enforce_managed_network
+        || (!network_policy.is_enabled() && has_some_unix_socket_access);
     if should_use_restricted_network_policy {
         let mut policy = String::new();
         if proxy.allow_local_binding {
-            policy.push_str("; allow loopback local binding and loopback traffic\n");
-            policy.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
+            policy.push_str("; allow local binding and loopback traffic\n");
+            policy.push_str("(allow network-bind (local ip \"*:*\"))\n");
             policy.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
             policy.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
+        }
+        if proxy.allow_local_binding && !proxy.ports.is_empty() {
+            policy.push_str("; allow DNS lookups while application traffic remains proxy-routed\n");
+            policy.push_str("(allow network-outbound (remote ip \"*:53\"))\n");
         }
         for port in &proxy.ports {
             policy.push_str(&format!(
@@ -284,9 +305,13 @@ fn dynamic_network_policy_for_network(
 
     if network_policy.is_enabled() {
         // No proxy env is configured: retain the existing full-network behavior.
-        format!(
-            "(allow network-outbound)\n(allow network-inbound)\n{MACOS_SEATBELT_NETWORK_POLICY}"
-        )
+        let mut policy = String::from("(allow network-outbound)\n(allow network-inbound)\n");
+        let unix_socket_policy = unix_socket_policy(proxy);
+        if !unix_socket_policy.is_empty() {
+            policy.push_str("; allow unix domain sockets for local IPC\n");
+            policy.push_str(&unix_socket_policy);
+        }
+        format!("{policy}{MACOS_SEATBELT_NETWORK_POLICY}")
     } else {
         String::new()
     }
@@ -330,8 +355,14 @@ fn build_seatbelt_access_policy(
         {
             let excluded_subpath =
                 normalize_path_for_sandbox(excluded_subpath.as_path()).unwrap_or(excluded_subpath);
-            let excluded_param = format!("{param_prefix}_{index}_RO_{excluded_index}");
+            let excluded_param = format!("{param_prefix}_{index}_EXCLUDED_{excluded_index}");
             params.push((excluded_param.clone(), excluded_subpath.into_path_buf()));
+            // Exclude both the exact protected path and anything beneath it.
+            // `subpath` alone leaves a gap for first-time creation of the
+            // protected directory itself, such as `mkdir .codex`.
+            require_parts.push(format!(
+                "(require-not (literal (param \"{excluded_param}\")))"
+            ));
             require_parts.push(format!(
                 "(require-not (subpath (param \"{excluded_param}\")))"
             ));
@@ -349,35 +380,193 @@ fn build_seatbelt_access_policy(
     }
 }
 
+fn build_seatbelt_unreadable_glob_policy(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    cwd: &Path,
+) -> String {
+    // Seatbelt does not understand the filesystem policy's glob syntax directly.
+    // Convert each unreadable pattern into an anchored regex deny rule and apply
+    // it to both reads and unlink-style writes so a denied path cannot be probed
+    // through destructive filesystem operations.
+    let unreadable_globs = file_system_sandbox_policy.get_unreadable_globs_with_cwd(cwd);
+    if unreadable_globs.is_empty() {
+        return String::new();
+    }
+
+    let mut policy_components = Vec::new();
+    for pattern in unreadable_globs {
+        let mut regexes = BTreeSet::new();
+        if let Some(regex) = seatbelt_regex_for_unreadable_glob(&pattern) {
+            regexes.insert(regex);
+        }
+        if let Some(pattern) = canonicalize_glob_static_prefix_for_sandbox(&pattern)
+            && let Some(regex) = seatbelt_regex_for_unreadable_glob(&pattern)
+        {
+            regexes.insert(regex);
+        }
+        for regex in regexes {
+            let regex = regex.replace('"', "\\\"");
+            policy_components.push(format!(r#"(deny file-read* (regex #"{regex}"))"#));
+            policy_components.push(format!(r#"(deny file-write-unlink (regex #"{regex}"))"#));
+        }
+    }
+
+    policy_components.join("\n")
+}
+
+fn canonicalize_glob_static_prefix_for_sandbox(pattern: &str) -> Option<String> {
+    let first_glob_index = pattern
+        .char_indices()
+        .find_map(|(index, ch)| matches!(ch, '*' | '?' | '[' | ']').then_some(index));
+    let Some(first_glob_index) = first_glob_index else {
+        return normalize_path_for_sandbox(Path::new(pattern))
+            .map(|path| path.to_string_lossy().to_string());
+    };
+
+    let static_prefix = &pattern[..first_glob_index];
+    let prefix_end = if static_prefix.ends_with('/') {
+        static_prefix.len() - 1
+    } else {
+        static_prefix.rfind('/').unwrap_or(0)
+    };
+    if prefix_end == 0 {
+        return None;
+    }
+
+    let root = normalize_path_for_sandbox(Path::new(&pattern[..prefix_end]))?;
+    let root = root.to_string_lossy();
+    let suffix = &pattern[prefix_end..];
+    let normalized_pattern = format!("{root}{suffix}");
+    (normalized_pattern != pattern).then_some(normalized_pattern)
+}
+
+fn seatbelt_regex_for_unreadable_glob(pattern: &str) -> Option<String> {
+    if pattern.is_empty() {
+        return None;
+    }
+
+    // Translate the supported git-style glob subset into a Seatbelt regex:
+    // `*` and `?` stay within one path component, `**/` can consume zero or
+    // more components, and closed character classes remain character classes.
+    // A pattern with no glob metacharacters is treated as exact path plus subtree.
+    let mut regex = String::from("^");
+    let mut chars = pattern.chars().collect::<VecDeque<_>>();
+    let mut saw_glob = false;
+
+    while let Some(ch) = chars.pop_front() {
+        match ch {
+            '*' => {
+                saw_glob = true;
+                if chars.front() == Some(&'*') {
+                    chars.pop_front();
+                    if chars.front() == Some(&'/') {
+                        chars.pop_front();
+                        regex.push_str("(.*/)?");
+                    } else {
+                        regex.push_str(".*");
+                    }
+                } else {
+                    regex.push_str("[^/]*");
+                }
+            }
+            '?' => {
+                saw_glob = true;
+                regex.push_str("[^/]");
+            }
+            '[' => {
+                saw_glob = true;
+                let mut class = Vec::new();
+                let mut closed = false;
+                while let Some(class_ch) = chars.pop_front() {
+                    if class_ch == ']' {
+                        closed = true;
+                        break;
+                    }
+                    class.push(class_ch);
+                }
+                if !closed {
+                    regex.push_str("\\[");
+                    for class_ch in class.into_iter().rev() {
+                        chars.push_front(class_ch);
+                    }
+                    continue;
+                }
+
+                regex.push('[');
+                let mut class_chars = class.into_iter();
+                if let Some(first) = class_chars.next() {
+                    match first {
+                        '!' => regex.push('^'),
+                        '^' => regex.push_str("\\^"),
+                        _ => regex.push(first),
+                    }
+                }
+                for class_ch in class_chars {
+                    match class_ch {
+                        '\\' => regex.push_str("\\\\"),
+                        _ => regex.push(class_ch),
+                    }
+                }
+                regex.push(']');
+            }
+            ']' => {
+                saw_glob = true;
+                regex.push_str("\\]");
+            }
+            _ => regex.push_str(&regex_lite::escape(&ch.to_string())),
+        }
+    }
+
+    if !saw_glob {
+        regex.push_str("(/.*)?");
+    }
+    regex.push('$');
+    Some(regex)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
-fn create_seatbelt_command_args_with_extensions(
+fn create_seatbelt_command_args_for_legacy_policy(
     command: Vec<String>,
     sandbox_policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
     enforce_managed_network: bool,
     network: Option<&NetworkProxy>,
-    extensions: Option<&MacOsSeatbeltProfileExtensions>,
 ) -> Vec<String> {
-    create_seatbelt_command_args_for_policies_with_extensions(
+    let file_system_sandbox_policy =
+        FileSystemSandboxPolicy::from_legacy_sandbox_policy(sandbox_policy, sandbox_policy_cwd);
+    create_seatbelt_command_args(CreateSeatbeltCommandArgsParams {
         command,
-        &FileSystemSandboxPolicy::from_legacy_sandbox_policy(sandbox_policy, sandbox_policy_cwd),
-        NetworkSandboxPolicy::from(sandbox_policy),
+        file_system_sandbox_policy: &file_system_sandbox_policy,
+        network_sandbox_policy: NetworkSandboxPolicy::from(sandbox_policy),
         sandbox_policy_cwd,
         enforce_managed_network,
         network,
-        extensions,
-    )
+        extra_allow_unix_sockets: &[],
+    })
 }
 
-pub fn create_seatbelt_command_args_for_policies_with_extensions(
-    command: Vec<String>,
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    network_sandbox_policy: NetworkSandboxPolicy,
-    sandbox_policy_cwd: &Path,
-    enforce_managed_network: bool,
-    network: Option<&NetworkProxy>,
-    extensions: Option<&MacOsSeatbeltProfileExtensions>,
-) -> Vec<String> {
+#[derive(Debug)]
+pub struct CreateSeatbeltCommandArgsParams<'a> {
+    pub command: Vec<String>,
+    pub file_system_sandbox_policy: &'a FileSystemSandboxPolicy,
+    pub network_sandbox_policy: NetworkSandboxPolicy,
+    pub sandbox_policy_cwd: &'a Path,
+    pub enforce_managed_network: bool,
+    pub network: Option<&'a NetworkProxy>,
+    pub extra_allow_unix_sockets: &'a [AbsolutePathBuf],
+}
+
+pub fn create_seatbelt_command_args(args: CreateSeatbeltCommandArgsParams<'_>) -> Vec<String> {
+    let CreateSeatbeltCommandArgsParams {
+        command,
+        file_system_sandbox_policy,
+        network_sandbox_policy,
+        sandbox_policy_cwd,
+        enforce_managed_network,
+        network,
+        extra_allow_unix_sockets,
+    } = args;
+
     let unreadable_roots =
         file_system_sandbox_policy.get_unreadable_roots_with_cwd(sandbox_policy_cwd);
     let (file_write_policy, file_write_dir_params) =
@@ -461,29 +650,22 @@ pub fn create_seatbelt_command_args_for_policies_with_extensions(
             }
         };
 
-    let proxy = proxy_policy_inputs(network);
+    let proxy = proxy_policy_inputs(network, extra_allow_unix_sockets);
     let network_policy =
         dynamic_network_policy_for_network(network_sandbox_policy, enforce_managed_network, &proxy);
-    let seatbelt_extensions = extensions.map_or_else(
-        || {
-            // Backward-compatibility default when no extension profile is provided.
-            build_seatbelt_extensions(&MacOsSeatbeltProfileExtensions::default())
-        },
-        build_seatbelt_extensions,
-    );
 
     let include_platform_defaults = file_system_sandbox_policy.include_platform_defaults();
+    let deny_read_policy =
+        build_seatbelt_unreadable_glob_policy(file_system_sandbox_policy, sandbox_policy_cwd);
     let mut policy_sections = vec![
         MACOS_SEATBELT_BASE_POLICY.to_string(),
         file_read_policy,
         file_write_policy,
+        deny_read_policy,
         network_policy,
     ];
     if include_platform_defaults {
         policy_sections.push(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS.to_string());
-    }
-    if !seatbelt_extensions.policy.is_empty() {
-        policy_sections.push(seatbelt_extensions.policy.clone());
     }
 
     let full_policy = policy_sections.join("\n");
@@ -493,7 +675,6 @@ pub fn create_seatbelt_command_args_for_policies_with_extensions(
         file_write_dir_params,
         macos_dir_params(),
         unix_socket_dir_params(&proxy),
-        seatbelt_extensions.dir_params,
     ]
     .concat();
 

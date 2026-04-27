@@ -12,6 +12,36 @@ Codex can connect to MCP servers configured in `~/.codex/config.toml`. See the c
 
 - https://developers.openai.com/codex/config-reference
 
+MCP tools default to serialized calls. To mark every tool exposed by one server
+as eligible for parallel tool calls, set `supports_parallel_tool_calls` on that
+server:
+
+```toml
+[mcp_servers.docs]
+command = "docs-server"
+supports_parallel_tool_calls = true
+```
+
+Only enable parallel calls for MCP servers whose tools are safe to run at the
+same time. If tools read and write shared state, files, databases, or external
+resources, review those read/write race conditions before enabling this setting.
+
+## MCP tool approvals
+
+Codex stores approval defaults and per-tool overrides for custom MCP servers
+under `mcp_servers` in `~/.codex/config.toml`. Set
+`default_tools_approval_mode` on the server to apply a default to every tool,
+and use per-tool `approval_mode` entries for exceptions:
+
+```toml
+[mcp_servers.docs]
+command = "docs-server"
+default_tools_approval_mode = "approve"
+
+[mcp_servers.docs.tools.search]
+approval_mode = "prompt"
+```
+
 ## Apps (Connectors)
 
 Use `$` in the composer to insert a ChatGPT connector; the popover lists accessible
@@ -25,36 +55,6 @@ Codex can run a notification hook when the agent finishes a turn. See the config
 - https://developers.openai.com/codex/config-reference
 
 When Codex knows which client started the turn, the legacy notify JSON payload also includes a top-level `client` field. The TUI reports `codex-tui`, and the app server reports the `clientInfo.name` value from `initialize`.
-
-## After-tool-use hook
-
-Codex can run an external hook after each tool call completes. Configure:
-
-```toml
-after_tool_use = ["python3", "/path/to/hook.py"]
-after_tool_use_failure_behavior = "continue" # or "abort"
-```
-
-Codex appends one JSON argument containing the hook payload. The payload uses the same stable `HookPayload` envelope shape as other hooks, with:
-
-1. `hook_event.event_type = "after_tool_use"`
-2. `hook_event.turn_id`
-3. `hook_event.call_id`
-4. `hook_event.tool_name`
-5. `hook_event.tool_kind`
-6. `hook_event.tool_input`
-7. `hook_event.executed`
-8. `hook_event.success`
-9. `hook_event.duration_ms`
-10. `hook_event.mutating`
-11. `hook_event.sandbox`
-12. `hook_event.sandbox_policy`
-13. `hook_event.output_preview`
-
-Failure behavior is deterministic:
-
-1. `continue` (default): hook failure is recorded and operation continues.
-2. `abort`: hook failure aborts the operation immediately.
 
 ## JSON Schema
 

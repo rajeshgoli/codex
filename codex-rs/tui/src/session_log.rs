@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::IsTerminal;
 use std::io::Write;
@@ -7,10 +6,9 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use codex_core::config::Config;
+use crate::app_command::AppCommand;
+use crate::legacy_core::config::Config;
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::Event;
-use codex_protocol::protocol::Op;
 use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
@@ -156,8 +154,7 @@ impl SessionLogger {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        if session_id_override.is_none()
-            && event_type == "session_configured"
+        if event_type == "session_configured"
             && let Some(session_id) = payload.get("session_id").and_then(Value::as_str)
         {
             state.session_id = Some(session_id.to_string());
@@ -191,33 +188,6 @@ impl SessionLogger {
         self.write_json_line(&record);
     }
 
-    fn write_protocol_event(&self, event: &Event, thread_id_override: Option<&ThreadId>) {
-        let mut payload = match serde_json::to_value(&event.msg) {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!("event stream serialize error: {err}");
-                return;
-            }
-        };
-
-        let event_type = payload
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-        let event_type = normalize_contract_event_type(&event_type);
-
-        if let Some(obj) = payload.as_object_mut() {
-            obj.remove("type");
-        }
-
-        self.write_event_stream_record(
-            &event_type,
-            payload,
-            thread_id_override.map(ToString::to_string),
-        );
-    }
-
     fn is_enabled(&self) -> bool {
         self.writer.get().is_some()
     }
@@ -240,6 +210,7 @@ fn validate_schema_version(schema_version: u32) -> std::io::Result<()> {
     ))
 }
 
+#[cfg(test)]
 fn normalize_contract_event_type(event_type: &str) -> String {
     match event_type {
         "task_started" => "turn_started".to_string(),
@@ -283,7 +254,7 @@ pub(crate) fn maybe_init(config: &Config, cli: &Cli) -> std::io::Result<()> {
     let path = if let Ok(path) = std::env::var("CODEX_TUI_SESSION_LOG_PATH") {
         PathBuf::from(path)
     } else {
-        let mut p = match codex_core::config::log_dir(config) {
+        let mut p = match crate::legacy_core::config::log_dir(config) {
             Ok(dir) => dir,
             Err(_) => std::env::temp_dir(),
         };
@@ -320,16 +291,12 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
 
     match LOGGER.mode() {
         Some(LogMode::EventStream) => match event {
-            AppEvent::CodexEvent(ev) => LOGGER.write_protocol_event(ev, None),
-            AppEvent::ThreadEvent { thread_id, event } => {
-                LOGGER.write_protocol_event(event, Some(thread_id))
+            AppEvent::SubmitThreadOp { thread_id, op } => {
+                write_event_stream_op(op, Some(thread_id));
             }
             _ => {}
         },
         Some(LogMode::Legacy) => match event {
-            AppEvent::CodexEvent(ev) => {
-                write_legacy_record("to_tui", "codex_event", ev);
-            }
             AppEvent::NewSession => {
                 LOGGER.write_json_line(&json!({
                     "ts": now_ts(),
@@ -382,46 +349,14 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
     }
 }
 
-pub(crate) fn set_active_session_id(thread_id: ThreadId) {
-    if !LOGGER.is_enabled() {
-        return;
-    }
-
-    if !matches!(LOGGER.mode(), Some(LogMode::EventStream)) {
-        return;
-    }
-
-    let Some(state_mutex) = LOGGER.event_stream_state.get() else {
-        return;
-    };
-
-    let mut state = match state_mutex.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-
-    state.session_id = Some(thread_id.to_string());
-}
-
-pub(crate) fn log_outbound_op(op: &Op, thread_id_override: Option<&ThreadId>) {
+pub(crate) fn log_outbound_op(op: &AppCommand) {
     if !LOGGER.is_enabled() {
         return;
     }
 
     match LOGGER.mode() {
         Some(LogMode::EventStream) => {
-            let payload = match serde_json::to_value(op) {
-                Ok(value) => value,
-                Err(err) => {
-                    tracing::warn!("event stream serialize error: {err}");
-                    return;
-                }
-            };
-            LOGGER.write_event_stream_record(
-                "op_submitted",
-                payload,
-                thread_id_override.map(ToString::to_string),
-            );
+            write_event_stream_op(op, None);
         }
         Some(LogMode::Legacy) => write_legacy_record("from_tui", "op", op),
         None => {}
@@ -460,6 +395,26 @@ where
     }));
 }
 
+fn write_event_stream_op<C>(op: C, thread_id_override: Option<&ThreadId>)
+where
+    C: Into<AppCommand>,
+{
+    let app_command: AppCommand = op.into();
+    let payload = match serde_json::to_value(&app_command) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("event stream serialize error: {err}");
+            return;
+        }
+    };
+
+    LOGGER.write_event_stream_record(
+        "op_submitted",
+        payload,
+        thread_id_override.map(ToString::to_string),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
@@ -471,7 +426,12 @@ mod tests {
     use super::validate_schema_version;
 
     fn assert_common_fields(record: &Value) {
-        assert!(record.get("schema_version").and_then(Value::as_u64).is_some());
+        assert!(
+            record
+                .get("schema_version")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
         assert!(record.get("ts").and_then(Value::as_str).is_some());
         assert!(record.get("session_id").and_then(Value::as_str).is_some());
         assert!(record.get("event_type").and_then(Value::as_str).is_some());
@@ -496,7 +456,12 @@ mod tests {
         assert_common_fields(&record);
         assert_eq!(record["schema_version"], Value::from(EVENT_SCHEMA_CURRENT));
         assert!(record.get("seq").and_then(Value::as_u64).is_some());
-        assert!(record.get("session_epoch").and_then(Value::as_u64).is_some());
+        assert!(
+            record
+                .get("session_epoch")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
     }
 
     #[test]
@@ -509,8 +474,17 @@ mod tests {
 
     #[test]
     fn normalizes_legacy_turn_event_names() {
-        assert_eq!(normalize_contract_event_type("task_started"), "turn_started");
-        assert_eq!(normalize_contract_event_type("task_complete"), "turn_complete");
-        assert_eq!(normalize_contract_event_type("exec_command_begin"), "exec_command_begin");
+        assert_eq!(
+            normalize_contract_event_type("task_started"),
+            "turn_started"
+        );
+        assert_eq!(
+            normalize_contract_event_type("task_complete"),
+            "turn_complete"
+        );
+        assert_eq!(
+            normalize_contract_event_type("exec_command_begin"),
+            "exec_command_begin"
+        );
     }
 }

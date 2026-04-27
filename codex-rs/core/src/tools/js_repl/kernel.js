@@ -1214,6 +1214,7 @@ function encodeByteImage(bytes, mimeType, detail) {
   if (typeof mimeType !== "string" || !mimeType) {
     throw new Error("codex.emitImage expected a non-empty mimeType");
   }
+  assertEmitImageMimeType(mimeType);
   const image_url = `data:${mimeType};base64,${Buffer.from(bytes).toString("base64")}`;
   return { image_url, detail };
 }
@@ -1225,9 +1226,9 @@ function parseImageDetail(detail) {
   if (typeof detail !== "string" || !detail) {
     throw new Error("codex.emitImage expected detail to be a non-empty string");
   }
-  if (detail !== "original") {
+  if (!["auto", "low", "high", "original"].includes(detail)) {
     throw new Error(
-      'codex.emitImage only supports detail "original"; omit detail for default behavior',
+      'codex.emitImage expected detail to be one of "auto", "low", "high", or "original"',
     );
   }
   return detail;
@@ -1240,7 +1241,40 @@ function normalizeEmitImageUrl(value) {
   if (!/^data:/i.test(value)) {
     throw new Error("codex.emitImage only accepts data URLs");
   }
+  const mimeType = parseDataUrlMimeType(value);
+  assertEmitImageMimeType(mimeType);
   return value;
+}
+
+const SUPPORTED_EMIT_IMAGE_MIME_TYPES = [
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+];
+
+function parseDataUrlMimeType(dataUrl) {
+  const commaIndex = dataUrl.indexOf(",");
+  if (commaIndex < 0) {
+    throw new Error("codex.emitImage expected a valid image data URL");
+  }
+  const mediaType = dataUrl.slice("data:".length, commaIndex).split(";")[0];
+  if (!mediaType) {
+    throw new Error("codex.emitImage expected image data URL to include a MIME type");
+  }
+  return mediaType;
+}
+
+function assertEmitImageMimeType(mimeType) {
+  const normalized = typeof mimeType === "string" ? mimeType.toLowerCase() : "";
+  if (!SUPPORTED_EMIT_IMAGE_MIME_TYPES.includes(normalized)) {
+    const supportedTypes = `${SUPPORTED_EMIT_IMAGE_MIME_TYPES.slice(0, -1).join(", ")}, or ${
+      SUPPORTED_EMIT_IMAGE_MIME_TYPES[SUPPORTED_EMIT_IMAGE_MIME_TYPES.length - 1]
+    }`;
+    throw new Error(
+      `codex.emitImage only supports ${supportedTypes}`,
+    );
+  }
 }
 
 function parseInputImageItem(value) {
@@ -1330,6 +1364,20 @@ function normalizeMcpImageData(data, mimeType) {
   return `data:${normalizedMimeType};base64,${data}`;
 }
 
+function parseMcpImageDetail(meta) {
+  if (!isPlainObject(meta)) {
+    return undefined;
+  }
+  const detail = meta["codex/imageDetail"];
+  if (
+    typeof detail !== "string" ||
+    !["auto", "low", "high", "original"].includes(detail)
+  ) {
+    return undefined;
+  }
+  return detail;
+}
+
 function parseMcpToolResult(result) {
   if (typeof result === "string") {
     return { images: [], textCount: result.length > 0 ? 1 : 0 };
@@ -1362,6 +1410,7 @@ function parseMcpToolResult(result) {
     if (item.type === "image") {
       images.push({
         image_url: normalizeMcpImageData(item.data, item.mimeType ?? item.mime_type),
+        detail: parseMcpImageDetail(item._meta),
       });
       continue;
     }

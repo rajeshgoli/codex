@@ -17,15 +17,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 #[cfg(unix)]
 use std::fs;
-#[cfg(unix)]
-use std::io::BufRead;
 #[cfg(unix)]
 use std::io::BufReader;
 #[cfg(unix)]
@@ -55,7 +53,10 @@ pub(crate) struct ControlSocketHandle {
 }
 
 impl ControlSocketHandle {
-    pub(crate) fn start(socket_path: PathBuf, app_event_tx: AppEventSender) -> std::io::Result<Self> {
+    pub(crate) fn start(
+        socket_path: PathBuf,
+        app_event_tx: AppEventSender,
+    ) -> std::io::Result<Self> {
         #[cfg(not(unix))]
         {
             let _ = socket_path;
@@ -90,7 +91,10 @@ impl ControlSocketHandle {
             let shutdown = Arc::new(AtomicBool::new(false));
             let shutdown_for_thread = Arc::clone(&shutdown);
             let socket_path_for_thread = socket_path.clone();
-            let state = Arc::new(ControlState::new(app_event_tx, uuid::Uuid::new_v4().to_string()));
+            let state = Arc::new(ControlState::new(
+                app_event_tx,
+                uuid::Uuid::new_v4().to_string(),
+            ));
 
             let join_handle = std::thread::Builder::new()
                 .name("codex-control-socket".to_string())
@@ -255,7 +259,12 @@ fn response_ok(request_id: &str, epoch: &str, result: Value) -> ControlResponse 
     }
 }
 
-fn response_err(request_id: &str, epoch: &str, code: &str, message: impl Into<String>) -> ControlResponse {
+fn response_err(
+    request_id: &str,
+    epoch: &str,
+    code: &str,
+    message: impl Into<String>,
+) -> ControlResponse {
     ControlResponse {
         request_id: request_id.to_string(),
         ok: false,
@@ -332,7 +341,9 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                                 text: message,
                                 text_elements: Vec::new(),
                             }],
+                            environments: None,
                             final_output_json_schema: None,
+                            responsesapi_client_metadata: None,
                         };
                         match dispatch_op(state, Some(thread_id), op) {
                             Ok(()) => response_ok(
@@ -340,12 +351,9 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                                 &state.epoch,
                                 json!({"status": "accepted", "operation": "submit_message"}),
                             ),
-                            Err(err) => response_err(
-                                &request_id,
-                                &state.epoch,
-                                "event_channel_closed",
-                                err,
-                            ),
+                            Err(err) => {
+                                response_err(&request_id, &state.epoch, "event_channel_closed", err)
+                            }
                         }
                     }
                     Ok(None) => match dispatch_app_event(
@@ -357,19 +365,11 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                             &state.epoch,
                             json!({"status": "accepted", "operation": "submit_message"}),
                         ),
-                        Err(err) => response_err(
-                            &request_id,
-                            &state.epoch,
-                            "event_channel_closed",
-                            err,
-                        ),
+                        Err(err) => {
+                            response_err(&request_id, &state.epoch, "event_channel_closed", err)
+                        }
                     },
-                    Err(err) => response_err(
-                        &request_id,
-                        &state.epoch,
-                        "invalid_request",
-                        err,
-                    ),
+                    Err(err) => response_err(&request_id, &state.epoch, "invalid_request", err),
                 }
             }
         }
@@ -396,12 +396,9 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                             &state.epoch,
                             json!({"status": "accepted", "operation": "submit_approval"}),
                         ),
-                        Err(err) => response_err(
-                            &request_id,
-                            &state.epoch,
-                            "event_channel_closed",
-                            err,
-                        ),
+                        Err(err) => {
+                            response_err(&request_id, &state.epoch, "event_channel_closed", err)
+                        }
                     }
                 }
                 None => response_err(
@@ -411,12 +408,7 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                     "decision must be one of: approved, approved_for_session, denied, abort",
                 ),
             },
-            Err(err) => response_err(
-                &request_id,
-                &state.epoch,
-                "invalid_request",
-                err,
-            ),
+            Err(err) => response_err(&request_id, &state.epoch, "invalid_request", err),
         },
         ControlCommand::SubmitUserInput {
             id,
@@ -435,12 +427,9 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                             &state.epoch,
                             json!({"status": "accepted", "operation": "submit_user_input"}),
                         ),
-                        Err(err) => response_err(
-                            &request_id,
-                            &state.epoch,
-                            "event_channel_closed",
-                            err,
-                        ),
+                        Err(err) => {
+                            response_err(&request_id, &state.epoch, "event_channel_closed", err)
+                        }
                     }
                 }
                 Err(err) => response_err(
@@ -450,12 +439,7 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                     format!("response is invalid: {err}"),
                 ),
             },
-            Err(err) => response_err(
-                &request_id,
-                &state.epoch,
-                "invalid_request",
-                err,
-            ),
+            Err(err) => response_err(&request_id, &state.epoch, "invalid_request", err),
         },
         ControlCommand::Shutdown { immediate } => {
             let exit_mode = if immediate {
@@ -469,12 +453,7 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                     &state.epoch,
                     json!({"status": "accepted", "operation": "shutdown", "immediate": immediate}),
                 ),
-                Err(err) => response_err(
-                    &request_id,
-                    &state.epoch,
-                    "event_channel_closed",
-                    err,
-                ),
+                Err(err) => response_err(&request_id, &state.epoch, "event_channel_closed", err),
             }
         }
     };
@@ -567,10 +546,7 @@ fn remove_socket_file_if_socket(path: &Path) -> std::io::Result<()> {
             } else {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "refusing to remove non-socket path: {}",
-                        path.display()
-                    ),
+                    format!("refusing to remove non-socket path: {}", path.display()),
                 ))
             }
         }
@@ -708,7 +684,9 @@ fn read_line_capped(
                     }
                 }
             }
-            Err(err) if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut => {
+            Err(err)
+                if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut =>
+            {
                 continue;
             }
             Err(err) => return Err(err),
@@ -746,7 +724,10 @@ mod tests {
     use tokio::sync::mpsc::error::TryRecvError;
     use tokio::sync::mpsc::unbounded_channel;
 
-    fn test_state() -> (Arc<ControlState>, tokio::sync::mpsc::UnboundedReceiver<AppEvent>) {
+    fn test_state() -> (
+        Arc<ControlState>,
+        tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    ) {
         let (tx, rx) = unbounded_channel();
         let sender = AppEventSender::new(tx);
         let state = Arc::new(ControlState::new(sender, "epoch-1".to_string()));
@@ -808,7 +789,10 @@ mod tests {
             },
         );
         assert!(!response.ok);
-        assert_eq!(response.error.as_ref().map(|e| e.code.as_str()), Some("stale_epoch"));
+        assert_eq!(
+            response.error.as_ref().map(|e| e.code.as_str()),
+            Some("stale_epoch")
+        );
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 }
