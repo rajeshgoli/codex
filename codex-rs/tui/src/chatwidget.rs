@@ -11026,10 +11026,10 @@ impl ChatWidget {
         if text.is_empty() {
             return None;
         }
-        if queue_if_unconfigured && !self.is_session_configured() {
-            tracing::warn!(
-                "cannot submit external user message before session is configured; queueing"
-            );
+        if queue_if_unconfigured
+            && (!self.is_session_configured() || self.is_user_turn_pending_or_running())
+        {
+            tracing::warn!("cannot submit external user message immediately; queueing");
             self.queued_user_messages.push_back(QueuedUserMessage::new(
                 UserMessage {
                     text,
