@@ -19,6 +19,29 @@ pub(crate) struct PreToolUseOutput {
     pub invalid_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PermissionRequestDecision {
+    Allow,
+    Deny { message: String },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PermissionRequestOutput {
+    pub universal: UniversalOutput,
+    pub decision: Option<PermissionRequestDecision>,
+    pub invalid_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PostToolUseOutput {
+    pub universal: UniversalOutput,
+    pub should_block: bool,
+    pub reason: Option<String>,
+    pub invalid_block_reason: Option<String>,
+    pub additional_context: Option<String>,
+    pub invalid_reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct UserPromptSubmitOutput {
     pub universal: UniversalOutput,
@@ -38,6 +61,10 @@ pub(crate) struct StopOutput {
 
 use crate::schema::BlockDecisionWire;
 use crate::schema::HookUniversalOutputWire;
+use crate::schema::PermissionRequestBehaviorWire;
+use crate::schema::PermissionRequestCommandOutputWire;
+use crate::schema::PermissionRequestDecisionWire;
+use crate::schema::PostToolUseCommandOutputWire;
 use crate::schema::PreToolUseCommandOutputWire;
 use crate::schema::PreToolUseDecisionWire;
 use crate::schema::PreToolUsePermissionDecisionWire;
@@ -100,6 +127,63 @@ pub(crate) fn parse_pre_tool_use(stdout: &str) -> Option<PreToolUseOutput> {
     Some(PreToolUseOutput {
         universal,
         block_reason,
+        invalid_reason,
+    })
+}
+
+pub(crate) fn parse_permission_request(stdout: &str) -> Option<PermissionRequestOutput> {
+    let wire: PermissionRequestCommandOutputWire = parse_json(stdout)?;
+    let universal = UniversalOutput::from(wire.universal);
+    let hook_specific_output = wire.hook_specific_output.as_ref();
+    let decision = hook_specific_output.and_then(|output| output.decision.as_ref());
+    let invalid_reason = unsupported_permission_request_universal(&universal).or_else(|| {
+        hook_specific_output.and_then(|output| {
+            unsupported_permission_request_hook_specific_output(output.decision.as_ref())
+        })
+    });
+    let decision = if invalid_reason.is_none() {
+        decision.map(permission_request_decision)
+    } else {
+        None
+    };
+
+    Some(PermissionRequestOutput {
+        universal,
+        decision,
+        invalid_reason,
+    })
+}
+
+pub(crate) fn parse_post_tool_use(stdout: &str) -> Option<PostToolUseOutput> {
+    let wire: PostToolUseCommandOutputWire = parse_json(stdout)?;
+    let universal = UniversalOutput::from(wire.universal);
+    let invalid_reason = unsupported_post_tool_use_universal(&universal).or_else(|| {
+        wire.hook_specific_output
+            .as_ref()
+            .and_then(unsupported_post_tool_use_hook_specific_output)
+    });
+    let should_block = matches!(wire.decision, Some(BlockDecisionWire::Block));
+    let invalid_block_reason = if should_block
+        && match wire.reason.as_deref() {
+            Some(reason) => reason.trim().is_empty(),
+            None => true,
+        } {
+        Some(invalid_block_message("PostToolUse"))
+    } else if !should_block && universal.continue_processing && wire.reason.is_some() {
+        Some("PostToolUse hook returned reason without decision".to_string())
+    } else {
+        None
+    };
+    let additional_context = wire
+        .hook_specific_output
+        .and_then(|output| output.additional_context);
+
+    Some(PostToolUseOutput {
+        universal,
+        should_block: should_block && invalid_reason.is_none() && invalid_block_reason.is_none(),
+        reason: wire.reason,
+        invalid_block_reason,
+        additional_context,
         invalid_reason,
     })
 }
@@ -190,6 +274,66 @@ fn unsupported_pre_tool_use_universal(universal: &UniversalOutput) -> Option<Str
     }
 }
 
+fn unsupported_permission_request_universal(universal: &UniversalOutput) -> Option<String> {
+    if !universal.continue_processing {
+        Some("PermissionRequest hook returned unsupported continue:false".to_string())
+    } else if universal.stop_reason.is_some() {
+        Some("PermissionRequest hook returned unsupported stopReason".to_string())
+    } else if universal.suppress_output {
+        Some("PermissionRequest hook returned unsupported suppressOutput".to_string())
+    } else {
+        None
+    }
+}
+
+fn unsupported_post_tool_use_universal(universal: &UniversalOutput) -> Option<String> {
+    if universal.suppress_output {
+        Some("PostToolUse hook returned unsupported suppressOutput".to_string())
+    } else {
+        None
+    }
+}
+
+fn unsupported_permission_request_hook_specific_output(
+    decision: Option<&PermissionRequestDecisionWire>,
+) -> Option<String> {
+    let decision = decision?;
+    if decision.updated_input.is_some() {
+        Some("PermissionRequest hook returned unsupported updatedInput".to_string())
+    } else if decision.updated_permissions.is_some() {
+        Some("PermissionRequest hook returned unsupported updatedPermissions".to_string())
+    } else if decision.interrupt {
+        Some("PermissionRequest hook returned unsupported interrupt:true".to_string())
+    } else {
+        None
+    }
+}
+
+fn permission_request_decision(
+    decision: &PermissionRequestDecisionWire,
+) -> PermissionRequestDecision {
+    match decision.behavior {
+        PermissionRequestBehaviorWire::Allow => PermissionRequestDecision::Allow,
+        PermissionRequestBehaviorWire::Deny => PermissionRequestDecision::Deny {
+            message: decision
+                .message
+                .as_deref()
+                .and_then(trimmed_reason)
+                .unwrap_or_else(|| "PermissionRequest hook denied approval".to_string()),
+        },
+    }
+}
+
+fn unsupported_post_tool_use_hook_specific_output(
+    output: &crate::schema::PostToolUseHookSpecificOutputWire,
+) -> Option<String> {
+    if output.updated_mcp_tool_output.is_some() {
+        Some("PostToolUse hook returned unsupported updatedMCPToolOutput".to_string())
+    } else {
+        None
+    }
+}
+
 fn unsupported_pre_tool_use_hook_specific_output(
     output: &crate::schema::PreToolUseHookSpecificOutputWire,
 ) -> Option<String> {
@@ -269,5 +413,82 @@ fn trimmed_reason(reason: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    use super::parse_permission_request;
+
+    #[test]
+    fn permission_request_rejects_reserved_updated_input_field() {
+        let parsed = parse_permission_request(
+            &json!({
+                "continue": true,
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {
+                        "behavior": "allow",
+                        "updatedInput": {}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("permission request hook output should parse");
+
+        assert_eq!(
+            parsed.invalid_reason,
+            Some("PermissionRequest hook returned unsupported updatedInput".to_string())
+        );
+    }
+
+    #[test]
+    fn permission_request_rejects_reserved_updated_permissions_field() {
+        let parsed = parse_permission_request(
+            &json!({
+                "continue": true,
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {
+                        "behavior": "allow",
+                        "updatedPermissions": {}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("permission request hook output should parse");
+
+        assert_eq!(
+            parsed.invalid_reason,
+            Some("PermissionRequest hook returned unsupported updatedPermissions".to_string())
+        );
+    }
+
+    #[test]
+    fn permission_request_rejects_reserved_interrupt_field() {
+        let parsed = parse_permission_request(
+            &json!({
+                "continue": true,
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {
+                        "behavior": "allow",
+                        "interrupt": true
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("permission request hook output should parse");
+
+        assert_eq!(
+            parsed.invalid_reason,
+            Some("PermissionRequest hook returned unsupported interrupt:true".to_string())
+        );
     }
 }

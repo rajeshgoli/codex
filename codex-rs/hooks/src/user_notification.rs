@@ -77,52 +77,12 @@ pub fn notify_hook(argv: Vec<String>) -> Hook {
     }
 }
 
-pub fn after_tool_use_hook(argv: Vec<String>, abort_on_failure: bool) -> Hook {
-    let argv = Arc::new(argv);
-    Hook {
-        name: "after_tool_use".to_string(),
-        func: Arc::new(move |payload: &HookPayload| {
-            let argv = Arc::clone(&argv);
-            Box::pin(async move {
-                let mut command = match command_from_argv(&argv) {
-                    Some(command) => command,
-                    None => return HookResult::Success,
-                };
-                let payload_json = match serde_json::to_string(payload) {
-                    Ok(value) => value,
-                    Err(err) => return failure_result(abort_on_failure, err.into()),
-                };
-                command.arg(payload_json);
-                command
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
-
-                match command.status().await {
-                    Ok(status) if status.success() => HookResult::Success,
-                    Ok(status) => failure_result(
-                        abort_on_failure,
-                        std::io::Error::other(format!("hook exited with status {status}")).into(),
-                    ),
-                    Err(err) => failure_result(abort_on_failure, err.into()),
-                }
-            })
-        }),
-    }
-}
-
-fn failure_result(abort_on_failure: bool, err: Box<dyn std::error::Error + Send + Sync>) -> HookResult {
-    if abort_on_failure {
-        HookResult::FailedAbort(err)
-    } else {
-        HookResult::FailedContinue(err)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
     use codex_protocol::ThreadId;
+    use codex_utils_absolute_path::test_support::PathBufExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
     use serde_json::Value;
     use serde_json::json;
@@ -130,11 +90,12 @@ mod tests {
     use super::*;
 
     fn expected_notification_json() -> Value {
+        let cwd = test_path_buf("/Users/example/project");
         json!({
             "type": "agent-turn-complete",
             "thread-id": "b5f6c1c2-1111-2222-3333-444455556666",
             "turn-id": "12345",
-            "cwd": "/Users/example/project",
+            "cwd": cwd.display().to_string(),
             "client": "codex-tui",
             "input-messages": ["Rename `foo` to `bar` and update the callsites."],
             "last-assistant-message": "Rename complete and verified `cargo build` succeeds.",
@@ -146,7 +107,9 @@ mod tests {
         let notification = UserNotification::AgentTurnComplete {
             thread_id: "b5f6c1c2-1111-2222-3333-444455556666".to_string(),
             turn_id: "12345".to_string(),
-            cwd: "/Users/example/project".to_string(),
+            cwd: test_path_buf("/Users/example/project")
+                .display()
+                .to_string(),
             client: Some("codex-tui".to_string()),
             input_messages: vec!["Rename `foo` to `bar` and update the callsites.".to_string()],
             last_assistant_message: Some(
@@ -163,7 +126,7 @@ mod tests {
     fn legacy_notify_json_matches_historical_wire_shape() -> Result<()> {
         let payload = HookPayload {
             session_id: ThreadId::new(),
-            cwd: std::path::Path::new("/Users/example/project").to_path_buf(),
+            cwd: test_path_buf("/Users/example/project").abs(),
             client: Some("codex-tui".to_string()),
             triggered_at: chrono::Utc::now(),
             hook_event: HookEvent::AfterAgent {

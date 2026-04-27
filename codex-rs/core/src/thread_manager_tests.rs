@@ -1,10 +1,11 @@
 use super::*;
-use crate::codex::make_session_and_context;
 use crate::config::test_config;
-use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
-use crate::models_manager::manager::RefreshStrategy;
 use crate::rollout::RolloutRecorder;
+use crate::session::session::SessionSettingsUpdate;
+use crate::session::tests::make_session_and_context;
 use crate::tasks::interrupted_turn_history_marker;
+use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
+use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
@@ -12,6 +13,8 @@ use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
+use core_test_support::PathBufExt;
+use core_test_support::PathExt;
 use core_test_support::responses::mount_models_once;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
@@ -39,6 +42,20 @@ fn assistant_msg(text: &str) -> ResponseItem {
         end_turn: None,
         phase: None,
     }
+}
+
+fn disabled_environment_manager_for_tests() -> Arc<codex_exec_server::EnvironmentManager> {
+    let runtime_paths = codex_exec_server::ExecServerRuntimePaths::new(
+        std::env::current_exe().expect("current exe path"),
+        /*codex_linux_sandbox_exe*/ None,
+    )
+    .expect("runtime paths");
+    Arc::new(codex_exec_server::EnvironmentManager::new(
+        codex_exec_server::EnvironmentManagerArgs {
+            exec_server_url: Some("none".to_string()),
+            local_runtime_paths: runtime_paths,
+        },
+    ))
 }
 
 #[test]
@@ -74,7 +91,7 @@ fn truncates_before_requested_user_message() {
         .collect();
     let truncated = truncate_before_nth_user_message(
         InitialHistory::Forked(initial),
-        1,
+        /*n*/ 1,
         &SnapshotTurnState {
             ends_mid_turn: false,
             active_turn_id: None,
@@ -99,7 +116,7 @@ fn truncates_before_requested_user_message() {
         .collect();
     let truncated2 = truncate_before_nth_user_message(
         InitialHistory::Forked(initial2.clone()),
-        2,
+        /*n*/ 2,
         &SnapshotTurnState {
             ends_mid_turn: false,
             active_turn_id: None,
@@ -163,6 +180,7 @@ fn out_of_range_truncation_drops_pre_user_active_turn_prefix() {
         RolloutItem::ResponseItem(assistant_msg("a1")),
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "turn-2".to_string(),
+            started_at: None,
             model_context_window: None,
             collaboration_mode_kind: Default::default(),
         })),
@@ -209,7 +227,7 @@ async fn ignores_session_prefix_messages_when_truncating() {
 
     let truncated = truncate_before_nth_user_message(
         InitialHistory::Forked(rollout_items),
-        1,
+        /*n*/ 1,
         &SnapshotTurnState {
             ends_mid_turn: false,
             active_turn_id: None,
@@ -234,15 +252,16 @@ async fn ignores_session_prefix_messages_when_truncating() {
 #[tokio::test]
 async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
     let temp_dir = tempdir().expect("tempdir");
-    let mut config = test_config();
-    config.codex_home = temp_dir.path().join("codex-home");
-    config.cwd = config.codex_home.clone();
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
 
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
-        config.codex_home.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let thread_1 = manager
         .start_thread(config.clone())
@@ -268,21 +287,142 @@ async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
 }
 
 #[tokio::test]
-async fn new_uses_configured_openai_provider_for_model_refresh() {
+async fn start_thread_accepts_explicit_environment_when_default_environment_is_disabled() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        disabled_environment_manager_for_tests(),
+    );
+
+    let thread = manager
+        .start_thread_with_tools_and_service_name(StartThreadWithToolsOptions {
+            config: config.clone(),
+            initial_history: InitialHistory::New,
+            dynamic_tools: Vec::new(),
+            persist_extended_history: false,
+            metrics_service_name: None,
+            parent_trace: None,
+            environments: vec![TurnEnvironmentSelection {
+                environment_id: "local".to_string(),
+                cwd: config.cwd.clone(),
+            }],
+        })
+        .await
+        .expect("explicit sticky environment should resolve by id");
+
+    assert_eq!(manager.list_thread_ids().await, vec![thread.thread_id]);
+}
+
+#[tokio::test]
+async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager.clone(),
+        SessionSource::Exec,
+        CollaborationModesConfig::default(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        /*analytics_events_client*/ None,
+    );
+    let selected_cwd =
+        AbsolutePathBuf::try_from(config.cwd.as_path().join("selected")).expect("absolute path");
+    let environments = vec![TurnEnvironmentSelection {
+        environment_id: "local".to_string(),
+        cwd: selected_cwd.clone(),
+    }];
+    let default_cwd = config.cwd.clone();
+
+    let source = manager
+        .start_thread_with_tools_and_service_name(StartThreadWithToolsOptions {
+            config: config.clone(),
+            initial_history: InitialHistory::New,
+            dynamic_tools: Vec::new(),
+            persist_extended_history: false,
+            metrics_service_name: None,
+            parent_trace: None,
+            environments: environments.clone(),
+        })
+        .await
+        .expect("start source thread");
+    source.thread.ensure_rollout_materialized().await;
+    source
+        .thread
+        .flush_rollout()
+        .await
+        .expect("flush source rollout");
+    let rollout_path = source
+        .thread
+        .rollout_path()
+        .expect("source rollout path should exist");
+
+    let resumed = manager
+        .resume_thread_from_rollout(
+            config.clone(),
+            rollout_path.clone(),
+            auth_manager,
+            /*parent_trace*/ None,
+        )
+        .await
+        .expect("resume source thread");
+    let resumed_turn = resumed
+        .thread
+        .codex
+        .session
+        .new_turn_with_sub_id("resume-turn".to_string(), SessionSettingsUpdate::default())
+        .await
+        .expect("build resumed turn context");
+    assert_eq!(resumed_turn.environments.len(), 1);
+    assert_eq!(resumed_turn.environments[0].cwd, default_cwd);
+    assert_ne!(resumed_turn.environments[0].cwd, selected_cwd);
+
+    let forked = manager
+        .fork_thread(
+            ForkSnapshot::Interrupted,
+            config,
+            rollout_path,
+            /*persist_extended_history*/ false,
+            /*parent_trace*/ None,
+        )
+        .await
+        .expect("fork source thread");
+    let forked_turn = forked
+        .thread
+        .codex
+        .session
+        .new_turn_with_sub_id("fork-turn".to_string(), SessionSettingsUpdate::default())
+        .await
+        .expect("build forked turn context");
+    assert_eq!(forked_turn.environments.len(), 1);
+    assert_eq!(forked_turn.environments[0].cwd, default_cwd);
+    assert_ne!(forked_turn.environments[0].cwd, selected_cwd);
+}
+
+#[tokio::test]
+async fn new_uses_active_provider_for_model_refresh() {
     let server = MockServer::start().await;
     let models_mock = mount_models_once(&server, ModelsResponse { models: vec![] }).await;
 
     let temp_dir = tempdir().expect("tempdir");
-    let mut config = test_config();
-    config.codex_home = temp_dir.path().join("codex-home");
-    config.cwd = config.codex_home.clone();
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
     config.model_catalog = None;
-    config
-        .model_providers
-        .get_mut("openai")
-        .expect("openai provider should exist")
-        .base_url = Some(server.uri());
+    config.model_provider.base_url = Some(server.uri());
 
     let auth_manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
@@ -291,6 +431,8 @@ async fn new_uses_configured_openai_provider_for_model_refresh() {
         auth_manager,
         SessionSource::Exec,
         CollaborationModesConfig::default(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        /*analytics_events_client*/ None,
     );
 
     let _ = manager.list_models(RefreshStrategy::Online).await;
@@ -313,6 +455,8 @@ fn interrupted_fork_snapshot_appends_interrupt_boundary() {
             RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: None,
                 reason: TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
             })),
         ])
         .expect("serialize expected interrupted fork history"),
@@ -327,6 +471,8 @@ fn interrupted_fork_snapshot_appends_interrupt_boundary() {
             RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: None,
                 reason: TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
             })),
         ])
         .expect("serialize expected interrupted empty history"),
@@ -342,6 +488,8 @@ fn interrupted_snapshot_is_not_mid_turn() {
         RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         })),
     ]);
 
@@ -406,9 +554,9 @@ fn mixed_response_and_legacy_user_event_history_is_mid_turn() {
 #[tokio::test]
 async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_history() {
     let temp_dir = tempdir().expect("tempdir");
-    let mut config = test_config();
-    config.codex_home = temp_dir.path().join("codex-home");
-    config.cwd = config.codex_home.clone();
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
 
     let auth_manager =
@@ -418,6 +566,8 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
         auth_manager.clone(),
         SessionSource::Exec,
         CollaborationModesConfig::default(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        /*analytics_events_client*/ None,
     );
 
     let source = manager
@@ -475,6 +625,8 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
         EventMsg::TurnAborted(TurnAbortedEvent {
             turn_id: expected_turn_id,
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     ))
     .expect("serialize interrupted abort event");
@@ -503,9 +655,9 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
 #[tokio::test]
 async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
     let temp_dir = tempdir().expect("tempdir");
-    let mut config = test_config();
-    config.codex_home = temp_dir.path().join("codex-home");
-    config.cwd = config.codex_home.clone();
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
 
     let auth_manager =
@@ -515,6 +667,8 @@ async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
         auth_manager.clone(),
         SessionSource::Exec,
         CollaborationModesConfig::default(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        /*analytics_events_client*/ None,
     );
 
     let source = manager
@@ -523,6 +677,7 @@ async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
             InitialHistory::Forked(vec![
                 RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                     turn_id: "turn-explicit".to_string(),
+                    started_at: None,
                     model_context_window: None,
                     collaboration_mode_kind: Default::default(),
                 })),
@@ -581,6 +736,8 @@ async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
             RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_id),
                 reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
             })) if turn_id == "turn-explicit"
         )
     }));
@@ -589,9 +746,9 @@ async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
 #[tokio::test]
 async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_source() {
     let temp_dir = tempdir().expect("tempdir");
-    let mut config = test_config();
-    config.codex_home = temp_dir.path().join("codex-home");
-    config.cwd = config.codex_home.clone();
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
 
     let auth_manager =
@@ -601,6 +758,8 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
         auth_manager.clone(),
         SessionSource::Exec,
         CollaborationModesConfig::default(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        /*analytics_events_client*/ None,
     );
 
     let source = manager

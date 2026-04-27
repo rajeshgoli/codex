@@ -3,6 +3,10 @@ use tokio::process::Command;
 
 use crate::engine::ClaudeHooksEngine;
 use crate::engine::CommandShell;
+use crate::events::permission_request::PermissionRequestOutcome;
+use crate::events::permission_request::PermissionRequestRequest;
+use crate::events::post_tool_use::PostToolUseOutcome;
+use crate::events::post_tool_use::PostToolUseRequest;
 use crate::events::pre_tool_use::PreToolUseOutcome;
 use crate::events::pre_tool_use::PreToolUseRequest;
 use crate::events::session_start::SessionStartOutcome;
@@ -23,8 +27,6 @@ pub struct HooksConfig {
     pub config_layer_stack: Option<ConfigLayerStack>,
     pub shell_program: Option<String>,
     pub shell_args: Vec<String>,
-    pub after_tool_use_argv: Option<Vec<String>>,
-    pub after_tool_use_abort_on_failure: bool,
 }
 
 #[derive(Clone)]
@@ -56,15 +58,9 @@ impl Hooks {
                 args: config.shell_args,
             },
         );
-        let after_tool_use = config
-            .after_tool_use_argv
-            .filter(|argv| !argv.is_empty() && !argv[0].is_empty())
-            .map(|argv| crate::after_tool_use_hook(argv, config.after_tool_use_abort_on_failure))
-            .into_iter()
-            .collect();
         Self {
             after_agent,
-            after_tool_use,
+            after_tool_use: Vec::new(),
             engine,
         }
     }
@@ -109,6 +105,20 @@ impl Hooks {
         self.engine.preview_pre_tool_use(request)
     }
 
+    pub fn preview_permission_request(
+        &self,
+        request: &PermissionRequestRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_permission_request(request)
+    }
+
+    pub fn preview_post_tool_use(
+        &self,
+        request: &PostToolUseRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_post_tool_use(request)
+    }
+
     pub async fn run_session_start(
         &self,
         request: SessionStartRequest,
@@ -119,6 +129,17 @@ impl Hooks {
 
     pub async fn run_pre_tool_use(&self, request: PreToolUseRequest) -> PreToolUseOutcome {
         self.engine.run_pre_tool_use(request).await
+    }
+
+    pub async fn run_permission_request(
+        &self,
+        request: PermissionRequestRequest,
+    ) -> PermissionRequestOutcome {
+        self.engine.run_permission_request(request).await
+    }
+
+    pub async fn run_post_tool_use(&self, request: PostToolUseRequest) -> PostToolUseOutcome {
+        self.engine.run_post_tool_use(request).await
     }
 
     pub fn preview_user_prompt_submit(

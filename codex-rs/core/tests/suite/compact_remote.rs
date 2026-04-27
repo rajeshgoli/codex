@@ -4,8 +4,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use codex_core::CodexAuth;
 use codex_core::compact::SUMMARY_PREFIX;
+use codex_login::CodexAuth;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -17,6 +17,7 @@ use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeConversationRealtimeEvent;
 use codex_protocol::protocol::RealtimeEvent;
+use codex_protocol::protocol::RealtimeOutputModality;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
@@ -33,8 +34,10 @@ use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
+use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use tokio::time::Duration;
 use wiremock::ResponseTemplate;
 
 fn approx_token_count(text: &str) -> i64 {
@@ -54,6 +57,7 @@ fn estimate_compact_payload_tokens(request: &responses::ResponsesRequest) -> i64
 
 const PRETURN_CONTEXT_DIFF_CWD: &str = "/tmp/PRETURN_CONTEXT_DIFF_CWD";
 const DUMMY_FUNCTION_NAME: &str = "test_tool";
+const REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn summary_with_prefix(summary: &str) -> String {
     format!("{SUMMARY_PREFIX}\n{summary}")
@@ -116,8 +120,11 @@ async fn start_remote_realtime_server() -> responses::WebSocketTestServer {
 async fn start_realtime_conversation(codex: &codex_core::CodexThread) -> Result<()> {
     codex
         .submit(Op::RealtimeConversationStart(ConversationStartParams {
-            prompt: "backend prompt".to_string(),
+            output_modality: RealtimeOutputModality::Audio,
+            prompt: Some(Some("backend prompt".to_string())),
             session_id: None,
+            transport: None,
+            voice: None,
         }))
         .await?;
 
@@ -193,6 +200,15 @@ fn assert_request_contains_realtime_end(request: &responses::ResponsesRequest) {
     );
 }
 
+async fn wait_for_turn_complete(codex: &codex_core::CodexThread) {
+    wait_for_event_with_timeout(
+        codex,
+        |ev| matches!(ev, EventMsg::TurnComplete(_)),
+        REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -230,28 +246,32 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello remote compact".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_turn_complete(&codex).await;
 
     codex.submit(Op::Compact).await?;
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_turn_complete(&codex).await;
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after compact".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_turn_complete(&codex).await;
 
     let compact_request = compact_mock.single_request();
     assert_eq!(compact_request.path(), "/v1/responses/compact");
@@ -353,7 +373,7 @@ async fn remote_compact_runs_automatically() -> Result<()> {
         harness.server(),
         sse(vec![
             responses::ev_shell_command_call("m1", "echo 'hi'"),
-            responses::ev_completed_with_tokens("resp-1", 100000000), // over token limit
+            responses::ev_completed_with_tokens("resp-1", /*total_tokens*/ 100000000), // over token limit
         ]),
     )
     .await;
@@ -374,11 +394,13 @@ async fn remote_compact_runs_automatically() -> Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello remote compact".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
 
@@ -448,22 +470,26 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: first_user_message.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: second_user_message.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
@@ -548,7 +574,10 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
         vec![
             sse(vec![
                 responses::ev_shell_command_call(retained_call_id, retained_command),
-                responses::ev_completed_with_tokens("retained-call-response", 100),
+                responses::ev_completed_with_tokens(
+                    "retained-call-response",
+                    /*total_tokens*/ 100,
+                ),
             ]),
             sse(vec![
                 responses::ev_assistant_message("retained-assistant", "retained complete"),
@@ -556,11 +585,14 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
             ]),
             sse(vec![
                 responses::ev_shell_command_call(trimmed_call_id, trimmed_command),
-                responses::ev_completed_with_tokens("trimmed-call-response", 100),
+                responses::ev_completed_with_tokens(
+                    "trimmed-call-response",
+                    /*total_tokens*/ 100,
+                ),
             ]),
             sse(vec![responses::ev_completed_with_tokens(
                 "trimmed-final-response",
-                500_000,
+                /*total_tokens*/ 500_000,
             )]),
         ],
     )
@@ -568,22 +600,26 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: first_user_message.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: second_user_message.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
@@ -596,11 +632,13 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "turn that triggers auto compact".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
@@ -672,7 +710,7 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
         harness.server(),
         sse(vec![
             responses::ev_assistant_message("initial-assistant", "initial turn complete"),
-            responses::ev_completed_with_tokens("initial-response", 500_000),
+            responses::ev_completed_with_tokens("initial-response", /*total_tokens*/ 500_000),
         ]),
     )
     .await;
@@ -693,22 +731,26 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "turn that exceeds token threshold".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "turn that triggers auto compact".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
 
@@ -759,7 +801,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
     let override_retained_call_id = "override-retained-call";
     let override_trailing_call_id = "override-trailing-call";
     let retained_command = "printf retained-shell-output";
-    let trailing_command = "printf trailing-shell-output";
+    let trailing_command = "printf '%020000d' 0";
 
     let baseline_harness = TestCodexHarness::with_builder(
         test_codex()
@@ -795,11 +837,13 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
 
     baseline_codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: first_user_message.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&baseline_codex, |event| {
@@ -809,11 +853,13 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
 
     baseline_codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: second_user_message.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&baseline_codex, |event| {
@@ -846,9 +892,12 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
     let baseline_input_tokens = estimate_compact_input_tokens(&baseline_compact_request);
     let baseline_payload_tokens = estimate_compact_payload_tokens(&baseline_compact_request);
 
-    let override_base_instructions =
-        format!("REMOTE_BASE_INSTRUCTIONS_OVERRIDE {}", "x".repeat(120_000));
-    let override_context_window = baseline_payload_tokens.saturating_add(1_000);
+    let override_base_instructions = format!(
+        "{}\nREMOTE_BASE_INSTRUCTIONS_OVERRIDE {}",
+        baseline_compact_request.instructions_text(),
+        "x".repeat(4_000)
+    );
+    let override_context_window = baseline_payload_tokens.saturating_add(500);
     let pretrim_override_estimate =
         baseline_input_tokens.saturating_add(approx_token_count(&override_base_instructions));
     assert!(
@@ -894,11 +943,13 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
 
     override_codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: first_user_message.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&override_codex, |event| {
@@ -908,11 +959,13 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
 
     override_codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: second_user_message.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&override_codex, |event| {
@@ -976,11 +1029,13 @@ async fn remote_manual_compact_emits_context_compaction_items() -> Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "manual remote compact".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
@@ -1054,11 +1109,13 @@ async fn remote_manual_compact_failure_emits_task_error_event() -> Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "manual remote compact".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
@@ -1136,11 +1193,13 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "needs compaction".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1277,11 +1336,13 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
     initial
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "start remote compact flow".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1292,11 +1353,13 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
     initial
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after compact in same session".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1314,11 +1377,13 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
     resumed
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after resume".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&resumed.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1408,11 +1473,13 @@ async fn remote_compact_refreshes_stale_developer_instructions_without_resume() 
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "start remote compact flow".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1422,11 +1489,13 @@ async fn remote_compact_refreshes_stale_developer_instructions_without_resume() 
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after compact in same session".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1468,11 +1537,11 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_sta
         vec![
             responses::sse(vec![
                 responses::ev_assistant_message("m1", "REMOTE_FIRST_REPLY"),
-                responses::ev_completed_with_tokens("r1", 500),
+                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m2", "REMOTE_SECOND_REPLY"),
-                responses::ev_completed_with_tokens("r2", 80),
+                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
             ]),
         ],
     )
@@ -1491,22 +1560,26 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_sta
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1566,11 +1639,13 @@ async fn remote_request_uses_custom_experimental_realtime_start_instructions() -
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1601,11 +1676,11 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end
         vec![
             responses::sse(vec![
                 responses::ev_assistant_message("m1", "REMOTE_FIRST_REPLY"),
-                responses::ev_completed_with_tokens("r1", 500),
+                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m2", "REMOTE_SECOND_REPLY"),
-                responses::ev_completed_with_tokens("r2", 80),
+                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
             ]),
         ],
     )
@@ -1624,11 +1699,13 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1637,11 +1714,13 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1686,11 +1765,11 @@ async fn snapshot_request_shape_remote_manual_compact_restates_realtime_start() 
         vec![
             responses::sse(vec![
                 responses::ev_assistant_message("m1", "REMOTE_FIRST_REPLY"),
-                responses::ev_completed_with_tokens("r1", 60),
+                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 60),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m2", "REMOTE_SECOND_REPLY"),
-                responses::ev_completed_with_tokens("r2", 80),
+                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
             ]),
         ],
     )
@@ -1709,11 +1788,13 @@ async fn snapshot_request_shape_remote_manual_compact_restates_realtime_start() 
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1723,11 +1804,13 @@ async fn snapshot_request_shape_remote_manual_compact_restates_realtime_start() 
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1776,15 +1859,15 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
         vec![
             responses::sse(vec![
                 responses::ev_assistant_message("setup", "REMOTE_SETUP_REPLY"),
-                responses::ev_completed_with_tokens("setup-response", 60),
+                responses::ev_completed_with_tokens("setup-response", /*total_tokens*/ 60),
             ]),
             responses::sse(vec![
                 responses::ev_function_call("call-remote-mid-turn", DUMMY_FUNCTION_NAME, "{}"),
-                responses::ev_completed_with_tokens("r1", 500),
+                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m2", "REMOTE_MID_TURN_FINAL_REPLY"),
-                responses::ev_completed_with_tokens("r2", 80),
+                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
             ]),
         ],
     )
@@ -1803,11 +1886,13 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "SETUP_USER".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1816,11 +1901,13 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1880,11 +1967,11 @@ async fn snapshot_request_shape_remote_compact_resume_restates_realtime_end() ->
         vec![
             responses::sse(vec![
                 responses::ev_assistant_message("m1", "REMOTE_FIRST_REPLY"),
-                responses::ev_completed_with_tokens("r1", 60),
+                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 60),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m2", "REMOTE_AFTER_RESUME_REPLY"),
-                responses::ev_completed_with_tokens("r2", 80),
+                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
             ]),
         ],
     )
@@ -1904,11 +1991,13 @@ async fn snapshot_request_shape_remote_compact_resume_restates_realtime_end() ->
     initial
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1931,11 +2020,13 @@ async fn snapshot_request_shape_remote_compact_resume_restates_realtime_end() ->
     resumed
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&resumed.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1984,15 +2075,15 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
         vec![
             responses::sse(vec![
                 responses::ev_assistant_message("m1", "REMOTE_FIRST_REPLY"),
-                responses::ev_completed_with_tokens("r1", 60),
+                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 60),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m2", "REMOTE_SECOND_REPLY"),
-                responses::ev_completed_with_tokens("r2", 500),
+                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 500),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m3", "REMOTE_FINAL_REPLY"),
-                responses::ev_completed_with_tokens("r3", 80),
+                responses::ev_completed_with_tokens("r3", /*total_tokens*/ 80),
             ]),
         ],
     )
@@ -2012,6 +2103,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
                     approval_policy: None,
                     approvals_reviewer: None,
                     sandbox_policy: None,
+                    permission_profile: None,
                     windows_sandbox_level: None,
                     model: None,
                     effort: None,
@@ -2024,11 +2116,13 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
         }
         codex
             .submit(Op::UserInput {
+                environments: None,
                 items: vec![UserInput::Text {
                     text: user.to_string(),
                     text_elements: Vec::new(),
                 }],
                 final_output_json_schema: None,
+                responsesapi_client_metadata: None,
             })
             .await?;
         wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -2071,8 +2165,8 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
 -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let previous_model = "gpt-5.1-codex-max";
-    let next_model = "gpt-5.2-codex";
+    let previous_model = "gpt-5.4";
+    let next_model = "gpt-5.3-codex";
     let harness = TestCodexHarness::with_builder(
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -2088,7 +2182,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
         harness.server(),
         responses::sse(vec![
             responses::ev_assistant_message("m1", "BEFORE_SWITCH_REPLY"),
-            responses::ev_completed_with_tokens("r1", 500),
+            responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
         ]),
     )
     .await;
@@ -2096,7 +2190,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
         harness.server(),
         responses::sse(vec![
             responses::ev_assistant_message("m2", "AFTER_SWITCH_REPLY"),
-            responses::ev_completed_with_tokens("r2", 80),
+            responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
         ]),
     )
     .await;
@@ -2108,11 +2202,13 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "BEFORE_SWITCH_USER".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -2123,6 +2219,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: Some(next_model.to_string()),
             effort: None,
@@ -2134,11 +2231,13 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
         .await?;
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "AFTER_SWITCH_USER".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -2224,7 +2323,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
         harness.server(),
         vec![responses::sse(vec![
             responses::ev_assistant_message("m1", "REMOTE_FIRST_REPLY"),
-            responses::ev_completed_with_tokens("r1", 500),
+            responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
         ])],
     )
     .await;
@@ -2243,29 +2342,33 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
         harness.server(),
         responses::sse(vec![
             responses::ev_assistant_message("m2", "REMOTE_POST_COMPACT_SHOULD_NOT_RUN"),
-            responses::ev_completed_with_tokens("r2", 80),
+            responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
         ]),
     )
     .await;
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     let error_message = wait_for_event_match(&codex, |event| match event {
@@ -2325,11 +2428,11 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
         vec![
             responses::sse(vec![
                 responses::ev_function_call("call-remote-mid-turn", DUMMY_FUNCTION_NAME, "{}"),
-                responses::ev_completed_with_tokens("r1", 500),
+                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m2", "REMOTE_MID_TURN_FINAL_REPLY"),
-                responses::ev_completed_with_tokens("r2", 80),
+                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
             ]),
         ],
     )
@@ -2343,11 +2446,13 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -2394,7 +2499,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
         harness.server(),
         responses::sse(vec![
             responses::ev_function_call("call-remote-summary-only", DUMMY_FUNCTION_NAME, "{}"),
-            responses::ev_completed_with_tokens("r1", 500),
+            responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
         ]),
     )
     .await;
@@ -2402,7 +2507,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
         harness.server(),
         responses::sse(vec![
             responses::ev_assistant_message("m2", "REMOTE_SUMMARY_ONLY_FINAL_REPLY"),
-            responses::ev_completed_with_tokens("r2", 80),
+            responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
         ]),
     )
     .await;
@@ -2418,11 +2523,13 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -2477,7 +2584,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
         harness.server(),
         responses::sse(vec![
             responses::ev_assistant_message("setup", "REMOTE_SETUP_REPLY"),
-            responses::ev_completed_with_tokens("setup-response", 60),
+            responses::ev_completed_with_tokens("setup-response", /*total_tokens*/ 60),
         ]),
     )
     .await;
@@ -2485,7 +2592,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
         harness.server(),
         responses::sse(vec![
             responses::ev_shell_command_call("call-remote-multi-summary", "echo multi-summary"),
-            responses::ev_completed_with_tokens("r1", 1_000),
+            responses::ev_completed_with_tokens("r1", /*total_tokens*/ 1_000),
         ]),
     )
     .await;
@@ -2501,11 +2608,13 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -2515,11 +2624,13 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -2580,7 +2691,7 @@ async fn snapshot_request_shape_remote_manual_compact_without_previous_user_mess
         harness.server(),
         responses::sse(vec![
             responses::ev_assistant_message("m1", "REMOTE_MANUAL_EMPTY_FOLLOW_UP_REPLY"),
-            responses::ev_completed_with_tokens("r1", 80),
+            responses::ev_completed_with_tokens("r1", /*total_tokens*/ 80),
         ]),
     )
     .await;
@@ -2594,11 +2705,13 @@ async fn snapshot_request_shape_remote_manual_compact_without_previous_user_mess
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
