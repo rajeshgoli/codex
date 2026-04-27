@@ -10922,6 +10922,72 @@ impl ChatWidget {
         )
     }
 
+    pub(crate) fn prepare_targeted_external_literal_user_message_for_thread(
+        &mut self,
+        text: String,
+        session: &ThreadSessionState,
+        input_state: Option<&ThreadInputState>,
+    ) -> Option<(AppCommand, Option<AppCommand>, String)> {
+        if text.is_empty() {
+            return None;
+        }
+
+        let items = vec![UserInput::Text {
+            text: text.clone(),
+            text_elements: Vec::new(),
+        }];
+        let base_mode = input_state
+            .map(|state| state.current_collaboration_mode.clone())
+            .unwrap_or_else(|| self.current_collaboration_mode.clone());
+        let effective_mode = input_state
+            .and_then(|state| state.active_collaboration_mask.as_ref())
+            .map(|mask| base_mode.apply_mask(mask))
+            .unwrap_or(base_mode)
+            .with_updates(
+                Some(session.model.clone()),
+                Some(session.reasoning_effort),
+                /*developer_instructions*/ None,
+            );
+        if effective_mode.model().trim().is_empty() {
+            self.add_error_message(
+                "Target thread model is unavailable. Wait for the thread to finish syncing before sending input.".to_string(),
+            );
+            return None;
+        }
+        let collaboration_mode = if self.collaboration_modes_enabled() {
+            input_state
+                .and_then(|state| state.active_collaboration_mask.as_ref())
+                .map(|_| effective_mode.clone())
+        } else {
+            None
+        };
+        let permission_profile = if matches!(
+            session.sandbox_policy,
+            SandboxPolicy::ExternalSandbox { .. }
+        ) {
+            None
+        } else {
+            session.permission_profile.clone()
+        };
+        let op = AppCommand::user_turn(
+            items,
+            session.cwd.to_path_buf(),
+            session.approval_policy,
+            session.sandbox_policy.clone(),
+            permission_profile,
+            effective_mode.model().to_string(),
+            effective_mode.reasoning_effort(),
+            /*summary*/ None,
+            Some(session.service_tier),
+            /*final_output_json_schema*/ None,
+            collaboration_mode,
+            /*personality*/ None,
+        );
+        let history_op = Some(AppCommand::from(Op::AddToHistory { text: text.clone() }));
+
+        Some((op, history_op, text))
+    }
+
     fn prepare_external_literal_user_message_with_queueing(
         &mut self,
         text: String,

@@ -1,4 +1,5 @@
 use super::*;
+use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -66,6 +67,65 @@ async fn targeted_external_literal_message_does_not_queue_before_session_configu
         other => panic!("expected Op::UserTurn, got {other:?}"),
     }
     assert!(chat.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn targeted_external_literal_message_uses_target_thread_context() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("active-model")).await;
+
+    let target_thread_id = ThreadId::new();
+    let target_cwd = test_path_buf("/workspace/target").abs();
+    let target_sandbox = SandboxPolicy::new_workspace_write_policy();
+    let target_permission_profile =
+        PermissionProfile::from_legacy_sandbox_policy(&target_sandbox, target_cwd.as_path());
+    let target_session = ThreadSessionState {
+        thread_id: target_thread_id,
+        forked_from_id: None,
+        fork_parent_title: None,
+        thread_name: Some("target".to_string()),
+        model: "target-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::OnRequest,
+        approvals_reviewer: ApprovalsReviewer::User,
+        sandbox_policy: target_sandbox.clone(),
+        permission_profile: Some(target_permission_profile.clone()),
+        cwd: target_cwd.clone(),
+        instruction_source_paths: Vec::new(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        history_log_id: 0,
+        history_entry_count: 0,
+        network_proxy: None,
+        rollout_path: None,
+    };
+
+    let prepared = chat
+        .prepare_targeted_external_literal_user_message_for_thread(
+            "targeted to inactive thread".to_string(),
+            &target_session,
+            /*input_state*/ None,
+        )
+        .expect("targeted external message should prepare with target context");
+
+    match prepared.0.into_core() {
+        Op::UserTurn {
+            cwd,
+            approval_policy,
+            sandbox_policy,
+            permission_profile,
+            model,
+            effort,
+            ..
+        } => {
+            assert_eq!(cwd, target_cwd.to_path_buf());
+            assert_eq!(approval_policy, AskForApproval::OnRequest);
+            assert_eq!(sandbox_policy, target_sandbox);
+            assert_eq!(permission_profile, Some(target_permission_profile));
+            assert_eq!(model, "target-model");
+            assert_eq!(effort, Some(ReasoningEffortConfig::High));
+        }
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
 }
 
 #[tokio::test]

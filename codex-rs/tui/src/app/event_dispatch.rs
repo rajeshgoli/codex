@@ -1494,11 +1494,38 @@ impl App {
                     self.chat_widget.submit_external_literal_user_message(text);
                     return Ok(AppRunControl::Continue);
                 }
-                if let Some((op, history_op, submitted_text)) = self
-                    .chat_widget
-                    .prepare_targeted_external_literal_user_message(text)
-                {
-                    if let Some(thread_id) = target_thread_id {
+                if let Some(thread_id) = target_thread_id {
+                    let prepared = if Some(thread_id) == self.active_thread_id {
+                        self.chat_widget
+                            .prepare_targeted_external_literal_user_message(text)
+                    } else {
+                        let target_state =
+                            if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+                                let store = channel.store.lock().await;
+                                store
+                                    .session
+                                    .clone()
+                                    .map(|session| (session, store.input_state.clone()))
+                            } else {
+                                None
+                            };
+                        match target_state {
+                            Some((session, input_state)) => self
+                                .chat_widget
+                                .prepare_targeted_external_literal_user_message_for_thread(
+                                    text,
+                                    &session,
+                                    input_state.as_ref(),
+                                ),
+                            None => {
+                                self.chat_widget.add_error_message(format!(
+                                    "Target thread {thread_id} is not available for external input."
+                                ));
+                                None
+                            }
+                        }
+                    };
+                    if let Some((op, history_op, submitted_text)) = prepared {
                         let render_in_active_history = Some(thread_id) == self.active_thread_id;
                         self.submit_thread_op(app_server, thread_id, op).await?;
                         if let Some(history_op) = history_op {
