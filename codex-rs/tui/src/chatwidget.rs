@@ -7563,10 +7563,7 @@ impl ChatWidget {
                     break;
                 }
                 QueuedInputAction::LiteralUserTurn => {
-                    self.submit_user_message_with_shell_escape_policy(
-                        queued_message.into_user_message(),
-                        ShellEscapePolicy::Disallow,
-                    );
+                    self.submit_queued_external_literal_user_message(queued_message);
                     break;
                 }
                 QueuedInputAction::ParseSlash => {
@@ -10908,6 +10905,25 @@ impl ChatWidget {
             self.submit_op(history_op);
         }
 
+        self.render_external_literal_user_message(submitted_text);
+    }
+
+    fn submit_queued_external_literal_user_message(&mut self, queued_message: QueuedUserMessage) {
+        let text = queued_message.into_user_message().text;
+        let Some((op, history_op, submitted_text)) = self
+            .prepare_external_literal_user_message_with_queueing(
+                text, /*queue_if_unconfigured*/ true,
+            )
+        else {
+            return;
+        };
+
+        if !self.submit_op(op) {
+            return;
+        }
+        if let Some(history_op) = history_op {
+            self.submit_op(history_op);
+        }
         self.render_external_literal_user_message(submitted_text);
     }
 

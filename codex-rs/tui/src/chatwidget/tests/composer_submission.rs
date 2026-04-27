@@ -153,6 +153,73 @@ async fn external_literal_messages_queued_before_config_preserve_fifo_order() {
 }
 
 #[tokio::test]
+async fn external_literal_message_queued_before_config_skips_mention_extraction() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.submit_external_literal_user_message("please use $figma literally".to_string());
+    assert_eq!(chat.queued_user_messages.len(), 1);
+
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let configured = codex_protocol::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        permission_profile: None,
+        cwd: test_path_buf("/home/user/project").abs(),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        network_proxy: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+    drain_insert_history(&mut rx);
+
+    let skill_path = test_path_buf("/tmp/repo/figma/SKILL.md").abs();
+    chat.set_skills(Some(vec![SkillMetadata {
+        name: "figma".to_string(),
+        description: "Repo skill".to_string(),
+        short_description: None,
+        interface: None,
+        dependencies: None,
+        policy: None,
+        path_to_skills_md: skill_path,
+        scope: SkillScope::Repo,
+    }]));
+
+    chat.maybe_send_next_queued_input();
+
+    loop {
+        match op_rx.try_recv() {
+            Ok(Op::UserTurn { items, .. }) => {
+                assert_eq!(
+                    items,
+                    vec![UserInput::Text {
+                        text: "please use $figma literally".to_string(),
+                        text_elements: Vec::new(),
+                    }]
+                );
+                break;
+            }
+            Ok(_) => continue,
+            Err(TryRecvError::Empty) => panic!("expected queued external literal op"),
+            Err(TryRecvError::Disconnected) => panic!("op channel closed"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn targeted_external_literal_message_uses_target_thread_context() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("active-model")).await;
 
