@@ -5,7 +5,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::request_user_input::RequestUserInputResponse;
-use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -335,30 +334,12 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                 )
             } else {
                 match parse_thread_id(thread_id) {
-                    Ok(Some(thread_id)) => {
-                        let op = Op::UserInput {
-                            items: vec![UserInput::Text {
-                                text: message,
-                                text_elements: Vec::new(),
-                            }],
-                            environments: None,
-                            final_output_json_schema: None,
-                            responsesapi_client_metadata: None,
-                        };
-                        match dispatch_op(state, Some(thread_id), op) {
-                            Ok(()) => response_ok(
-                                &request_id,
-                                &state.epoch,
-                                json!({"status": "accepted", "operation": "submit_message"}),
-                            ),
-                            Err(err) => {
-                                response_err(&request_id, &state.epoch, "event_channel_closed", err)
-                            }
-                        }
-                    }
-                    Ok(None) => match dispatch_app_event(
+                    Ok(target_thread_id) => match dispatch_app_event(
                         state,
-                        AppEvent::SubmitExternalLiteralUserMessage { text: message },
+                        AppEvent::SubmitExternalLiteralUserMessage {
+                            text: message,
+                            target_thread_id,
+                        },
                     ) {
                         Ok(()) => response_ok(
                             &request_id,
@@ -769,12 +750,45 @@ mod tests {
         assert_eq!(first.epoch, second.epoch);
 
         match rx.try_recv() {
-            Ok(AppEvent::SubmitExternalLiteralUserMessage { text }) => {
-                assert_eq!(text, "hello")
+            Ok(AppEvent::SubmitExternalLiteralUserMessage {
+                text,
+                target_thread_id,
+            }) => {
+                assert_eq!(text, "hello");
+                assert_eq!(target_thread_id, None);
             }
             other => panic!("expected one external user message event, got {other:?}"),
         }
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn submit_message_with_thread_id_uses_external_message_event() {
+        let (state, mut rx) = test_state();
+        let thread_id = ThreadId::new();
+        let response = process_request(
+            &state,
+            ControlRequest {
+                request_id: "req-thread-message".to_string(),
+                expected_epoch: None,
+                command: ControlCommand::SubmitMessage {
+                    message: "hello thread".to_string(),
+                    thread_id: Some(thread_id.to_string()),
+                },
+            },
+        );
+
+        assert!(response.ok);
+        match rx.try_recv() {
+            Ok(AppEvent::SubmitExternalLiteralUserMessage {
+                text,
+                target_thread_id,
+            }) => {
+                assert_eq!(text, "hello thread");
+                assert_eq!(target_thread_id, Some(thread_id));
+            }
+            other => panic!("expected external user message event, got {other:?}"),
+        }
     }
 
     #[test]

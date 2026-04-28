@@ -1,5 +1,515 @@
 use super::*;
+use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
+
+#[tokio::test]
+async fn external_literal_message_submits_user_turn() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let configured = codex_protocol::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        permission_profile: None,
+        cwd: test_path_buf("/home/user/project").abs(),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        network_proxy: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+    drain_insert_history(&mut rx);
+
+    chat.submit_external_literal_user_message("!literal from sm send".to_string());
+
+    assert!(chat.is_user_turn_pending_or_running());
+    let items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    };
+    assert_eq!(
+        items,
+        vec![UserInput::Text {
+            text: "!literal from sm send".to_string(),
+            text_elements: Vec::new(),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn external_literal_message_queues_while_turn_pending() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let configured = codex_protocol::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        permission_profile: None,
+        cwd: test_path_buf("/home/user/project").abs(),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        network_proxy: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+    drain_insert_history(&mut rx);
+
+    chat.submit_external_literal_user_message("first".to_string());
+    chat.submit_external_literal_user_message("second".to_string());
+
+    let first_items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    };
+    assert_eq!(
+        first_items,
+        vec![UserInput::Text {
+            text: "first".to_string(),
+            text_elements: Vec::new(),
+        }]
+    );
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(chat.queued_user_messages[0].text, "second");
+    assert_eq!(
+        chat.queued_user_messages[0].action,
+        QueuedInputAction::LiteralUserTurn
+    );
+}
+
+#[tokio::test]
+async fn targeted_external_literal_message_does_not_queue_before_session_configured() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    let prepared = chat
+        .prepare_targeted_external_literal_user_message("targeted before configured".to_string())
+        .expect("targeted external message should prepare immediately");
+
+    match prepared.0.into_core() {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "targeted before configured".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(chat.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn external_literal_message_queued_before_config_preserves_bang_literal() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.submit_external_literal_user_message("!literal before configured".to_string());
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(
+        chat.queued_user_messages[0].action,
+        QueuedInputAction::LiteralUserTurn
+    );
+
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let configured = codex_protocol::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        permission_profile: None,
+        cwd: test_path_buf("/home/user/project").abs(),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        network_proxy: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+    drain_insert_history(&mut rx);
+
+    chat.maybe_send_next_queued_input();
+
+    assert!(chat.is_user_turn_pending_or_running());
+    loop {
+        match op_rx.try_recv() {
+            Ok(Op::UserTurn { items, .. }) => {
+                assert_eq!(
+                    items,
+                    vec![UserInput::Text {
+                        text: "!literal before configured".to_string(),
+                        text_elements: Vec::new(),
+                    }]
+                );
+                break;
+            }
+            Ok(Op::RunUserShellCommand { command }) => {
+                panic!("queued external literal became shell command: {command}")
+            }
+            Ok(_) => continue,
+            Err(TryRecvError::Empty) => panic!("expected queued external literal op"),
+            Err(TryRecvError::Disconnected) => panic!("op channel closed"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn external_literal_messages_queued_before_config_preserve_fifo_order() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.submit_external_literal_user_message("first literal".to_string());
+    chat.submit_external_literal_user_message("second literal".to_string());
+
+    assert_eq!(
+        chat.queued_user_messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first literal", "second literal"]
+    );
+    assert!(
+        chat.queued_user_messages
+            .iter()
+            .all(|message| message.action == QueuedInputAction::LiteralUserTurn)
+    );
+}
+
+#[tokio::test]
+async fn external_literal_message_queued_before_config_skips_mention_extraction() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.submit_external_literal_user_message("please use $figma literally".to_string());
+    assert_eq!(chat.queued_user_messages.len(), 1);
+
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let configured = codex_protocol::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        permission_profile: None,
+        cwd: test_path_buf("/home/user/project").abs(),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        network_proxy: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+    drain_insert_history(&mut rx);
+
+    let skill_path = test_path_buf("/tmp/repo/figma/SKILL.md").abs();
+    chat.set_skills(Some(vec![SkillMetadata {
+        name: "figma".to_string(),
+        description: "Repo skill".to_string(),
+        short_description: None,
+        interface: None,
+        dependencies: None,
+        policy: None,
+        path_to_skills_md: skill_path,
+        scope: SkillScope::Repo,
+    }]));
+
+    chat.maybe_send_next_queued_input();
+
+    loop {
+        match op_rx.try_recv() {
+            Ok(Op::UserTurn { items, .. }) => {
+                assert_eq!(
+                    items,
+                    vec![UserInput::Text {
+                        text: "please use $figma literally".to_string(),
+                        text_elements: Vec::new(),
+                    }]
+                );
+                break;
+            }
+            Ok(_) => continue,
+            Err(TryRecvError::Empty) => panic!("expected queued external literal op"),
+            Err(TryRecvError::Disconnected) => panic!("op channel closed"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn targeted_external_literal_message_uses_target_thread_context() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("active-model")).await;
+
+    let target_thread_id = ThreadId::new();
+    let target_cwd = test_path_buf("/workspace/target").abs();
+    let target_sandbox = SandboxPolicy::new_workspace_write_policy();
+    let target_permission_profile =
+        PermissionProfile::from_legacy_sandbox_policy(&target_sandbox, target_cwd.as_path());
+    let target_session = ThreadSessionState {
+        thread_id: target_thread_id,
+        forked_from_id: None,
+        fork_parent_title: None,
+        thread_name: Some("target".to_string()),
+        model: "target-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::OnRequest,
+        approvals_reviewer: ApprovalsReviewer::AutoReview,
+        sandbox_policy: target_sandbox.clone(),
+        permission_profile: Some(target_permission_profile.clone()),
+        cwd: target_cwd.clone(),
+        instruction_source_paths: Vec::new(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        history_log_id: 0,
+        history_entry_count: 0,
+        network_proxy: None,
+        rollout_path: None,
+    };
+
+    let prepared = chat
+        .prepare_targeted_external_literal_user_message_for_thread(
+            "targeted to inactive thread".to_string(),
+            &target_session,
+            /*input_state*/ None,
+        )
+        .expect("targeted external message should prepare with target context");
+
+    match prepared.0.into_core() {
+        Op::UserTurn {
+            cwd,
+            approval_policy,
+            sandbox_policy,
+            permission_profile,
+            model,
+            effort,
+            approvals_reviewer,
+            ..
+        } => {
+            assert_eq!(cwd, target_cwd.to_path_buf());
+            assert_eq!(approval_policy, AskForApproval::OnRequest);
+            assert_eq!(approvals_reviewer, Some(ApprovalsReviewer::AutoReview));
+            assert_eq!(sandbox_policy, target_sandbox);
+            assert_eq!(permission_profile, Some(target_permission_profile));
+            assert_eq!(model, "target-model");
+            assert_eq!(effort, Some(ReasoningEffortConfig::High));
+        }
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn targeted_external_literal_message_preserves_target_collaboration_mask() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("active-model")).await;
+
+    let target_session = ThreadSessionState {
+        thread_id: ThreadId::new(),
+        forked_from_id: None,
+        fork_parent_title: None,
+        thread_name: Some("target".to_string()),
+        model: "target-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::OnRequest,
+        approvals_reviewer: ApprovalsReviewer::AutoReview,
+        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+        permission_profile: None,
+        cwd: test_path_buf("/workspace/target").abs(),
+        instruction_source_paths: Vec::new(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        history_log_id: 0,
+        history_entry_count: 0,
+        network_proxy: None,
+        rollout_path: None,
+    };
+    let mut input_state =
+        ThreadInputState::for_target_session(&target_session, /*agent_turn_running*/ false);
+    input_state.current_collaboration_mode = CollaborationMode {
+        mode: ModeKind::Default,
+        settings: Settings {
+            model: "base-model".to_string(),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            developer_instructions: None,
+        },
+    };
+    input_state.active_collaboration_mask = Some(CollaborationModeMask {
+        name: "custom".to_string(),
+        mode: Some(ModeKind::Plan),
+        model: Some("masked-model".to_string()),
+        reasoning_effort: Some(Some(ReasoningEffort::Minimal)),
+        developer_instructions: None,
+    });
+
+    let prepared = chat
+        .prepare_targeted_external_literal_user_message_for_thread(
+            "targeted to inactive thread".to_string(),
+            &target_session,
+            Some(&input_state),
+        )
+        .expect("targeted external message should prepare with target mask");
+
+    match prepared.0.into_core() {
+        Op::UserTurn { model, effort, .. } => {
+            assert_eq!(model, "masked-model");
+            assert_eq!(effort, Some(ReasoningEffortConfig::Minimal));
+        }
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn external_literal_rejected_steers_preserve_fifo_order() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("active-model")).await;
+
+    chat.record_pending_external_literal_steer("first literal".to_string());
+    chat.record_pending_external_literal_steer("second literal".to_string());
+
+    assert!(chat.enqueue_rejected_steer());
+    assert!(chat.enqueue_rejected_steer());
+    assert_eq!(
+        chat.queued_user_messages
+            .iter()
+            .map(|message| (message.text.as_str(), message.action))
+            .collect::<Vec<_>>(),
+        vec![
+            ("first literal", QueuedInputAction::LiteralUserTurn),
+            ("second literal", QueuedInputAction::LiteralUserTurn),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn targeted_external_literal_input_state_records_rejected_steer() {
+    let target_thread_id = ThreadId::new();
+    let target_cwd = test_path_buf("/workspace/target").abs();
+    let target_session = ThreadSessionState {
+        thread_id: target_thread_id,
+        forked_from_id: None,
+        fork_parent_title: None,
+        thread_name: Some("target".to_string()),
+        model: "target-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::OnRequest,
+        approvals_reviewer: ApprovalsReviewer::AutoReview,
+        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+        permission_profile: Some(PermissionProfile::from_legacy_sandbox_policy(
+            &SandboxPolicy::new_workspace_write_policy(),
+            target_cwd.as_path(),
+        )),
+        cwd: target_cwd,
+        instruction_source_paths: Vec::new(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        history_log_id: 0,
+        history_entry_count: 0,
+        network_proxy: None,
+        rollout_path: None,
+    };
+    let mut input_state =
+        ThreadInputState::for_target_session(&target_session, /*agent_turn_running*/ true);
+
+    input_state.record_pending_external_literal_steer("!literal target steer 1".to_string());
+    input_state.record_pending_external_literal_steer("!literal target steer 2".to_string());
+
+    assert!(input_state.enqueue_rejected_steer());
+    assert!(input_state.enqueue_rejected_steer());
+    assert_eq!(
+        input_state
+            .queued_user_messages
+            .iter()
+            .map(|message| (message.text.as_str(), message.action))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "!literal target steer 1",
+                QueuedInputAction::LiteralUserTurn
+            ),
+            (
+                "!literal target steer 2",
+                QueuedInputAction::LiteralUserTurn
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn targeted_external_literal_input_state_tracks_background_turn_lifecycle() {
+    let target_thread_id = ThreadId::new();
+    let target_session = ThreadSessionState {
+        thread_id: target_thread_id,
+        forked_from_id: None,
+        fork_parent_title: None,
+        thread_name: Some("target".to_string()),
+        model: "target-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::OnRequest,
+        approvals_reviewer: ApprovalsReviewer::AutoReview,
+        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+        permission_profile: None,
+        cwd: test_path_buf("/workspace/target").abs(),
+        instruction_source_paths: Vec::new(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        history_log_id: 0,
+        history_entry_count: 0,
+        network_proxy: None,
+        rollout_path: None,
+    };
+    let mut input_state =
+        ThreadInputState::for_target_session(&target_session, /*agent_turn_running*/ false);
+
+    assert!(!input_state.is_user_turn_pending_or_running());
+    assert!(!input_state.is_user_turn_pending_start());
+
+    input_state.mark_user_turn_pending_start();
+    assert!(input_state.is_user_turn_pending_or_running());
+    assert!(input_state.is_user_turn_pending_start());
+
+    input_state.mark_user_turn_started();
+    assert!(input_state.is_user_turn_pending_or_running());
+    assert!(!input_state.is_user_turn_pending_start());
+
+    input_state.mark_user_turn_completed();
+    assert!(!input_state.is_user_turn_pending_or_running());
+    assert!(!input_state.is_user_turn_pending_start());
+}
 
 #[tokio::test]
 async fn submission_preserves_text_elements_and_local_images() {

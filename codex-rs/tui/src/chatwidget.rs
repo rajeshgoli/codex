@@ -369,6 +369,7 @@ use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
 mod interrupts;
 use self::interrupts::InterruptManager;
+mod external_literal;
 mod session_header;
 use self::session_header::SessionHeader;
 mod skills;
@@ -1157,7 +1158,7 @@ impl ThreadComposerState {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ThreadInputState {
     composer: Option<ThreadComposerState>,
-    pending_steers: VecDeque<UserMessage>,
+    pending_steers: VecDeque<PendingSteer>,
     rejected_steers_queue: VecDeque<UserMessage>,
     queued_user_messages: VecDeque<QueuedUserMessage>,
     user_turn_pending_start: bool,
@@ -1165,6 +1166,32 @@ pub(crate) struct ThreadInputState {
     active_collaboration_mask: Option<CollaborationModeMask>,
     task_running: bool,
     agent_turn_running: bool,
+}
+
+impl ThreadInputState {
+    pub(crate) fn for_target_session(
+        session: &ThreadSessionState,
+        agent_turn_running: bool,
+    ) -> Self {
+        Self {
+            composer: None,
+            pending_steers: VecDeque::new(),
+            rejected_steers_queue: VecDeque::new(),
+            queued_user_messages: VecDeque::new(),
+            user_turn_pending_start: false,
+            current_collaboration_mode: CollaborationMode {
+                mode: ModeKind::Default,
+                settings: Settings {
+                    model: session.model.clone(),
+                    reasoning_effort: session.reasoning_effort,
+                    developer_instructions: None,
+                },
+            },
+            active_collaboration_mask: None,
+            task_running: agent_turn_running,
+            agent_turn_running,
+        }
+    }
 }
 
 impl From<String> for UserMessage {
@@ -1193,9 +1220,28 @@ impl From<&str> for UserMessage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
 struct PendingSteer {
     user_message: UserMessage,
     compare_key: PendingSteerCompareKey,
+    rejection_action: QueuedInputAction,
+}
+
+impl PendingSteer {
+    fn new(user_message: UserMessage, rejection_action: QueuedInputAction) -> Self {
+        Self {
+            compare_key: Self::compare_key_for_message(&user_message),
+            user_message,
+            rejection_action,
+        }
+    }
+
+    fn compare_key_for_message(user_message: &UserMessage) -> PendingSteerCompareKey {
+        PendingSteerCompareKey {
+            message: user_message.text.clone(),
+            image_count: user_message.local_images.len() + user_message.remote_image_urls.len(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2740,8 +2786,23 @@ impl ChatWidget {
             );
             return false;
         };
-        self.rejected_steers_queue
-            .push_back(pending_steer.user_message);
+        match pending_steer.rejection_action {
+            QueuedInputAction::Plain => self
+                .rejected_steers_queue
+                .push_back(pending_steer.user_message),
+            QueuedInputAction::LiteralUserTurn => {
+                self.queued_user_messages.push_back(QueuedUserMessage::new(
+                    pending_steer.user_message,
+                    QueuedInputAction::LiteralUserTurn,
+                ))
+            }
+            QueuedInputAction::ParseSlash | QueuedInputAction::RunShell => {
+                self.queued_user_messages.push_front(QueuedUserMessage::new(
+                    pending_steer.user_message,
+                    pending_steer.rejection_action,
+                ));
+            }
+        }
         self.refresh_pending_input_preview();
         true
     }
@@ -3539,11 +3600,7 @@ impl ChatWidget {
         };
         Some(ThreadInputState {
             composer: composer.has_content().then_some(composer),
-            pending_steers: self
-                .pending_steers
-                .iter()
-                .map(|pending| pending.user_message.clone())
-                .collect(),
+            pending_steers: self.pending_steers.iter().cloned().collect(),
             rejected_steers_queue: self.rejected_steers_queue.clone(),
             queued_user_messages: self.queued_user_messages.clone(),
             user_turn_pending_start: self.user_turn_pending_start,
@@ -3588,18 +3645,7 @@ impl ChatWidget {
                 );
                 self.bottom_pane.set_composer_pending_pastes(Vec::new());
             }
-            self.pending_steers = input_state
-                .pending_steers
-                .into_iter()
-                .map(|user_message| PendingSteer {
-                    compare_key: PendingSteerCompareKey {
-                        message: user_message.text.clone(),
-                        image_count: user_message.local_images.len()
-                            + user_message.remote_image_urls.len(),
-                    },
-                    user_message,
-                })
-                .collect();
+            self.pending_steers = input_state.pending_steers.into_iter().collect();
             self.rejected_steers_queue = input_state.rejected_steers_queue;
             self.queued_user_messages = input_state.queued_user_messages;
         } else {
@@ -5998,6 +6044,7 @@ impl ChatWidget {
                 mention_bindings: mention_bindings.clone(),
             },
             compare_key: Self::pending_steer_compare_key_from_items(&items),
+            rejection_action: QueuedInputAction::Plain,
         });
         let personality = self
             .config
@@ -7562,6 +7609,10 @@ impl ChatWidget {
                     self.submit_user_message(queued_message.into_user_message());
                     break;
                 }
+                QueuedInputAction::LiteralUserTurn => {
+                    self.submit_queued_external_literal_user_message(queued_message);
+                    break;
+                }
                 QueuedInputAction::ParseSlash => {
                     let drain = self.submit_queued_slash_prompt(queued_message.into_user_message());
                     if drain == QueueDrain::Stop {
@@ -7582,6 +7633,10 @@ impl ChatWidget {
 
     pub(super) fn is_user_turn_pending_or_running(&self) -> bool {
         self.user_turn_pending_start || self.bottom_pane.is_task_running()
+    }
+
+    pub(crate) fn mark_user_turn_pending_start(&mut self) {
+        self.user_turn_pending_start = true;
     }
 
     fn only_user_shell_commands_running(&self) -> bool {
@@ -10885,39 +10940,6 @@ impl ChatWidget {
         } else {
             self.submit_user_message(user_message);
         }
-    }
-
-    pub(crate) fn submit_external_literal_user_message(&mut self, text: String) {
-        if text.is_empty() {
-            return;
-        }
-
-        let submitted = self.submit_op(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: text.clone(),
-                text_elements: Vec::new(),
-            }],
-            environments: None,
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        });
-        if !submitted {
-            return;
-        }
-
-        self.last_rendered_user_message_event = Some(Self::rendered_user_message_event_from_parts(
-            text.clone(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ));
-        self.add_to_history(history_cell::new_user_prompt(
-            text,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ));
-        self.needs_final_message_separator = false;
     }
 
     /// True when the UI is in the regular composer state with no running task,

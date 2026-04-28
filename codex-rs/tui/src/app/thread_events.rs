@@ -94,6 +94,13 @@ impl ThreadEventStore {
             .rev()
             .find(|turn| matches!(turn.status, TurnStatus::InProgress))
             .map(|turn| turn.id.clone());
+        if let Some(input_state) = self.input_state.as_mut() {
+            if self.active_turn_id.is_some() {
+                input_state.mark_user_turn_started();
+            } else {
+                input_state.mark_user_turn_completed();
+            }
+        }
         self.turns = turns;
     }
 
@@ -103,14 +110,23 @@ impl ThreadEventStore {
         match &notification {
             ServerNotification::TurnStarted(turn) => {
                 self.active_turn_id = Some(turn.turn.id.clone());
+                if let Some(input_state) = self.input_state.as_mut() {
+                    input_state.mark_user_turn_started();
+                }
             }
             ServerNotification::TurnCompleted(turn) => {
                 if self.active_turn_id.as_deref() == Some(turn.turn.id.as_str()) {
                     self.active_turn_id = None;
+                    if let Some(input_state) = self.input_state.as_mut() {
+                        input_state.mark_user_turn_completed();
+                    }
                 }
             }
             ServerNotification::ThreadClosed(_) => {
                 self.active_turn_id = None;
+                if let Some(input_state) = self.input_state.as_mut() {
+                    input_state.mark_user_turn_completed();
+                }
             }
             _ => {}
         }
