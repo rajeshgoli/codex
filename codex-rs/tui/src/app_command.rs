@@ -252,6 +252,16 @@ impl AppCommand {
         }
     }
 
+    pub(crate) fn with_approvals_reviewer(mut self, reviewer: ApprovalsReviewer) -> Self {
+        if let Op::UserTurn {
+            approvals_reviewer, ..
+        } = &mut self.0
+        {
+            *approvals_reviewer = Some(reviewer);
+        }
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn override_turn_context(
         cwd: Option<PathBuf>,

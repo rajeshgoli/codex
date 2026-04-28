@@ -586,6 +586,7 @@ pub(super) fn pending_steer(text: &str) -> PendingSteer {
             message: text.to_string(),
             image_count: 0,
         },
+        rejection_action: QueuedInputAction::Plain,
     }
 }
 

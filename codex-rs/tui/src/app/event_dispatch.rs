@@ -1619,8 +1619,109 @@ impl App {
                 self.chat_widget
                     .submit_user_message_with_mode(text, collaboration_mode);
             }
-            AppEvent::SubmitExternalLiteralUserMessage { text } => {
-                self.chat_widget.submit_external_literal_user_message(text);
+            AppEvent::SubmitExternalLiteralUserMessage {
+                text,
+                target_thread_id,
+            } => {
+                let Some(thread_id) = target_thread_id.or(self.active_thread_id) else {
+                    self.chat_widget.submit_external_literal_user_message(text);
+                    return Ok(AppRunControl::Continue);
+                };
+                let prepared = if Some(thread_id) == self.active_thread_id {
+                    if self.chat_widget.is_user_turn_pending_start() {
+                        self.chat_widget.queue_external_literal_user_message(text);
+                        None
+                    } else {
+                        self.chat_widget
+                            .prepare_targeted_external_literal_user_message(text)
+                    }
+                } else {
+                    let target_state = match self.thread_event_channels.get(&thread_id) {
+                        Some(channel) => {
+                            let mut store = channel.store.lock().await;
+                            match store.session.clone() {
+                                Some(session) => {
+                                    let agent_turn_running = store.active_turn_id().is_some();
+                                    let input_state = store.input_state.get_or_insert_with(|| {
+                                        ThreadInputState::for_target_session(
+                                            &session,
+                                            agent_turn_running,
+                                        )
+                                    });
+                                    if !agent_turn_running
+                                        && input_state.is_user_turn_pending_or_running()
+                                    {
+                                        let reason = if input_state.is_user_turn_pending_start() {
+                                            "is still starting a turn"
+                                        } else {
+                                            "has no active turn state"
+                                        };
+                                        self.chat_widget.add_error_message(format!(
+                                            "Target thread {thread_id} {reason}; retry after it starts."
+                                        ));
+                                        None
+                                    } else {
+                                        Some((session, input_state.clone(), text))
+                                    }
+                                }
+                                None => {
+                                    self.chat_widget.add_error_message(format!(
+                                        "Target thread {thread_id} is not ready for external input."
+                                    ));
+                                    None
+                                }
+                            }
+                        }
+                        None => {
+                            self.chat_widget.add_error_message(format!(
+                                "Target thread {thread_id} is not available for external input."
+                            ));
+                            None
+                        }
+                    };
+                    match target_state {
+                        Some((session, input_state, text)) => self
+                            .chat_widget
+                            .prepare_targeted_external_literal_user_message_for_thread(
+                                text,
+                                &session,
+                                Some(&input_state),
+                            ),
+                        None => None,
+                    }
+                };
+                if let Some((op, history_op, submitted_text)) = prepared {
+                    let render_in_active_history = Some(thread_id) == self.active_thread_id;
+                    self.record_pending_external_literal_steer_for_thread(
+                        thread_id,
+                        submitted_text.clone(),
+                    )
+                    .await;
+                    let result = self.submit_thread_op(app_server, thread_id, op).await?;
+                    if !result.is_steered() {
+                        self.cancel_pending_external_literal_steer_for_thread(
+                            thread_id,
+                            &submitted_text,
+                        )
+                        .await;
+                    }
+                    if !result.is_accepted() {
+                        return Ok(AppRunControl::Continue);
+                    }
+                    if !result.is_steered() {
+                        self.mark_user_turn_pending_start_for_thread(thread_id)
+                            .await;
+                    }
+                    if let Some(history_op) = history_op {
+                        let _ = self
+                            .submit_thread_op(app_server, thread_id, history_op)
+                            .await?;
+                    }
+                    if render_in_active_history && !result.is_steered() {
+                        self.chat_widget
+                            .render_external_literal_user_message(submitted_text);
+                    }
+                }
             }
             AppEvent::ManageSkillsClosed => {
                 self.chat_widget.handle_manage_skills_closed();

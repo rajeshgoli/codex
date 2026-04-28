@@ -715,6 +715,7 @@ pub(crate) enum AppEvent {
     /// text) while still rendering the injected input in the transcript.
     SubmitExternalLiteralUserMessage {
         text: String,
+        target_thread_id: Option<ThreadId>,
     },
 
     /// Open the approval popup.
