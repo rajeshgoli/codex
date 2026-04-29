@@ -204,6 +204,10 @@ enum ControlCommand {
         message: String,
         thread_id: Option<String>,
     },
+    SetThreadName {
+        name: String,
+        thread_id: Option<String>,
+    },
     SubmitApproval {
         id: String,
         decision: String,
@@ -352,6 +356,32 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                     },
                     Err(err) => response_err(&request_id, &state.epoch, "invalid_request", err),
                 }
+            }
+        }
+        ControlCommand::SetThreadName { name, thread_id } => {
+            if let Some(name) = crate::legacy_core::util::normalize_thread_name(&name) {
+                match parse_thread_id(thread_id) {
+                    Ok(thread_id) => {
+                        match dispatch_op(state, thread_id, Op::SetThreadName { name }) {
+                            Ok(()) => response_ok(
+                                &request_id,
+                                &state.epoch,
+                                json!({"status": "accepted", "operation": "set_thread_name"}),
+                            ),
+                            Err(err) => {
+                                response_err(&request_id, &state.epoch, "event_channel_closed", err)
+                            }
+                        }
+                    }
+                    Err(err) => response_err(&request_id, &state.epoch, "invalid_request", err),
+                }
+            } else {
+                response_err(
+                    &request_id,
+                    &state.epoch,
+                    "invalid_request",
+                    "thread name must not be empty",
+                )
             }
         }
         ControlCommand::SubmitApproval {
@@ -789,6 +819,82 @@ mod tests {
             }
             other => panic!("expected external user message event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_thread_name_dispatches_thread_name_op() {
+        let (state, mut rx) = test_state();
+        let response = process_request(
+            &state,
+            ControlRequest {
+                request_id: "req-set-name".to_string(),
+                expected_epoch: None,
+                command: ControlCommand::SetThreadName {
+                    name: "worker-one".to_string(),
+                    thread_id: None,
+                },
+            },
+        );
+
+        assert!(response.ok);
+        match rx.try_recv() {
+            Ok(AppEvent::CodexOp(Op::SetThreadName { name })) => {
+                assert_eq!(name, "worker-one");
+            }
+            other => panic!("expected set thread name op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_thread_name_with_thread_id_dispatches_thread_op() {
+        let (state, mut rx) = test_state();
+        let thread_id = ThreadId::new();
+        let response = process_request(
+            &state,
+            ControlRequest {
+                request_id: "req-thread-set-name".to_string(),
+                expected_epoch: None,
+                command: ControlCommand::SetThreadName {
+                    name: "worker-two".to_string(),
+                    thread_id: Some(thread_id.to_string()),
+                },
+            },
+        );
+
+        assert!(response.ok);
+        match rx.try_recv() {
+            Ok(AppEvent::SubmitThreadOp {
+                thread_id: actual_thread_id,
+                op: Op::SetThreadName { name },
+            }) => {
+                assert_eq!(actual_thread_id, thread_id);
+                assert_eq!(name, "worker-two");
+            }
+            other => panic!("expected thread-scoped set thread name op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_thread_name_rejects_empty_name() {
+        let (state, mut rx) = test_state();
+        let response = process_request(
+            &state,
+            ControlRequest {
+                request_id: "req-empty-name".to_string(),
+                expected_epoch: None,
+                command: ControlCommand::SetThreadName {
+                    name: "   ".to_string(),
+                    thread_id: None,
+                },
+            },
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().map(|e| e.code.as_str()),
+            Some("invalid_request")
+        );
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]
