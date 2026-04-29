@@ -31,6 +31,7 @@ All requests include:
 - `command` (string, required): one of:
   - `get_epoch`
   - `submit_message`
+  - `set_thread_name`
   - `submit_approval`
   - `submit_user_input`
   - `shutdown`
@@ -40,6 +41,10 @@ All requests include:
 - `submit_message`
   - `message` (string, required)
   - `thread_id` (UUID string, optional)
+- `set_thread_name`
+  - `name` (string, required)
+  - `thread_id` (UUID string, optional)
+  - Renames the current thread when `thread_id` is omitted.
 - `submit_approval`
   - `id` (string, required)
   - `decision` (string, required): `approved | approved_for_session | denied | abort`
