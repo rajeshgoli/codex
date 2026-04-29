@@ -359,26 +359,29 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
             }
         }
         ControlCommand::SetThreadName { name, thread_id } => {
-            let Some(name) = crate::legacy_core::util::normalize_thread_name(&name) else {
-                return response_err(
+            if let Some(name) = crate::legacy_core::util::normalize_thread_name(&name) {
+                match parse_thread_id(thread_id) {
+                    Ok(thread_id) => {
+                        match dispatch_op(state, thread_id, Op::SetThreadName { name }) {
+                            Ok(()) => response_ok(
+                                &request_id,
+                                &state.epoch,
+                                json!({"status": "accepted", "operation": "set_thread_name"}),
+                            ),
+                            Err(err) => {
+                                response_err(&request_id, &state.epoch, "event_channel_closed", err)
+                            }
+                        }
+                    }
+                    Err(err) => response_err(&request_id, &state.epoch, "invalid_request", err),
+                }
+            } else {
+                response_err(
                     &request_id,
                     &state.epoch,
                     "invalid_request",
                     "thread name must not be empty",
-                );
-            };
-            match parse_thread_id(thread_id) {
-                Ok(thread_id) => match dispatch_op(state, thread_id, Op::SetThreadName { name }) {
-                    Ok(()) => response_ok(
-                        &request_id,
-                        &state.epoch,
-                        json!({"status": "accepted", "operation": "set_thread_name"}),
-                    ),
-                    Err(err) => {
-                        response_err(&request_id, &state.epoch, "event_channel_closed", err)
-                    }
-                },
-                Err(err) => response_err(&request_id, &state.epoch, "invalid_request", err),
+                )
             }
         }
         ControlCommand::SubmitApproval {
