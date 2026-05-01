@@ -132,20 +132,11 @@ impl ChatWidget {
         } else {
             None
         };
-        let permission_profile = if matches!(
-            session.sandbox_policy,
-            SandboxPolicy::ExternalSandbox { .. }
-        ) {
-            None
-        } else {
-            session.permission_profile.clone()
-        };
         let op = AppCommand::user_turn(
             items,
             session.cwd.to_path_buf(),
             session.approval_policy,
-            session.sandbox_policy.clone(),
-            permission_profile,
+            session.permission_profile.clone(),
             effective_mode.model().to_string(),
             effective_mode.reasoning_effort(),
             /*summary*/ None,
@@ -163,6 +154,7 @@ impl ChatWidget {
     pub(crate) fn record_pending_external_literal_steer(&mut self, text: String) {
         self.pending_steers.push_back(PendingSteer {
             user_message: UserMessage::from(text.clone()),
+            history_record: UserMessageHistoryRecord::UserMessageText,
             compare_key: PendingSteerCompareKey {
                 message: text,
                 image_count: 0,
@@ -237,19 +229,11 @@ impl ChatWidget {
             None if self.config.notices.fast_default_opt_out == Some(true) => Some(None),
             None => None,
         };
-        let permission_profile = if matches!(
-            self.config.permissions.sandbox_policy.get(),
-            SandboxPolicy::ExternalSandbox { .. }
-        ) {
-            None
-        } else {
-            Some(self.config.permissions.permission_profile())
-        };
+        let permission_profile = self.config.permissions.permission_profile();
         let op = AppCommand::user_turn(
             items,
             self.config.cwd.to_path_buf(),
             self.config.permissions.approval_policy.value(),
-            self.config.permissions.sandbox_policy.get().clone(),
             permission_profile,
             effective_mode.model().to_string(),
             effective_mode.reasoning_effort(),
@@ -331,20 +315,27 @@ impl ThreadInputState {
             return false;
         };
         match pending_steer.rejection_action {
-            QueuedInputAction::Plain => self
-                .rejected_steers_queue
-                .push_back(pending_steer.user_message),
+            QueuedInputAction::Plain => {
+                self.rejected_steers_queue
+                    .push_back(pending_steer.user_message);
+                self.rejected_steer_history_records
+                    .push_back(pending_steer.history_record);
+            }
             QueuedInputAction::LiteralUserTurn => {
                 self.queued_user_messages.push_back(QueuedUserMessage::new(
                     pending_steer.user_message,
                     QueuedInputAction::LiteralUserTurn,
                 ));
+                self.queued_user_message_history_records
+                    .push_back(pending_steer.history_record);
             }
             QueuedInputAction::ParseSlash | QueuedInputAction::RunShell => {
                 self.queued_user_messages.push_front(QueuedUserMessage::new(
                     pending_steer.user_message,
                     pending_steer.rejection_action,
                 ));
+                self.queued_user_message_history_records
+                    .push_front(pending_steer.history_record);
             }
         }
         true

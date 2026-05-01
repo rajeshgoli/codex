@@ -17,8 +17,8 @@ async fn external_literal_message_submits_user_turn() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -64,8 +64,8 @@ async fn external_literal_message_queues_while_turn_pending() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -145,8 +145,8 @@ async fn external_literal_message_queued_before_config_preserves_bang_literal() 
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -225,8 +225,8 @@ async fn external_literal_message_queued_before_config_skips_mention_extraction(
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -280,9 +280,7 @@ async fn targeted_external_literal_message_uses_target_thread_context() {
 
     let target_thread_id = ThreadId::new();
     let target_cwd = test_path_buf("/workspace/target").abs();
-    let target_sandbox = SandboxPolicy::new_workspace_write_policy();
-    let target_permission_profile =
-        PermissionProfile::from_legacy_sandbox_policy(&target_sandbox, target_cwd.as_path());
+    let target_permission_profile = PermissionProfile::workspace_write();
     let target_session = ThreadSessionState {
         thread_id: target_thread_id,
         forked_from_id: None,
@@ -293,8 +291,8 @@ async fn targeted_external_literal_message_uses_target_thread_context() {
         service_tier: None,
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::AutoReview,
-        sandbox_policy: target_sandbox.clone(),
-        permission_profile: Some(target_permission_profile.clone()),
+        permission_profile: target_permission_profile.clone(),
+        active_permission_profile: None,
         cwd: target_cwd.clone(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffort::High),
@@ -316,7 +314,6 @@ async fn targeted_external_literal_message_uses_target_thread_context() {
         Op::UserTurn {
             cwd,
             approval_policy,
-            sandbox_policy,
             permission_profile,
             model,
             effort,
@@ -326,7 +323,6 @@ async fn targeted_external_literal_message_uses_target_thread_context() {
             assert_eq!(cwd, target_cwd.to_path_buf());
             assert_eq!(approval_policy, AskForApproval::OnRequest);
             assert_eq!(approvals_reviewer, Some(ApprovalsReviewer::AutoReview));
-            assert_eq!(sandbox_policy, target_sandbox);
             assert_eq!(permission_profile, Some(target_permission_profile));
             assert_eq!(model, "target-model");
             assert_eq!(effort, Some(ReasoningEffortConfig::High));
@@ -349,8 +345,8 @@ async fn targeted_external_literal_message_preserves_target_collaboration_mask()
         service_tier: None,
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::AutoReview,
-        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::workspace_write(),
+        active_permission_profile: None,
         cwd: test_path_buf("/workspace/target").abs(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffort::High),
@@ -429,11 +425,8 @@ async fn targeted_external_literal_input_state_records_rejected_steer() {
         service_tier: None,
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::AutoReview,
-        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
-        permission_profile: Some(PermissionProfile::from_legacy_sandbox_policy(
-            &SandboxPolicy::new_workspace_write_policy(),
-            target_cwd.as_path(),
-        )),
+        permission_profile: PermissionProfile::workspace_write(),
+        active_permission_profile: None,
         cwd: target_cwd,
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffort::High),
@@ -482,8 +475,8 @@ async fn targeted_external_literal_input_state_tracks_background_turn_lifecycle(
         service_tier: None,
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::AutoReview,
-        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::workspace_write(),
+        active_permission_profile: None,
         cwd: test_path_buf("/workspace/target").abs(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffort::High),
@@ -526,8 +519,8 @@ async fn submission_preserves_text_elements_and_local_images() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -631,8 +624,8 @@ async fn submission_includes_configured_permission_profile() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: Some(expected_permission_profile.clone()),
+        permission_profile: expected_permission_profile.clone(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -664,6 +657,54 @@ async fn submission_includes_configured_permission_profile() {
 }
 
 #[tokio::test]
+async fn submission_keeps_profile_when_legacy_projection_is_external() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let expected_permission_profile = PermissionProfile::Managed {
+        network: codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+        file_system: codex_protocol::models::ManagedFileSystemPermissions::Unrestricted,
+    };
+    let configured = codex_protocol::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: expected_permission_profile.clone(),
+        active_permission_profile: None,
+        cwd: test_path_buf("/home/user/project").abs(),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        network_proxy: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+    drain_insert_history(&mut rx);
+
+    chat.bottom_pane
+        .set_composer_text("submit".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let permission_profile = match next_submit_op(&mut op_rx) {
+        Op::UserTurn {
+            permission_profile, ..
+        } => permission_profile,
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    };
+    assert_eq!(permission_profile, Some(expected_permission_profile));
+}
+
+#[tokio::test]
 async fn submission_with_remote_and_local_images_keeps_local_placeholder_numbering() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -678,8 +719,8 @@ async fn submission_with_remote_and_local_images_keeps_local_placeholder_numberi
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -774,8 +815,8 @@ async fn enter_with_only_remote_images_submits_user_turn() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -840,8 +881,8 @@ async fn shift_enter_with_only_remote_images_does_not_submit_user_turn() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -881,8 +922,8 @@ async fn enter_with_only_remote_images_does_not_submit_when_modal_is_active() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -922,8 +963,8 @@ async fn enter_with_only_remote_images_does_not_submit_when_input_disabled() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -966,8 +1007,8 @@ async fn submission_prefers_selected_duplicate_skill_path() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -1383,7 +1424,9 @@ async fn restore_thread_input_state_syncs_sleep_inhibitor_state() {
         composer: None,
         pending_steers: VecDeque::new(),
         rejected_steers_queue: VecDeque::new(),
+        rejected_steer_history_records: VecDeque::new(),
         queued_user_messages: VecDeque::new(),
+        queued_user_message_history_records: VecDeque::new(),
         user_turn_pending_start: false,
         current_collaboration_mode: chat.current_collaboration_mode.clone(),
         active_collaboration_mask: chat.active_collaboration_mask.clone(),
@@ -1405,9 +1448,10 @@ async fn restore_thread_input_state_syncs_sleep_inhibitor_state() {
 #[tokio::test]
 async fn alt_up_edits_most_recent_queued_message() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.queued_message_edit_binding = crate::key_hint::alt(KeyCode::Up);
+    chat.chat_keymap.edit_queued_message = vec![crate::key_hint::alt(KeyCode::Up)];
+    chat.queued_message_edit_hint_binding = Some(crate::key_hint::alt(KeyCode::Up));
     chat.bottom_pane
-        .set_queued_message_edit_binding(crate::key_hint::alt(KeyCode::Up));
+        .set_queued_message_edit_binding(chat.queued_message_edit_hint_binding);
 
     // Simulate a running task so messages would normally be queued.
     chat.bottom_pane.set_task_running(/*running*/ true);
@@ -1433,6 +1477,24 @@ async fn alt_up_edits_most_recent_queued_message() {
         chat.queued_user_messages.front().unwrap().text,
         "first queued"
     );
+}
+
+#[tokio::test]
+async fn unbound_queued_message_edit_does_not_fall_back_to_alt_up() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.chat_keymap.edit_queued_message = Vec::new();
+    chat.queued_message_edit_hint_binding = None;
+    chat.bottom_pane
+        .set_queued_message_edit_binding(chat.queued_message_edit_hint_binding);
+    chat.bottom_pane.set_task_running(/*running*/ true);
+    chat.queued_user_messages
+        .push_back(UserMessage::from("queued".to_string()).into());
+    chat.refresh_pending_input_preview();
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+
+    assert!(chat.bottom_pane.composer_text().is_empty());
+    assert_eq!(chat.queued_user_messages.len(), 1);
 }
 
 #[tokio::test]

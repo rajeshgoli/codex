@@ -213,7 +213,6 @@ fn validate_schema_version(schema_version: u32) -> std::io::Result<()> {
     ))
 }
 
-#[cfg(test)]
 fn normalize_contract_event_type(event_type: &str) -> String {
     match event_type {
         "task_started" => "turn_started".to_string(),
@@ -222,19 +221,11 @@ fn normalize_contract_event_type(event_type: &str) -> String {
         "turn/completed" => "turn_complete".to_string(),
         "turn_completed" => "turn_complete".to_string(),
         "turn_aborted" => "turn_aborted".to_string(),
-        _ => event_type.to_string(),
-    }
-}
-
-#[cfg(not(test))]
-fn normalize_contract_event_type(event_type: &str) -> String {
-    match event_type {
-        "task_started" => "turn_started".to_string(),
-        "task_complete" => "turn_complete".to_string(),
-        "turn/started" => "turn_started".to_string(),
-        "turn/completed" => "turn_complete".to_string(),
-        "turn_completed" => "turn_complete".to_string(),
-        "turn_aborted" => "turn_aborted".to_string(),
+        "item/started" => "item_started".to_string(),
+        "item/completed" => "item_completed".to_string(),
+        "rawResponseItemCompleted" | "raw_response_item_completed" => {
+            "raw_response_item".to_string()
+        }
         _ => event_type.to_string(),
     }
 }
@@ -651,6 +642,18 @@ mod tests {
         assert_eq!(
             normalize_contract_event_type("turn/completed"),
             "turn_complete"
+        );
+        assert_eq!(
+            normalize_contract_event_type("item/started"),
+            "item_started"
+        );
+        assert_eq!(
+            normalize_contract_event_type("item/completed"),
+            "item_completed"
+        );
+        assert_eq!(
+            normalize_contract_event_type("rawResponseItemCompleted"),
+            "raw_response_item"
         );
         assert_eq!(
             normalize_contract_event_type("exec_command_begin"),

@@ -1,3 +1,4 @@
+use crate::app_command::AppCommand;
 use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
 use crate::app_event_sender::AppEventSender;
@@ -493,6 +494,7 @@ fn parse_review_decision(raw: &str) -> Option<ReviewDecision> {
 }
 
 fn dispatch_op(state: &ControlState, thread_id: Option<ThreadId>, op: Op) -> Result<(), String> {
+    let op = AppCommand::from(op);
     match thread_id {
         Some(thread_id) => dispatch_app_event(state, AppEvent::SubmitThreadOp { thread_id, op }),
         None => dispatch_app_event(state, AppEvent::CodexOp(op)),
@@ -838,7 +840,7 @@ mod tests {
 
         assert!(response.ok);
         match rx.try_recv() {
-            Ok(AppEvent::CodexOp(Op::SetThreadName { name })) => {
+            Ok(AppEvent::CodexOp(AppCommand::SetThreadName { name })) => {
                 assert_eq!(name, "worker-one");
             }
             other => panic!("expected set thread name op, got {other:?}"),
@@ -865,7 +867,7 @@ mod tests {
         match rx.try_recv() {
             Ok(AppEvent::SubmitThreadOp {
                 thread_id: actual_thread_id,
-                op: Op::SetThreadName { name },
+                op: AppCommand::SetThreadName { name },
             }) => {
                 assert_eq!(actual_thread_id, thread_id);
                 assert_eq!(name, "worker-two");
