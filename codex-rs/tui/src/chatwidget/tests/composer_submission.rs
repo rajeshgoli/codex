@@ -17,8 +17,8 @@ async fn external_literal_message_submits_user_turn() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -64,8 +64,8 @@ async fn external_literal_message_queues_while_turn_pending() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -145,8 +145,8 @@ async fn external_literal_message_queued_before_config_preserves_bang_literal() 
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -225,8 +225,8 @@ async fn external_literal_message_queued_before_config_skips_mention_extraction(
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -280,9 +280,7 @@ async fn targeted_external_literal_message_uses_target_thread_context() {
 
     let target_thread_id = ThreadId::new();
     let target_cwd = test_path_buf("/workspace/target").abs();
-    let target_sandbox = SandboxPolicy::new_workspace_write_policy();
-    let target_permission_profile =
-        PermissionProfile::from_legacy_sandbox_policy(&target_sandbox, target_cwd.as_path());
+    let target_permission_profile = PermissionProfile::workspace_write();
     let target_session = ThreadSessionState {
         thread_id: target_thread_id,
         forked_from_id: None,
@@ -293,8 +291,8 @@ async fn targeted_external_literal_message_uses_target_thread_context() {
         service_tier: None,
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::AutoReview,
-        sandbox_policy: target_sandbox.clone(),
-        permission_profile: Some(target_permission_profile.clone()),
+        permission_profile: target_permission_profile.clone(),
+        active_permission_profile: None,
         cwd: target_cwd.clone(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffort::High),
@@ -316,7 +314,6 @@ async fn targeted_external_literal_message_uses_target_thread_context() {
         Op::UserTurn {
             cwd,
             approval_policy,
-            sandbox_policy,
             permission_profile,
             model,
             effort,
@@ -326,7 +323,6 @@ async fn targeted_external_literal_message_uses_target_thread_context() {
             assert_eq!(cwd, target_cwd.to_path_buf());
             assert_eq!(approval_policy, AskForApproval::OnRequest);
             assert_eq!(approvals_reviewer, Some(ApprovalsReviewer::AutoReview));
-            assert_eq!(sandbox_policy, target_sandbox);
             assert_eq!(permission_profile, Some(target_permission_profile));
             assert_eq!(model, "target-model");
             assert_eq!(effort, Some(ReasoningEffortConfig::High));
@@ -349,8 +345,8 @@ async fn targeted_external_literal_message_preserves_target_collaboration_mask()
         service_tier: None,
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::AutoReview,
-        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::workspace_write(),
+        active_permission_profile: None,
         cwd: test_path_buf("/workspace/target").abs(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffort::High),
@@ -429,11 +425,8 @@ async fn targeted_external_literal_input_state_records_rejected_steer() {
         service_tier: None,
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::AutoReview,
-        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
-        permission_profile: Some(PermissionProfile::from_legacy_sandbox_policy(
-            &SandboxPolicy::new_workspace_write_policy(),
-            target_cwd.as_path(),
-        )),
+        permission_profile: PermissionProfile::workspace_write(),
+        active_permission_profile: None,
         cwd: target_cwd,
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffort::High),
@@ -482,8 +475,8 @@ async fn targeted_external_literal_input_state_tracks_background_turn_lifecycle(
         service_tier: None,
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::AutoReview,
-        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::workspace_write(),
+        active_permission_profile: None,
         cwd: test_path_buf("/workspace/target").abs(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffort::High),
@@ -1430,7 +1423,6 @@ async fn restore_thread_input_state_syncs_sleep_inhibitor_state() {
     chat.restore_thread_input_state(Some(ThreadInputState {
         composer: None,
         pending_steers: VecDeque::new(),
-        pending_steer_history_records: VecDeque::new(),
         rejected_steers_queue: VecDeque::new(),
         rejected_steer_history_records: VecDeque::new(),
         queued_user_messages: VecDeque::new(),

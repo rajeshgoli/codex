@@ -579,7 +579,12 @@ mod tests {
     use super::validate_schema_version;
 
     fn assert_common_fields(record: &Value) {
-        assert!(record.get("schema_version").and_then(Value::as_u64).is_some());
+        assert!(
+            record
+                .get("schema_version")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
         assert!(record.get("ts").and_then(Value::as_str).is_some());
         assert!(record.get("session_id").and_then(Value::as_str).is_some());
         assert!(record.get("event_type").and_then(Value::as_str).is_some());
@@ -604,7 +609,12 @@ mod tests {
         assert_common_fields(&record);
         assert_eq!(record["schema_version"], Value::from(EVENT_SCHEMA_CURRENT));
         assert!(record.get("seq").and_then(Value::as_u64).is_some());
-        assert!(record.get("session_epoch").and_then(Value::as_u64).is_some());
+        assert!(
+            record
+                .get("session_epoch")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
     }
 
     #[test]
@@ -633,7 +643,10 @@ mod tests {
             normalize_contract_event_type("turn/completed"),
             "turn_complete"
         );
-        assert_eq!(normalize_contract_event_type("item/started"), "item_started");
+        assert_eq!(
+            normalize_contract_event_type("item/started"),
+            "item_started"
+        );
         assert_eq!(
             normalize_contract_event_type("item/completed"),
             "item_completed"

@@ -444,7 +444,6 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
     chat.restore_thread_input_state(Some(ThreadInputState {
         composer: None,
         pending_steers,
-        pending_steer_history_records: VecDeque::new(),
         rejected_steers_queue,
         rejected_steer_history_records: VecDeque::new(),
         queued_user_messages,

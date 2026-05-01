@@ -253,9 +253,9 @@ impl AppCommand {
     }
 
     pub(crate) fn with_approvals_reviewer(mut self, reviewer: ApprovalsReviewer) -> Self {
-        if let Op::UserTurn {
+        if let Self::UserTurn {
             approvals_reviewer, ..
-        } = &mut self.0
+        } = &mut self
         {
             *approvals_reviewer = Some(reviewer);
         }

@@ -132,20 +132,11 @@ impl ChatWidget {
         } else {
             None
         };
-        let permission_profile = if matches!(
-            session.sandbox_policy,
-            SandboxPolicy::ExternalSandbox { .. }
-        ) {
-            None
-        } else {
-            session.permission_profile.clone()
-        };
         let op = AppCommand::user_turn(
             items,
             session.cwd.to_path_buf(),
             session.approval_policy,
-            session.sandbox_policy.clone(),
-            permission_profile,
+            session.permission_profile.clone(),
             effective_mode.model().to_string(),
             effective_mode.reasoning_effort(),
             /*summary*/ None,
@@ -238,19 +229,11 @@ impl ChatWidget {
             None if self.config.notices.fast_default_opt_out == Some(true) => Some(None),
             None => None,
         };
-        let permission_profile = if matches!(
-            self.config.permissions.sandbox_policy.get(),
-            SandboxPolicy::ExternalSandbox { .. }
-        ) {
-            None
-        } else {
-            Some(self.config.permissions.permission_profile())
-        };
+        let permission_profile = self.config.permissions.permission_profile();
         let op = AppCommand::user_turn(
             items,
             self.config.cwd.to_path_buf(),
             self.config.permissions.approval_policy.value(),
-            self.config.permissions.sandbox_policy.get().clone(),
             permission_profile,
             effective_mode.model().to_string(),
             effective_mode.reasoning_effort(),

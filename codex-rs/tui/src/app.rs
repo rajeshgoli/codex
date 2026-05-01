@@ -1206,7 +1206,6 @@ impl Drop for App {
     }
 }
 
-
 #[cfg(test)]
 pub(super) mod test_support;
 #[cfg(test)]
