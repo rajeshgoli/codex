@@ -83,6 +83,7 @@ pub use crate::permissions::FileSystemSandboxKind;
 pub use crate::permissions::FileSystemSandboxPolicy;
 pub use crate::permissions::FileSystemSpecialPath;
 pub use crate::permissions::NetworkSandboxPolicy;
+use crate::permissions::PROTECTED_METADATA_PATH_NAMES;
 use crate::permissions::default_read_only_subpaths_for_writable_root;
 pub use crate::request_permissions::RequestPermissionsArgs;
 pub use crate::request_user_input::RequestUserInputEvent;
@@ -3586,7 +3587,7 @@ impl<'de> Deserialize<'de> for SessionConfiguredEvent {
             // `SessionConfiguredEvent` is persisted into rollout history. Older
             // rollouts only have `sandbox_policy`, so accept it on deserialize
             // and immediately project it into the canonical `permission_profile`.
-            sandbox_policy: Option<SandboxPolicy>,
+            sandbox_policy: Option<LegacySessionConfiguredSandboxPolicy>,
             permission_profile: Option<PermissionProfile>,
             #[serde(default)]
             active_permission_profile: Option<ActivePermissionProfile>,
@@ -3602,10 +3603,9 @@ impl<'de> Deserialize<'de> for SessionConfiguredEvent {
         let wire = Wire::deserialize(deserializer)?;
         let permission_profile = match (wire.permission_profile, wire.sandbox_policy) {
             (Some(permission_profile), _) => permission_profile,
-            (None, Some(sandbox_policy)) => PermissionProfile::from_legacy_sandbox_policy_for_cwd(
-                &sandbox_policy,
-                wire.cwd.as_path(),
-            ),
+            (None, Some(sandbox_policy)) => {
+                sandbox_policy.into_permission_profile(wire.cwd.as_path())
+            }
             (None, None) => {
                 return Err(serde::de::Error::missing_field("permission_profile"));
             }
@@ -3630,6 +3630,264 @@ impl<'de> Deserialize<'de> for SessionConfiguredEvent {
             network_proxy: wire.network_proxy,
             rollout_path: wire.rollout_path,
         })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum LegacySessionConfiguredReadOnlyAccess {
+    Restricted {
+        #[serde(default = "default_legacy_include_platform_defaults")]
+        include_platform_defaults: bool,
+        #[serde(default)]
+        readable_roots: Vec<AbsolutePathBuf>,
+    },
+    FullAccess,
+}
+
+impl Default for LegacySessionConfiguredReadOnlyAccess {
+    fn default() -> Self {
+        Self::FullAccess
+    }
+}
+
+fn default_legacy_include_platform_defaults() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum LegacySessionConfiguredSandboxPolicy {
+    #[serde(rename = "danger-full-access")]
+    DangerFullAccess,
+    ReadOnly {
+        #[serde(default)]
+        access: LegacySessionConfiguredReadOnlyAccess,
+        #[serde(default)]
+        network_access: bool,
+    },
+    ExternalSandbox {
+        #[serde(default)]
+        network_access: NetworkAccess,
+    },
+    WorkspaceWrite {
+        #[serde(default)]
+        writable_roots: Vec<AbsolutePathBuf>,
+        #[serde(default)]
+        read_only_access: LegacySessionConfiguredReadOnlyAccess,
+        #[serde(default)]
+        network_access: bool,
+        #[serde(default)]
+        exclude_tmpdir_env_var: bool,
+        #[serde(default)]
+        exclude_slash_tmp: bool,
+    },
+}
+
+impl LegacySessionConfiguredSandboxPolicy {
+    fn into_permission_profile(self, cwd: &Path) -> PermissionProfile {
+        match self {
+            Self::DangerFullAccess => PermissionProfile::Disabled,
+            Self::ExternalSandbox { network_access } => PermissionProfile::External {
+                network: network_sandbox_policy_from_bool(network_access.is_enabled()),
+            },
+            Self::ReadOnly {
+                access,
+                network_access,
+            } => PermissionProfile::from_runtime_permissions_with_enforcement(
+                SandboxEnforcement::Managed,
+                &legacy_session_configured_file_system_policy_for_read_access(access, cwd),
+                network_sandbox_policy_from_bool(network_access),
+            ),
+            Self::WorkspaceWrite {
+                writable_roots,
+                read_only_access,
+                network_access,
+                exclude_tmpdir_env_var,
+                exclude_slash_tmp,
+            } => {
+                let file_system_policy = match read_only_access {
+                    LegacySessionConfiguredReadOnlyAccess::FullAccess => {
+                        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+                            &SandboxPolicy::WorkspaceWrite {
+                                writable_roots,
+                                network_access,
+                                exclude_tmpdir_env_var,
+                                exclude_slash_tmp,
+                            },
+                            cwd,
+                        )
+                    }
+                    read_only_access @ LegacySessionConfiguredReadOnlyAccess::Restricted {
+                        ..
+                    } => legacy_session_configured_workspace_write_policy(
+                        read_only_access,
+                        cwd,
+                        &writable_roots,
+                        exclude_tmpdir_env_var,
+                        exclude_slash_tmp,
+                    ),
+                };
+                PermissionProfile::from_runtime_permissions_with_enforcement(
+                    SandboxEnforcement::Managed,
+                    &file_system_policy,
+                    network_sandbox_policy_from_bool(network_access),
+                )
+            }
+        }
+    }
+}
+
+fn network_sandbox_policy_from_bool(network_access: bool) -> NetworkSandboxPolicy {
+    if network_access {
+        NetworkSandboxPolicy::Enabled
+    } else {
+        NetworkSandboxPolicy::Restricted
+    }
+}
+
+fn legacy_session_configured_file_system_policy_for_read_access(
+    access: LegacySessionConfiguredReadOnlyAccess,
+    cwd: &Path,
+) -> FileSystemSandboxPolicy {
+    match access {
+        LegacySessionConfiguredReadOnlyAccess::FullAccess => {
+            FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            }])
+        }
+        LegacySessionConfiguredReadOnlyAccess::Restricted {
+            include_platform_defaults,
+            readable_roots,
+        } => {
+            let mut entries = Vec::new();
+            if include_platform_defaults {
+                entries.push(FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Minimal,
+                    },
+                    access: FileSystemAccessMode::Read,
+                });
+            }
+            if let Ok(cwd_root) = AbsolutePathBuf::from_absolute_path(cwd) {
+                push_file_system_path_entry(
+                    &mut entries,
+                    FileSystemPath::Path { path: cwd_root },
+                    FileSystemAccessMode::Read,
+                );
+            } else {
+                error!("Ignoring invalid cwd {cwd:?} for sandbox readable root");
+            }
+            for readable_root in readable_roots {
+                push_file_system_path_entry(
+                    &mut entries,
+                    FileSystemPath::Path {
+                        path: readable_root,
+                    },
+                    FileSystemAccessMode::Read,
+                );
+            }
+            FileSystemSandboxPolicy::restricted(entries)
+        }
+    }
+}
+
+fn legacy_session_configured_workspace_write_policy(
+    read_only_access: LegacySessionConfiguredReadOnlyAccess,
+    cwd: &Path,
+    writable_roots: &[AbsolutePathBuf],
+    exclude_tmpdir_env_var: bool,
+    exclude_slash_tmp: bool,
+) -> FileSystemSandboxPolicy {
+    let mut entries =
+        legacy_session_configured_file_system_policy_for_read_access(read_only_access, cwd).entries;
+
+    push_file_system_path_entry(
+        &mut entries,
+        FileSystemPath::Special {
+            value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+        },
+        FileSystemAccessMode::Write,
+    );
+    if !exclude_slash_tmp {
+        push_file_system_path_entry(
+            &mut entries,
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::SlashTmp,
+            },
+            FileSystemAccessMode::Write,
+        );
+    }
+    if !exclude_tmpdir_env_var {
+        push_file_system_path_entry(
+            &mut entries,
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::Tmpdir,
+            },
+            FileSystemAccessMode::Write,
+        );
+    }
+    for writable_root in writable_roots {
+        push_file_system_path_entry(
+            &mut entries,
+            FileSystemPath::Path {
+                path: writable_root.clone(),
+            },
+            FileSystemAccessMode::Write,
+        );
+    }
+
+    for metadata_name in PROTECTED_METADATA_PATH_NAMES {
+        push_file_system_path_entry(
+            &mut entries,
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::project_roots(Some((*metadata_name).into())),
+            },
+            FileSystemAccessMode::Read,
+        );
+    }
+    if let Ok(cwd_root) = AbsolutePathBuf::from_absolute_path(cwd) {
+        for protected_path in default_read_only_subpaths_for_writable_root(
+            &cwd_root, /*protect_missing_dot_codex*/ true,
+        ) {
+            push_file_system_path_entry(
+                &mut entries,
+                FileSystemPath::Path {
+                    path: protected_path,
+                },
+                FileSystemAccessMode::Read,
+            );
+        }
+    }
+    for writable_root in writable_roots {
+        for protected_path in default_read_only_subpaths_for_writable_root(
+            writable_root,
+            /*protect_missing_dot_codex*/ false,
+        ) {
+            push_file_system_path_entry(
+                &mut entries,
+                FileSystemPath::Path {
+                    path: protected_path,
+                },
+                FileSystemAccessMode::Read,
+            );
+        }
+    }
+
+    FileSystemSandboxPolicy::restricted(entries)
+}
+
+fn push_file_system_path_entry(
+    entries: &mut Vec<FileSystemSandboxEntry>,
+    path: FileSystemPath,
+    access: FileSystemAccessMode,
+) {
+    let entry = FileSystemSandboxEntry { path, access };
+    if !entries.iter().any(|existing| existing == &entry) {
+        entries.push(entry);
     }
 }
 
@@ -5221,6 +5479,94 @@ mod tests {
 
         let event: SessionConfiguredEvent = serde_json::from_value(value)?;
         assert_eq!(event.permission_profile, PermissionProfile::read_only());
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_legacy_session_configured_event_preserves_restricted_read_roots() -> Result<()> {
+        let cwd = test_path_buf("/home/user/project");
+        let readable_root = test_path_buf("/var/shared");
+        let value = json!({
+            "session_id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
+            "model": "codex-mini-latest",
+            "model_provider_id": "openai",
+            "approval_policy": "never",
+            "approvals_reviewer": "user",
+            "sandbox_policy": {
+                "type": "read-only",
+                "access": {
+                    "type": "restricted",
+                    "include_platform_defaults": true,
+                    "readable_roots": [readable_root]
+                }
+            },
+            "cwd": cwd,
+            "history_log_id": 0,
+            "history_entry_count": 0,
+        });
+
+        let event: SessionConfiguredEvent = serde_json::from_value(value)?;
+        let (file_system_policy, network_policy) =
+            event.permission_profile.to_runtime_permissions();
+
+        assert_eq!(network_policy, NetworkSandboxPolicy::Restricted);
+        assert!(file_system_policy.include_platform_defaults());
+        assert!(
+            file_system_policy
+                .can_read_path_with_cwd(Path::new("/home/user/project/src/lib.rs"), cwd.as_path())
+        );
+        assert!(
+            file_system_policy
+                .can_read_path_with_cwd(Path::new("/var/shared/notes.txt"), cwd.as_path())
+        );
+        assert!(
+            !file_system_policy.can_read_path_with_cwd(Path::new("/etc/passwd"), cwd.as_path())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_legacy_workspace_write_preserves_restricted_read_roots() -> Result<()> {
+        let cwd = test_path_buf("/home/user/project");
+        let readable_root = test_path_buf("/var/shared");
+        let value = json!({
+            "session_id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
+            "model": "codex-mini-latest",
+            "model_provider_id": "openai",
+            "approval_policy": "never",
+            "approvals_reviewer": "user",
+            "sandbox_policy": {
+                "type": "workspace-write",
+                "read_only_access": {
+                    "type": "restricted",
+                    "include_platform_defaults": false,
+                    "readable_roots": [readable_root]
+                },
+                "exclude_tmpdir_env_var": true,
+                "exclude_slash_tmp": true
+            },
+            "cwd": cwd,
+            "history_log_id": 0,
+            "history_entry_count": 0,
+        });
+
+        let event: SessionConfiguredEvent = serde_json::from_value(value)?;
+        let (file_system_policy, network_policy) =
+            event.permission_profile.to_runtime_permissions();
+
+        assert_eq!(network_policy, NetworkSandboxPolicy::Restricted);
+        assert!(!file_system_policy.include_platform_defaults());
+        assert!(
+            file_system_policy
+                .can_write_path_with_cwd(Path::new("/home/user/project/output.txt"), cwd.as_path())
+        );
+        assert!(
+            file_system_policy
+                .can_read_path_with_cwd(Path::new("/var/shared/notes.txt"), cwd.as_path())
+        );
+        assert!(
+            !file_system_policy.can_read_path_with_cwd(Path::new("/etc/passwd"), cwd.as_path())
+        );
         Ok(())
     }
 
