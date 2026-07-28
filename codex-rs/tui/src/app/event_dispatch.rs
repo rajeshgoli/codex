@@ -2111,6 +2111,13 @@ impl App {
                     .handle_start_side(tui, app_server, parent_thread_id, user_message)
                     .await;
             }
+            AppEvent::StartExternalBtw { request_id, prompt } => {
+                self.start_external_btw(app_server, request_id, prompt)
+                    .await;
+            }
+            AppEvent::CleanupExternalBtw { thread_id } => {
+                self.cleanup_external_btw(app_server, thread_id).await;
+            }
             AppEvent::OpenSkillsList => {
                 self.chat_widget.open_skills_list();
             }

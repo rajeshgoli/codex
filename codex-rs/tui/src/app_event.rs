@@ -204,6 +204,17 @@ pub(crate) enum AppEvent {
         user_message: Option<UserMessage>,
     },
 
+    /// Run a provider-native side question without changing the displayed thread.
+    StartExternalBtw {
+        request_id: String,
+        prompt: String,
+    },
+
+    /// Release an externally controlled transient side thread after a terminal event.
+    CleanupExternalBtw {
+        thread_id: ThreadId,
+    },
+
     /// Submit an op to the specified thread, regardless of current focus.
     SubmitThreadOp {
         thread_id: ThreadId,

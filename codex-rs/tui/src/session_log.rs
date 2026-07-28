@@ -405,6 +405,66 @@ pub(crate) fn log_server_notification(notification: &ServerNotification) {
     write_event_stream_protocol_payload(payload, notification_thread_id(notification));
 }
 
+pub(crate) fn log_btw_started(request_id: &str, parent_thread_id: ThreadId, thread_id: ThreadId) {
+    write_btw_event(
+        "btw_started",
+        json!({
+            "request_id": request_id,
+            "parent_thread_id": parent_thread_id.to_string(),
+            "thread_id": thread_id.to_string(),
+        }),
+        Some(thread_id),
+    );
+}
+
+pub(crate) fn log_btw_completed(
+    request_id: &str,
+    parent_thread_id: ThreadId,
+    thread_id: ThreadId,
+    answer: &str,
+) {
+    write_btw_event(
+        "btw_completed",
+        json!({
+            "request_id": request_id,
+            "parent_thread_id": parent_thread_id.to_string(),
+            "thread_id": thread_id.to_string(),
+            "result": answer,
+        }),
+        Some(thread_id),
+    );
+}
+
+pub(crate) fn log_btw_failed(
+    request_id: &str,
+    parent_thread_id: Option<ThreadId>,
+    thread_id: Option<ThreadId>,
+    error: &str,
+) {
+    write_btw_event(
+        "btw_failed",
+        json!({
+            "request_id": request_id,
+            "parent_thread_id": parent_thread_id.map(|id| id.to_string()),
+            "thread_id": thread_id.map(|id| id.to_string()),
+            "error": error,
+        }),
+        thread_id.or(parent_thread_id),
+    );
+}
+
+fn write_btw_event(event_type: &str, payload: Value, session_id_override: Option<ThreadId>) {
+    if !LOGGER.is_enabled() || !matches!(LOGGER.mode(), Some(LogMode::EventStream)) {
+        return;
+    }
+
+    LOGGER.write_event_stream_record(
+        event_type,
+        payload,
+        session_id_override.map(|id| id.to_string()),
+    );
+}
+
 pub(crate) fn log_outbound_op(op: &AppCommand, thread_id_override: Option<&ThreadId>) {
     if !LOGGER.is_enabled() {
         return;

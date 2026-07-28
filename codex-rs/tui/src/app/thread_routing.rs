@@ -18,6 +18,7 @@ impl App {
         for side_thread_id in side_thread_ids {
             self.discard_side_thread(app_server, side_thread_id).await;
         }
+        self.fail_all_external_btw("main_thread_replaced");
         if let Some(thread_id) = self.chat_widget.thread_id() {
             if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
                 tracing::warn!("failed to unsubscribe thread {thread_id}: {err}");
