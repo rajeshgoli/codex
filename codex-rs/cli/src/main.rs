@@ -43,6 +43,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use supports_color::Stream;
 
+fn cli_bin_name() -> &'static str {
+    option_env!("CARGO_BIN_NAME").unwrap_or("codex")
+}
+
+fn cli_usage() -> String {
+    let name = cli_bin_name();
+    format!("{name} [OPTIONS] [PROMPT]\n       {name} [OPTIONS] <COMMAND> [ARGS]")
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app_cmd;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -100,8 +109,9 @@ use codex_terminal_detection::TerminalName;
     // The executable is sometimes invoked via a platform‑specific name like
     // `codex-x86_64-unknown-linux-musl`, but the help output should always use
     // the generic `codex` command name that users run.
-    bin_name = "codex",
-    override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]"
+    name = cli_bin_name(),
+    bin_name = cli_bin_name(),
+    override_usage = cli_usage()
 )]
 struct MultitoolCli {
     /// Enable process-only PSP routing for first-party ChatGPT requests.
@@ -2638,8 +2648,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
 
 fn print_completion(cmd: CompletionCommand) {
     let mut app = MultitoolCli::command();
-    let name = "codex";
-    generate(cmd.shell, &mut app, name, &mut std::io::stdout());
+    generate(cmd.shell, &mut app, cli_bin_name(), &mut std::io::stdout());
 }
 
 #[cfg(test)]
