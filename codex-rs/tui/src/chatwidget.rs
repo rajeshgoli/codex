@@ -258,7 +258,7 @@ fn queued_message_edit_hint_binding(
         .or(configured)
 }
 
-fn normalize_thread_name(name: &str) -> Option<String> {
+pub(crate) fn normalize_thread_name(name: &str) -> Option<String> {
     let trimmed = name.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
