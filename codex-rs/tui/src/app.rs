@@ -204,6 +204,7 @@ pub(crate) mod app_server_requests;
 mod background_requests;
 mod config_persistence;
 mod event_dispatch;
+mod external_btw;
 mod history_ui;
 mod input;
 mod loaded_threads;
@@ -569,6 +570,7 @@ pub(crate) struct App {
     thread_event_listener_tasks: HashMap<ThreadId, JoinHandle<()>>,
     agent_navigation: AgentNavigationState,
     side_threads: HashMap<ThreadId, SideThreadState>,
+    external_btw_requests: HashMap<ThreadId, external_btw::ExternalBtwState>,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<ThreadBufferedEvent>>,
     primary_thread_id: Option<ThreadId>,
@@ -1062,6 +1064,7 @@ See the Codex keymap documentation for supported actions and examples."
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
             side_threads: HashMap::new(),
+            external_btw_requests: HashMap::new(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,

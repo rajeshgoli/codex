@@ -46,6 +46,7 @@ const REQUEST_CACHE_CAPACITY: usize = 2048;
 const REQUEST_MAX_CHARS: usize = 1 << 20;
 const REQUEST_ID_MAX_CHARS: usize = 256;
 const MAX_CONNECTION_WORKERS: usize = 64;
+const MAX_EXTERNAL_BTW_PROMPT_BYTES: usize = 4 * 1024;
 
 pub(crate) struct ControlSocketHandle {
     shutdown: Arc<AtomicBool>,
@@ -212,6 +213,9 @@ enum ControlCommand {
     SetThreadName {
         name: String,
         thread_id: Option<String>,
+    },
+    SubmitBtw {
+        prompt: String,
     },
     SubmitApproval {
         id: String,
@@ -398,6 +402,40 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                     "invalid_request",
                     "thread name must not be empty",
                 )
+            }
+        }
+        ControlCommand::SubmitBtw { prompt } => {
+            if prompt.trim().is_empty() {
+                response_err(
+                    &request_id,
+                    &state.epoch,
+                    "invalid_request",
+                    "prompt must be non-empty",
+                )
+            } else if prompt.len() > MAX_EXTERNAL_BTW_PROMPT_BYTES {
+                response_err(
+                    &request_id,
+                    &state.epoch,
+                    "invalid_request",
+                    format!("prompt exceeds {MAX_EXTERNAL_BTW_PROMPT_BYTES} UTF-8 bytes"),
+                )
+            } else {
+                match dispatch_app_event(
+                    state,
+                    AppEvent::StartExternalBtw {
+                        request_id: request_id.clone(),
+                        prompt,
+                    },
+                ) {
+                    Ok(()) => response_ok(
+                        &request_id,
+                        &state.epoch,
+                        json!({"status": "accepted", "operation": "submit_btw"}),
+                    ),
+                    Err(err) => {
+                        response_err(&request_id, &state.epoch, "event_channel_closed", err)
+                    }
+                }
             }
         }
         ControlCommand::SubmitApproval {
@@ -896,6 +934,74 @@ mod tests {
                 command: ControlCommand::SetThreadName {
                     name: "   ".to_string(),
                     thread_id: None,
+                },
+            },
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("invalid_request")
+        );
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn submit_btw_dispatches_correlated_external_event() {
+        let (state, mut rx) = test_state();
+        let response = process_request(
+            &state,
+            ControlRequest {
+                request_id: "req-btw".to_string(),
+                expected_epoch: None,
+                command: ControlCommand::SubmitBtw {
+                    prompt: "Summarize the current work".to_string(),
+                },
+            },
+        );
+
+        assert!(response.ok);
+        match rx.try_recv() {
+            Ok(AppEvent::StartExternalBtw { request_id, prompt }) => {
+                assert_eq!(request_id, "req-btw");
+                assert_eq!(prompt, "Summarize the current work");
+            }
+            other => panic!("expected external btw event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_btw_rejects_empty_prompt() {
+        let (state, mut rx) = test_state();
+        let response = process_request(
+            &state,
+            ControlRequest {
+                request_id: "req-empty-btw".to_string(),
+                expected_epoch: None,
+                command: ControlCommand::SubmitBtw {
+                    prompt: "   ".to_string(),
+                },
+            },
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("invalid_request")
+        );
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn submit_btw_rejects_oversized_prompt() {
+        let (state, mut rx) = test_state();
+        let response = process_request(
+            &state,
+            ControlRequest {
+                request_id: "req-large-btw".to_string(),
+                expected_epoch: None,
+                command: ControlCommand::SubmitBtw {
+                    prompt: "x".repeat(MAX_EXTERNAL_BTW_PROMPT_BYTES + 1),
                 },
             },
         );

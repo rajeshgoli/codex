@@ -156,7 +156,14 @@ impl App {
             _ => {}
         }
 
-        match server_notification_thread_target(&notification) {
+        let thread_target = server_notification_thread_target(&notification);
+        if let ServerNotificationThreadTarget::Thread(thread_id) = thread_target
+            && self.handle_external_btw_notification(thread_id, &notification)
+        {
+            return;
+        }
+
+        match thread_target {
             ServerNotificationThreadTarget::Thread(thread_id) => {
                 let result = if self.primary_thread_id == Some(thread_id)
                     || self.primary_thread_id.is_none()
@@ -197,6 +204,22 @@ impl App {
         app_server_client: &AppServerSession,
         request: ServerRequest,
     ) {
+        if let Some(thread_id) = server_request_thread_id(&request)
+            && self.fail_external_btw(thread_id, "interactive_request_not_supported")
+        {
+            if let Err(err) = self
+                .reject_app_server_request(
+                    app_server_client,
+                    request.id().clone(),
+                    "Interactive requests are not supported in external /btw turns.".to_string(),
+                )
+                .await
+            {
+                tracing::warn!("{err}");
+            }
+            return;
+        }
+
         if let Some(unsupported) = self
             .pending_app_server_requests
             .note_server_request(&request)
