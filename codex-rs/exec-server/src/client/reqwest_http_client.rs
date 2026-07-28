@@ -5,10 +5,12 @@
 //! - in a remote environment, that means the remote runtime after the
 //!   orchestrator has forwarded `http/request` over JSON-RPC
 
+use std::error::Error as StdError;
 use std::time::Duration;
 
-use codex_app_server_protocol::JSONRPCErrorError;
-use codex_client::build_reqwest_client_with_custom_ca;
+use codex_exec_server_protocol::JSONRPCErrorError;
+use codex_http_client::build_reqwest_client_with_custom_ca;
+use codex_http_client::with_chatgpt_cloudflare_cookie_store;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::BoxFuture;
@@ -17,15 +19,18 @@ use reqwest::Url;
 use reqwest::header::HeaderMap;
 use reqwest::header::HeaderName;
 use reqwest::header::HeaderValue;
+use tracing::Instrument;
 
 use super::HttpResponseBodyStream;
 use super::response_body_stream::send_body_delta;
 use crate::HttpClient;
 use crate::client::ExecServerError;
 use crate::protocol::HttpHeader;
+use crate::protocol::HttpRedirectPolicy;
 use crate::protocol::HttpRequestBodyDeltaNotification;
 use crate::protocol::HttpRequestParams;
 use crate::protocol::HttpRequestResponse;
+use crate::protocol::MAX_HTTP_BODY_DELTA_BYTES;
 use crate::rpc::RpcNotificationSender;
 use crate::rpc::internal_error;
 use crate::rpc::invalid_params;
@@ -49,14 +54,21 @@ pub(crate) struct ReqwestHttpRequestRunner {
 }
 
 impl ReqwestHttpClient {
-    fn build_client(timeout_ms: Option<u64>) -> Result<reqwest::Client, ExecServerError> {
+    fn build_client(
+        timeout_ms: Option<u64>,
+        redirect_policy: HttpRedirectPolicy,
+    ) -> Result<reqwest::Client, ExecServerError> {
         let builder = match timeout_ms {
             None => reqwest::Client::builder(),
             Some(timeout_ms) => {
                 reqwest::Client::builder().timeout(Duration::from_millis(timeout_ms))
             }
         };
-        build_reqwest_client_with_custom_ca(builder)
+        let builder = match redirect_policy {
+            HttpRedirectPolicy::Follow => builder,
+            HttpRedirectPolicy::Stop => builder.redirect(reqwest::redirect::Policy::none()),
+        };
+        build_reqwest_client_with_custom_ca(with_chatgpt_cloudflare_cookie_store(builder))
             .map_err(|error| ExecServerError::HttpRequest(error.to_string()))
     }
 }
@@ -67,7 +79,7 @@ impl HttpClient for ReqwestHttpClient {
         params: HttpRequestParams,
     ) -> BoxFuture<'_, Result<HttpRequestResponse, ExecServerError>> {
         async move {
-            let runner = ReqwestHttpRequestRunner::new(params.timeout_ms)
+            let runner = ReqwestHttpRequestRunner::new(params.timeout_ms, params.redirect_policy)
                 .map_err(|error| ExecServerError::HttpRequest(error.message))?;
             let (response, _) = runner
                 .run(HttpRequestParams {
@@ -86,7 +98,7 @@ impl HttpClient for ReqwestHttpClient {
         params: HttpRequestParams,
     ) -> BoxFuture<'_, Result<(HttpRequestResponse, HttpResponseBodyStream), ExecServerError>> {
         async move {
-            let runner = ReqwestHttpRequestRunner::new(params.timeout_ms)
+            let runner = ReqwestHttpRequestRunner::new(params.timeout_ms, params.redirect_policy)
                 .map_err(|error| ExecServerError::HttpRequest(error.message))?;
             let (response, pending_stream) = runner
                 .run(HttpRequestParams {
@@ -110,8 +122,11 @@ impl HttpClient for ReqwestHttpClient {
 }
 
 impl ReqwestHttpRequestRunner {
-    pub(crate) fn new(timeout_ms: Option<u64>) -> Result<Self, JSONRPCErrorError> {
-        let client = ReqwestHttpClient::build_client(timeout_ms)
+    pub(crate) fn new(
+        timeout_ms: Option<u64>,
+        redirect_policy: HttpRedirectPolicy,
+    ) -> Result<Self, JSONRPCErrorError> {
+        let client = ReqwestHttpClient::build_client(timeout_ms, redirect_policy)
             .map_err(|error| internal_error(error.to_string()))?;
         Ok(Self { client })
     }
@@ -134,17 +149,35 @@ impl ReqwestHttpRequestRunner {
             }
         }
 
-        let headers = Self::build_headers(params.headers)?;
-        let mut request = self.client.request(method, url).headers(headers);
+        let request_span = tracing::info_span!(
+            "codex.exec_server.http_request",
+            otel.kind = "client",
+            http.request.method = method.as_str(),
+            server.address = url.host_str().unwrap_or_default(),
+            server.port = u64::from(url.port_or_known_default().unwrap_or_default()),
+            http.response.status_code = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+        );
+        let mut headers = Self::build_headers(params.headers)?;
+        codex_otel::inject_span_w3c_trace_headers(&request_span, &mut headers);
+        let mut request = self.client.request(method.clone(), url).headers(headers);
         if let Some(body) = params.body {
             request = request.body(body.into_inner());
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|error| internal_error(format!("http/request failed: {error}")))?;
+        let response = match request.send().instrument(request_span.clone()).await {
+            Ok(response) => response,
+            Err(error) => {
+                request_span.record("error.type", "request");
+                let error_message = error.to_string();
+                log_send_error(&method, error);
+                return Err(internal_error(format!(
+                    "http/request failed: {error_message}"
+                )));
+            }
+        };
         let status = response.status().as_u16();
+        request_span.record("http.response.status_code", u64::from(status));
         let headers = Self::response_headers(response.headers());
 
         if params.stream_response {
@@ -190,21 +223,23 @@ impl ReqwestHttpRequestRunner {
         while let Some(chunk) = body.next().await {
             match chunk {
                 Ok(bytes) => {
-                    if !send_body_delta(
-                        &notifications,
-                        HttpRequestBodyDeltaNotification {
-                            request_id: request_id.clone(),
-                            seq,
-                            delta: bytes.to_vec().into(),
-                            done: false,
-                            error: None,
-                        },
-                    )
-                    .await
-                    {
-                        return;
+                    for chunk in bytes.chunks(MAX_HTTP_BODY_DELTA_BYTES) {
+                        if !send_body_delta(
+                            &notifications,
+                            HttpRequestBodyDeltaNotification {
+                                request_id: request_id.clone(),
+                                seq,
+                                delta: chunk.to_vec().into(),
+                                done: false,
+                                error: None,
+                            },
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        seq += 1;
                     }
-                    seq += 1;
                 }
                 Err(error) => {
                     let _ = send_body_delta(
@@ -264,4 +299,27 @@ impl ReqwestHttpRequestRunner {
             })
             .collect()
     }
+}
+
+fn log_send_error(method: &Method, error: reqwest::Error) {
+    let error = error.without_url();
+    let source_chain = error_source_chain(&error);
+    tracing::warn!(
+        http_method = method.as_str(),
+        error_is_timeout = error.is_timeout(),
+        error_is_connect = error.is_connect(),
+        error = %error,
+        error_sources = ?source_chain,
+        "http/request send failed"
+    );
+}
+
+fn error_source_chain(error: &reqwest::Error) -> Option<String> {
+    let mut sources = Vec::new();
+    let mut source = error.source();
+    while let Some(error) = source {
+        sources.push(error.to_string());
+        source = error.source();
+    }
+    (!sources.is_empty()).then(|| sources.join(": "))
 }

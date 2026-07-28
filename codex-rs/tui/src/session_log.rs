@@ -57,6 +57,10 @@ impl SessionLogger {
         let mut opts = OpenOptions::new();
         opts.create(true).truncate(true).write(true);
 
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -221,11 +225,6 @@ fn normalize_contract_event_type(event_type: &str) -> String {
         "turn/completed" => "turn_complete".to_string(),
         "turn_completed" => "turn_complete".to_string(),
         "turn_aborted" => "turn_aborted".to_string(),
-        "item/started" => "item_started".to_string(),
-        "item/completed" => "item_completed".to_string(),
-        "rawResponseItemCompleted" | "raw_response_item_completed" => {
-            "raw_response_item".to_string()
-        }
         _ => event_type.to_string(),
     }
 }
@@ -265,10 +264,7 @@ pub(crate) fn maybe_init(config: &Config, cli: &Cli) -> std::io::Result<()> {
     let path = if let Ok(path) = std::env::var("CODEX_TUI_SESSION_LOG_PATH") {
         PathBuf::from(path)
     } else {
-        let mut p = match crate::legacy_core::config::log_dir(config) {
-            Ok(dir) => dir,
-            Err(_) => std::env::temp_dir(),
-        };
+        let mut p = config.log_dir.clone();
         let filename = format!(
             "session-{}.jsonl",
             chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
@@ -301,12 +297,9 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
     }
 
     match LOGGER.mode() {
-        Some(LogMode::EventStream) => match event {
-            // SubmitThreadOp is logged at the submit point, where the routed
-            // thread id is known and duplicate queued-event records can be avoided.
-            AppEvent::SubmitThreadOp { .. } => {}
-            _ => {}
-        },
+        // Event-stream mode records outbound commands and server notifications
+        // at their submit/receive points to avoid duplicate queued-event records.
+        Some(LogMode::EventStream) => {}
         Some(LogMode::Legacy) => match event {
             AppEvent::NewSession => {
                 LOGGER.write_json_line(&json!({
@@ -345,6 +338,31 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
                     "kind": "file_search_result",
                     "query": query,
                     "matches": matches.len(),
+                }));
+            }
+            AppEvent::PetPreviewLoaded { request_id, result } => {
+                LOGGER.write_json_line(&json!({
+                    "ts": now_ts(),
+                    "dir": "to_tui",
+                    "kind": "app_event",
+                    "variant": "PetPreviewLoaded",
+                    "request_id": request_id,
+                    "ok": result.is_ok(),
+                }));
+            }
+            AppEvent::PetSelectionLoaded {
+                request_id,
+                pet_id,
+                result,
+            } => {
+                LOGGER.write_json_line(&json!({
+                    "ts": now_ts(),
+                    "dir": "to_tui",
+                    "kind": "app_event",
+                    "variant": "PetSelectionLoaded",
+                    "request_id": request_id,
+                    "pet_id": pet_id,
+                    "ok": result.is_ok(),
                 }));
             }
             other => {
@@ -433,12 +451,8 @@ where
     }));
 }
 
-fn write_event_stream_op<C>(op: C, thread_id_override: Option<&ThreadId>)
-where
-    C: Into<AppCommand>,
-{
-    let app_command: AppCommand = op.into();
-    let payload = match serde_json::to_value(&app_command) {
+fn write_event_stream_op(op: &AppCommand, thread_id_override: Option<&ThreadId>) {
+    let payload = match serde_json::to_value(op) {
         Ok(value) => value,
         Err(err) => {
             tracing::warn!("event stream serialize error: {err}");
@@ -529,6 +543,7 @@ fn notification_thread_id(notification: &ServerNotification) -> Option<String> {
     let payload = serde_json::to_value(notification).ok()?;
     payload
         .get("thread_id")
+        .or_else(|| payload.get("threadId"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
         .or_else(|| {
@@ -540,7 +555,7 @@ fn notification_thread_id(notification: &ServerNotification) -> Option<String> {
         .or_else(|| {
             payload
                 .get("params")
-                .and_then(|params| params.get("thread_id"))
+                .and_then(|params| params.get("thread_id").or_else(|| params.get("threadId")))
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
         })
@@ -642,18 +657,6 @@ mod tests {
         assert_eq!(
             normalize_contract_event_type("turn/completed"),
             "turn_complete"
-        );
-        assert_eq!(
-            normalize_contract_event_type("item/started"),
-            "item_started"
-        );
-        assert_eq!(
-            normalize_contract_event_type("item/completed"),
-            "item_completed"
-        );
-        assert_eq!(
-            normalize_contract_event_type("rawResponseItemCompleted"),
-            "raw_response_item"
         );
         assert_eq!(
             normalize_contract_event_type("exec_command_begin"),

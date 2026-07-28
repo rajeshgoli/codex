@@ -1,6 +1,12 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+fn set_composer_text(chat: &mut ChatWidget, text: &str) {
+    chat.bottom_pane
+        .set_composer_text(text.to_string(), Vec::new(), Vec::new());
+    chat.refresh_plan_mode_nudge();
+}
+
 #[test]
 fn plan_mode_nudge_matches_only_standalone_plain_text_keyword() {
     assert!(contains_plan_keyword("plan"));
@@ -14,19 +20,19 @@ fn plan_mode_nudge_matches_only_standalone_plain_text_keyword() {
 #[tokio::test]
 async fn plan_mode_nudge_shows_only_for_eligible_default_mode_drafts() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
-    chat.set_composer_text("make a plan".to_string(), Vec::new(), Vec::new());
+    set_composer_text(&mut chat, "make a plan");
     chat.pre_draw_tick();
     assert!(chat.bottom_pane.plan_mode_nudge_visible());
 
-    chat.set_composer_text("/plan".to_string(), Vec::new(), Vec::new());
+    set_composer_text(&mut chat, "/plan");
     chat.pre_draw_tick();
     assert!(!chat.bottom_pane.plan_mode_nudge_visible());
 
-    chat.set_composer_text("!plan".to_string(), Vec::new(), Vec::new());
+    set_composer_text(&mut chat, "!plan");
     chat.pre_draw_tick();
     assert!(!chat.bottom_pane.plan_mode_nudge_visible());
 
-    chat.set_composer_text("make a plan".to_string(), Vec::new(), Vec::new());
+    set_composer_text(&mut chat, "make a plan");
     let plan_mask = collaboration_modes::plan_mask(chat.model_catalog.as_ref())
         .expect("expected plan collaboration mode");
     chat.set_collaboration_mask(plan_mask);
@@ -37,7 +43,7 @@ async fn plan_mode_nudge_shows_only_for_eligible_default_mode_drafts() {
 #[tokio::test]
 async fn plan_mode_nudge_hides_while_task_or_modal_is_active() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
-    chat.set_composer_text("make a plan".to_string(), Vec::new(), Vec::new());
+    set_composer_text(&mut chat, "make a plan");
     chat.pre_draw_tick();
     assert!(chat.bottom_pane.plan_mode_nudge_visible());
 
@@ -65,7 +71,7 @@ async fn plan_mode_nudge_dismissal_is_scoped_to_current_thread() {
     let first_thread = ThreadId::new();
     let second_thread = ThreadId::new();
     chat.thread_id = Some(first_thread);
-    chat.set_composer_text("make a plan".to_string(), Vec::new(), Vec::new());
+    set_composer_text(&mut chat, "make a plan");
     chat.pre_draw_tick();
     assert!(chat.bottom_pane.plan_mode_nudge_visible());
 
@@ -89,7 +95,7 @@ async fn plan_mode_nudge_dismissal_is_scoped_to_current_thread() {
 #[tokio::test]
 async fn plan_mode_nudge_shift_tab_uses_existing_mode_cycle_path() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
-    chat.set_composer_text("make a plan".to_string(), Vec::new(), Vec::new());
+    set_composer_text(&mut chat, "make a plan");
     chat.pre_draw_tick();
     assert!(chat.bottom_pane.plan_mode_nudge_visible());
 
@@ -105,7 +111,7 @@ async fn plan_mode_nudge_snapshot() {
     chat.set_token_info(Some(make_token_info(
         /*total_tokens*/ 50_000, /*context_window*/ 100_000,
     )));
-    chat.set_composer_text("make a plan".to_string(), Vec::new(), Vec::new());
+    set_composer_text(&mut chat, "make a plan");
     chat.pre_draw_tick();
 
     assert_chatwidget_snapshot!("plan_mode_nudge", render_bottom_popup(&chat, /*width*/ 80));
@@ -114,7 +120,7 @@ async fn plan_mode_nudge_snapshot() {
 #[tokio::test]
 async fn plan_mode_nudge_narrow_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
-    chat.set_composer_text("make a plan".to_string(), Vec::new(), Vec::new());
+    set_composer_text(&mut chat, "make a plan");
     chat.pre_draw_tick();
 
     assert_chatwidget_snapshot!(
@@ -428,6 +434,52 @@ async fn reasoning_shortcut_in_plan_mode_updates_plan_override_without_prompt_or
 }
 
 #[tokio::test]
+async fn advanced_reasoning_selection_in_plan_mode_uses_expected_scope() {
+    for effort in [ReasoningEffortConfig::Ultra, ReasoningEffortConfig::Max] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+        chat.thread_id = Some(ThreadId::new());
+        chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+        let plan_mask = collaboration_modes::plan_mask(chat.model_catalog.as_ref())
+            .expect("expected plan collaboration mode");
+        chat.set_collaboration_mask(plan_mask);
+        let _ = drain_insert_history(&mut rx);
+
+        let mut preset = get_available_model(&chat, "gpt-5.4");
+        preset.supported_reasoning_efforts = vec![ReasoningEffortPreset {
+            effort: effort.clone(),
+            description: "Advanced reasoning".to_string(),
+        }];
+        chat.open_advanced_reasoning_popup(preset);
+        chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        if effort == ReasoningEffortConfig::Ultra {
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AppEvent::ApplyAdvancedReasoning {
+                    model,
+                    effort: ReasoningEffortConfig::Ultra,
+                } if model == "gpt-5.4"
+            )));
+            assert!(events.iter().all(|event| !matches!(
+                event,
+                AppEvent::OpenPlanReasoningScopePrompt { .. }
+                    | AppEvent::PersistPlanModeReasoningEffort(_)
+                    | AppEvent::PersistModelSelection { .. }
+            )));
+        } else {
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AppEvent::OpenPlanReasoningScopePrompt {
+                    model,
+                    effort: Some(ReasoningEffortConfig::Max),
+                } if model == "gpt-5.4"
+            )));
+        }
+    }
+}
+
+#[tokio::test]
 async fn plan_mode_reasoning_override_is_marked_current_in_reasoning_popup() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
@@ -582,20 +634,22 @@ async fn request_user_input_notification_overrides_pending_agent_turn_complete_n
     chat.notify(Notification::AgentTurnComplete {
         response: "done".to_string(),
     });
-    chat.handle_request_user_input_now(RequestUserInputEvent {
-        call_id: "call-1".to_string(),
+    chat.handle_request_user_input_now(ToolRequestUserInputParams {
+        thread_id: "thread-1".to_string(),
+        item_id: "call-1".to_string(),
         turn_id: "turn-1".to_string(),
-        questions: vec![RequestUserInputQuestion {
+        questions: vec![ToolRequestUserInputQuestion {
             id: "reasoning_scope".to_string(),
             header: "Reasoning scope".to_string(),
             question: "Which reasoning scope should I use?".to_string(),
             is_other: false,
             is_secret: false,
-            options: Some(vec![RequestUserInputQuestionOption {
+            options: Some(vec![ToolRequestUserInputOption {
                 label: "Plan only".to_string(),
                 description: "Update only Plan mode.".to_string(),
             }]),
         }],
+        auto_resolution_ms: None,
     });
 
     assert_matches!(
@@ -610,20 +664,22 @@ async fn handle_request_user_input_sets_pending_notification() {
     chat.config.tui_notifications.notifications =
         Notifications::Custom(vec!["plan-mode-prompt".to_string()]);
 
-    chat.handle_request_user_input_now(RequestUserInputEvent {
-        call_id: "call-1".to_string(),
+    chat.handle_request_user_input_now(ToolRequestUserInputParams {
+        thread_id: "thread-1".to_string(),
+        item_id: "call-1".to_string(),
         turn_id: "turn-1".to_string(),
-        questions: vec![RequestUserInputQuestion {
+        questions: vec![ToolRequestUserInputQuestion {
             id: "reasoning_scope".to_string(),
             header: "Reasoning scope".to_string(),
             question: "Which reasoning scope should I use?".to_string(),
             is_other: false,
             is_secret: false,
-            options: Some(vec![RequestUserInputQuestionOption {
+            options: Some(vec![ToolRequestUserInputOption {
                 label: "Plan only".to_string(),
                 description: "Update only Plan mode.".to_string(),
             }]),
         }],
+        auto_resolution_ms: None,
     });
 
     assert_matches!(
@@ -699,7 +755,7 @@ async fn submit_user_message_with_mode_errors_when_mode_changes_during_running_t
     chat.submit_user_message_with_mode("Implement the plan.".to_string(), default_mode);
 
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
-    assert!(chat.queued_user_messages.is_empty());
+    assert!(chat.input_queue.queued_user_messages.is_empty());
     assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
     let rendered = drain_insert_history(&mut rx)
         .iter()
@@ -747,7 +803,7 @@ async fn submit_user_message_with_mode_allows_same_mode_during_running_turn() {
     chat.submit_user_message_with_mode("Continue planning.".to_string(), plan_mask);
 
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
-    assert!(chat.queued_user_messages.is_empty());
+    assert!(chat.input_queue.queued_user_messages.is_empty());
     match next_submit_op(&mut op_rx) {
         Op::UserTurn {
             collaboration_mode:
@@ -781,7 +837,7 @@ async fn submit_user_message_with_mode_submits_when_plan_stream_is_not_active() 
     chat.submit_user_message_with_mode("Implement the plan.".to_string(), default_mode);
 
     assert_eq!(chat.active_collaboration_mode_kind(), expected_mode);
-    assert!(chat.queued_user_messages.is_empty());
+    assert!(chat.input_queue.queued_user_messages.is_empty());
     match next_submit_op(&mut op_rx) {
         Op::UserTurn {
             collaboration_mode: Some(CollaborationMode { mode, .. }),
@@ -802,13 +858,24 @@ async fn plan_implementation_popup_skips_replayed_turn_complete() {
         .expect("expected plan collaboration mask");
     chat.set_collaboration_mask(plan_mask);
 
-    chat.replay_initial_messages(vec![EventMsg::TurnComplete(TurnCompleteEvent {
-        turn_id: "turn-1".to_string(),
-        last_agent_message: Some("Plan details".to_string()),
-        completed_at: None,
-        duration_ms: None,
-        time_to_first_token_ms: None,
-    })]);
+    chat.replay_thread_turns(
+        vec![AppServerTurn {
+            id: "turn-1".to_string(),
+            items_view: codex_app_server_protocol::TurnItemsView::Full,
+            items: vec![AppServerThreadItem::AgentMessage {
+                id: "msg-plan".to_string(),
+                text: "Plan details".to_string(),
+                phase: Some(MessagePhase::FinalAnswer),
+                memory_citation: None,
+            }],
+            status: AppServerTurnStatus::Completed,
+            error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+        }],
+        ReplayKind::ResumeInitialMessages,
+    );
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert!(
@@ -829,29 +896,37 @@ async fn plan_implementation_popup_shows_once_when_replay_precedes_live_turn_com
     chat.on_plan_delta("- Step 1\n- Step 2\n".to_string());
     chat.on_plan_item_completed("- Step 1\n- Step 2\n".to_string());
 
-    chat.replay_initial_messages(vec![EventMsg::TurnComplete(TurnCompleteEvent {
-        turn_id: "turn-1".to_string(),
-        last_agent_message: Some("Plan details".to_string()),
-        completed_at: None,
-        duration_ms: None,
-        time_to_first_token_ms: None,
-    })]);
+    chat.replay_thread_turns(
+        vec![AppServerTurn {
+            id: "turn-1".to_string(),
+            items_view: codex_app_server_protocol::TurnItemsView::Full,
+            items: vec![AppServerThreadItem::AgentMessage {
+                id: "msg-plan-replay".to_string(),
+                text: "Plan details".to_string(),
+                phase: Some(MessagePhase::FinalAnswer),
+                memory_citation: None,
+            }],
+            status: AppServerTurnStatus::Completed,
+            error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+        }],
+        ReplayKind::ResumeInitialMessages,
+    );
     let replay_popup = render_bottom_popup(&chat, /*width*/ 80);
     assert!(
         !replay_popup.contains(PLAN_IMPLEMENTATION_TITLE),
         "expected no prompt for replayed turn completion, got {replay_popup:?}"
     );
 
-    chat.handle_codex_event(Event {
-        id: "live-turn-complete-1".to_string(),
-        msg: EventMsg::TurnComplete(TurnCompleteEvent {
-            turn_id: "turn-1".to_string(),
-            last_agent_message: Some("Plan details".to_string()),
-            completed_at: None,
-            duration_ms: None,
-            time_to_first_token_ms: None,
-        }),
-    });
+    complete_assistant_message(
+        &mut chat,
+        "msg-plan-live-1",
+        "Plan details",
+        Some(MessagePhase::FinalAnswer),
+    );
+    handle_turn_completed(&mut chat, "live-turn-complete-1", /*duration_ms*/ None);
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert!(
@@ -866,16 +941,13 @@ async fn plan_implementation_popup_shows_once_when_replay_precedes_live_turn_com
         "expected prompt to dismiss on Esc, got {dismissed_popup:?}"
     );
 
-    chat.handle_codex_event(Event {
-        id: "live-turn-complete-2".to_string(),
-        msg: EventMsg::TurnComplete(TurnCompleteEvent {
-            turn_id: "turn-1".to_string(),
-            last_agent_message: Some("Plan details".to_string()),
-            completed_at: None,
-            duration_ms: None,
-            time_to_first_token_ms: None,
-        }),
-    });
+    complete_assistant_message(
+        &mut chat,
+        "msg-plan-live-2",
+        "Plan details",
+        Some(MessagePhase::FinalAnswer),
+    );
+    handle_turn_completed(&mut chat, "live-turn-complete-2", /*duration_ms*/ None);
     let duplicate_popup = render_bottom_popup(&chat, /*width*/ 80);
     assert!(
         !duplicate_popup.contains(PLAN_IMPLEMENTATION_TITLE),
@@ -1112,6 +1184,7 @@ async fn submit_user_message_queues_while_compaction_turn_is_running() {
             thread_id: thread_id.to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
@@ -1125,7 +1198,7 @@ async fn submit_user_message_queues_while_compaction_turn_is_running() {
 
     chat.submit_user_message(UserMessage::from("queued while compacting"));
 
-    assert_eq!(chat.pending_steers.len(), 1);
+    assert_eq!(chat.input_queue.pending_steers.len(), 1);
     match next_submit_op(&mut op_rx) {
         Op::UserTurn { items, .. } => assert_eq!(
             items,
@@ -1137,17 +1210,15 @@ async fn submit_user_message_queues_while_compaction_turn_is_running() {
         other => panic!("expected running-turn compact steer submit, got {other:?}"),
     }
 
-    chat.handle_codex_event(Event {
-        id: "steer-rejected".into(),
-        msg: EventMsg::Error(ErrorEvent {
-            message: "cannot steer a compact turn".to_string(),
-            codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
-                turn_kind: NonSteerableTurnKind::Compact,
-            }),
+    handle_error(
+        &mut chat,
+        "cannot steer a compact turn",
+        Some(CodexErrorInfo::ActiveTurnNotSteerable {
+            turn_kind: NonSteerableTurnKind::Compact,
         }),
-    });
+    );
 
-    assert!(chat.pending_steers.is_empty());
+    assert!(chat.input_queue.pending_steers.is_empty());
     assert_eq!(
         chat.queued_user_message_texts(),
         vec!["queued while compacting"]
@@ -1158,6 +1229,7 @@ async fn submit_user_message_queues_while_compaction_turn_is_running() {
             thread_id: thread_id.to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::Completed,
                 error: None,
@@ -1184,11 +1256,12 @@ async fn submit_user_message_queues_while_compaction_turn_is_running() {
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_user_message_emits_structured_plugin_mentions_from_bindings() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let conversation_id = ThreadId::new();
+    let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
-    let configured = codex_protocol::protocol::SessionConfiguredEvent {
-        session_id: conversation_id,
+    let configured = crate::session_state::ThreadSessionState {
+        thread_id,
         forked_from_id: None,
+        fork_parent_title: None,
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -1198,17 +1271,16 @@ async fn submit_user_message_emits_structured_plugin_mentions_from_bindings() {
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
+        runtime_workspace_roots: Vec::new(),
+        instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
-        history_log_id: 0,
-        history_entry_count: 0,
-        initial_messages: None,
+        collaboration_mode: None,
+        personality: None,
+        message_history: None,
         network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
     };
-    chat.handle_codex_event(Event {
-        id: "initial".into(),
-        msg: EventMsg::SessionConfigured(configured),
-    });
+    chat.handle_thread_session(configured);
     chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
     chat.bottom_pane
         .set_plugin_mentions(Some(vec![codex_plugin::PluginCapabilitySummary {
@@ -1226,6 +1298,7 @@ async fn submit_user_message_emits_structured_plugin_mentions_from_bindings() {
         remote_image_urls: Vec::new(),
         text_elements: Vec::new(),
         mention_bindings: vec![MentionBinding {
+            sigil: '$',
             mention: "sample".to_string(),
             path: "plugin://sample@test".to_string(),
         }],
@@ -1251,7 +1324,7 @@ async fn submit_user_message_emits_structured_plugin_mentions_from_bindings() {
 
 #[tokio::test]
 async fn enter_submits_when_plan_stream_is_not_active() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.thread_id = Some(ThreadId::new());
     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
     let plan_mask = collaboration_modes::mask_for_kind(chat.model_catalog.as_ref(), ModeKind::Plan)
@@ -1263,7 +1336,7 @@ async fn enter_submits_when_plan_stream_is_not_active() {
         .set_composer_text("submitted immediately".to_string(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    assert!(chat.queued_user_messages.is_empty());
+    assert!(chat.input_queue.queued_user_messages.is_empty());
     match next_submit_op(&mut op_rx) {
         Op::UserTurn {
             personality: Some(Personality::Pragmatic),
@@ -1333,7 +1406,7 @@ async fn mode_switch_surfaces_model_change_notification_when_effective_model_cha
 
 #[tokio::test]
 async fn mode_switch_surfaces_reasoning_change_notification_when_model_stays_same() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
 
@@ -1347,66 +1420,9 @@ async fn mode_switch_surfaces_reasoning_change_notification_when_model_stays_sam
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        plan_messages.contains("Model changed to gpt-5.3-codex medium for Plan mode."),
+        plan_messages.contains("Model changed to gpt-5.2 medium for Plan mode."),
         "expected reasoning-change notice in Plan mode, got: {plan_messages:?}"
     );
-}
-
-#[tokio::test]
-async fn collab_slash_command_opens_picker_and_updates_mode() {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.thread_id = Some(ThreadId::new());
-    chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
-
-    chat.dispatch_command(SlashCommand::Collab);
-    let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert!(
-        popup.contains("Select Collaboration Mode"),
-        "expected collaboration picker: {popup}"
-    );
-
-    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    let selected_mask = match rx.try_recv() {
-        Ok(AppEvent::UpdateCollaborationMode(mask)) => mask,
-        other => panic!("expected UpdateCollaborationMode event, got {other:?}"),
-    };
-    chat.set_collaboration_mask(selected_mask);
-
-    chat.bottom_pane
-        .set_composer_text("hello".to_string(), Vec::new(), Vec::new());
-    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    match next_submit_op(&mut op_rx) {
-        Op::UserTurn {
-            collaboration_mode:
-                Some(CollaborationMode {
-                    mode: ModeKind::Default,
-                    ..
-                }),
-            personality: Some(Personality::Pragmatic),
-            ..
-        } => {}
-        other => {
-            panic!("expected Op::UserTurn with code collab mode, got {other:?}")
-        }
-    }
-
-    chat.bottom_pane
-        .set_composer_text("follow up".to_string(), Vec::new(), Vec::new());
-    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    match next_submit_op(&mut op_rx) {
-        Op::UserTurn {
-            collaboration_mode:
-                Some(CollaborationMode {
-                    mode: ModeKind::Default,
-                    ..
-                }),
-            personality: Some(Personality::Pragmatic),
-            ..
-        } => {}
-        other => {
-            panic!("expected Op::UserTurn with code collab mode, got {other:?}")
-        }
-    }
 }
 
 #[tokio::test]
@@ -1432,9 +1448,10 @@ async fn plan_slash_command_with_args_submits_prompt_in_plan_mode() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
 
-    let configured = codex_protocol::protocol::SessionConfiguredEvent {
-        session_id: ThreadId::new(),
+    let configured = crate::session_state::ThreadSessionState {
+        thread_id: ThreadId::new(),
         forked_from_id: None,
+        fork_parent_title: None,
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -1444,17 +1461,16 @@ async fn plan_slash_command_with_args_submits_prompt_in_plan_mode() {
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
+        runtime_workspace_roots: Vec::new(),
+        instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
-        history_log_id: 0,
-        history_entry_count: 0,
-        initial_messages: None,
+        collaboration_mode: None,
+        personality: None,
+        message_history: None,
         network_proxy: None,
         rollout_path: None,
     };
-    chat.handle_codex_event(Event {
-        id: "configured".into(),
-        msg: EventMsg::SessionConfigured(configured),
-    });
+    chat.handle_thread_session(configured);
 
     chat.bottom_pane
         .set_composer_text("/plan build the plan".to_string(), Vec::new(), Vec::new());
@@ -1477,40 +1493,74 @@ async fn plan_slash_command_with_args_submits_prompt_in_plan_mode() {
 
 #[tokio::test]
 async fn collaboration_modes_defaults_to_code_on_startup() {
+    let chat = make_startup_chat_with_cli_overrides(vec![(
+        "features.collaboration_modes".to_string(),
+        TomlValue::Boolean(true),
+    )])
+    .await;
+    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Default);
+    assert_eq!(
+        chat.current_model(),
+        get_model_offline_for_tests(chat.config.model.as_deref())
+    );
+}
+
+#[tokio::test]
+async fn vim_mode_default_disabled_starts_composer_in_insert_mode() {
+    let chat = make_startup_chat_with_cli_overrides(Vec::new()).await;
+    assert!(!chat.bottom_pane.composer_is_vim_enabled());
+}
+
+#[tokio::test]
+async fn vim_mode_default_enabled_starts_composer_in_normal_mode() {
+    let chat = make_startup_chat_with_cli_overrides(vec![(
+        "tui.vim_mode_default".to_string(),
+        TomlValue::Boolean(true),
+    )])
+    .await;
+
+    assert!(chat.bottom_pane.composer_is_vim_enabled());
+    assert!(chat.composer_is_empty());
+    let mut chat = chat;
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert_eq!(chat.bottom_pane.composer_text(), "");
+}
+
+async fn make_startup_chat_with_cli_overrides(
+    cli_overrides: Vec<(String, TomlValue)>,
+) -> ChatWidget {
     let codex_home = tempdir().expect("tempdir");
     let cfg = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
-        .cli_overrides(vec![(
-            "features.collaboration_modes".to_string(),
-            TomlValue::Boolean(true),
-        )])
+        .cli_overrides(cli_overrides)
         .build()
         .await
         .expect("config");
-    let resolved_model = crate::legacy_core::test_support::get_model_offline(cfg.model.as_deref());
+    let resolved_model = get_model_offline_for_tests(cfg.model.as_deref());
     let session_telemetry = test_session_telemetry(&cfg, resolved_model.as_str());
     let init = ChatWidgetInit {
         config: cfg.clone(),
         frame_requester: FrameRequester::test_dummy(),
         app_event_tx: AppEventSender::new(unbounded_channel::<AppEvent>().0),
+        workspace_command_runner: None,
         initial_user_message: None,
         enhanced_keys_supported: false,
         has_chatgpt_account: false,
+        has_codex_backend_auth: false,
         model_catalog: test_model_catalog(&cfg),
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: true,
         status_account_display: None,
+        runtime_model_provider_base_url: None,
         initial_plan_type: None,
-        model: Some(resolved_model.clone()),
+        model: Some(resolved_model),
         startup_tooltip_override: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         session_telemetry,
     };
 
-    let chat = ChatWidget::new_with_app_event(init);
-    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Default);
-    assert_eq!(chat.current_model(), resolved_model);
+    ChatWidget::new_with_app_event(init)
 }
 
 #[tokio::test]
@@ -1564,7 +1614,7 @@ async fn set_reasoning_effort_does_not_override_active_plan_override() {
 
 #[tokio::test]
 async fn collab_mode_is_sent_after_enabling() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.thread_id = Some(ThreadId::new());
     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
 
@@ -1589,7 +1639,7 @@ async fn collab_mode_is_sent_after_enabling() {
 
 #[tokio::test]
 async fn collab_mode_applies_default_preset() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.thread_id = Some(ThreadId::new());
 
     chat.bottom_pane
@@ -1616,10 +1666,10 @@ async fn collab_mode_applies_default_preset() {
 
 #[tokio::test]
 async fn user_turn_includes_personality_from_config() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.set_feature_enabled(Feature::Personality, /*enabled*/ true);
     chat.thread_id = Some(ThreadId::new());
-    chat.set_model("gpt-5.3-codex");
+    chat.set_model("gpt-5.4");
     chat.set_personality(Personality::Friendly);
 
     chat.bottom_pane
@@ -1654,10 +1704,7 @@ async fn plan_update_renders_history_cell() {
             },
         ],
     };
-    chat.handle_codex_event(Event {
-        id: "sub-1".into(),
-        msg: EventMsg::PlanUpdate(update),
-    });
+    chat.on_plan_update(update);
     let cells = drain_insert_history(&mut rx);
     assert!(!cells.is_empty(), "expected plan update cell to be sent");
     let blob = lines_to_single_string(cells.last().unwrap());

@@ -2,9 +2,12 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
 
+use crate::model::AgentMessageMetadata;
+use crate::model::ConversationBody;
 use crate::model::ConversationChannel;
 use crate::model::ConversationItemKind;
 use crate::model::ConversationPart;
+use crate::model::ConversationRole;
 use crate::model::ExecutionStatus;
 use crate::model::ProducerRef;
 use crate::model::ToolCallKind;
@@ -108,6 +111,90 @@ fn response_outputs_enter_thread_conversation_on_completion() -> anyhow::Result<
 }
 
 #[test]
+fn agent_messages_preserve_routing_and_content() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+
+    let request = writer.write_json_payload(
+        RawPayloadKind::InferenceRequest,
+        &json!({
+            "input": [
+                {
+                    "type": "agent_message",
+                    "author": "/root/worker",
+                    "recipient": "/root",
+                    "content": [{"type": "input_text", "text": "done"}]
+                },
+                {
+                    "type": "agent_message",
+                    "author": "/root",
+                    "recipient": "/root/worker",
+                    "content": [{
+                        "type": "encrypted_content",
+                        "encrypted_content": "encrypted-task"
+                    }]
+                }
+            ]
+        }),
+    )?;
+    append_inference_start(&writer, "inference-1", "turn-1", request)?;
+
+    let rollout = replay_bundle(temp.path())?;
+    let actual = rollout.inference_calls["inference-1"]
+        .request_item_ids
+        .iter()
+        .map(|item_id| {
+            let item = &rollout.conversation_items[item_id];
+            (
+                item.role.clone(),
+                item.channel.clone(),
+                item.kind.clone(),
+                item.agent_message.clone(),
+                item.body.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        actual,
+        vec![
+            (
+                ConversationRole::Assistant,
+                Some(ConversationChannel::Analysis),
+                ConversationItemKind::Message,
+                Some(AgentMessageMetadata {
+                    author: "/root/worker".to_string(),
+                    recipient: "/root".to_string(),
+                }),
+                ConversationBody {
+                    parts: vec![ConversationPart::Text {
+                        text: "done".to_string(),
+                    }],
+                },
+            ),
+            (
+                ConversationRole::Assistant,
+                Some(ConversationChannel::Analysis),
+                ConversationItemKind::Message,
+                Some(AgentMessageMetadata {
+                    author: "/root".to_string(),
+                    recipient: "/root/worker".to_string(),
+                }),
+                ConversationBody {
+                    parts: vec![ConversationPart::Encoded {
+                        label: "encrypted_content".to_string(),
+                        value: "encrypted-task".to_string(),
+                    }],
+                },
+            ),
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
 fn later_full_request_reuses_prior_json_tool_call_by_position() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_writer(&temp)?;
@@ -189,6 +276,7 @@ fn incremental_request_carries_prior_request_and_response_items_forward() -> any
             "token_usage": {
                 "input_tokens": 10,
                 "cached_input_tokens": 1,
+                "cache_write_input_tokens": 3,
                 "output_tokens": 5,
                 "reasoning_output_tokens": 2,
                 "total_tokens": 15
@@ -242,6 +330,13 @@ fn incremental_request_carries_prior_request_and_response_items_forward() -> any
     assert_eq!(
         first.usage.as_ref().map(|usage| usage.input_tokens),
         Some(10),
+    );
+    assert_eq!(
+        first
+            .usage
+            .as_ref()
+            .map(|usage| usage.cache_write_input_tokens),
+        Some(3),
     );
 
     Ok(())
@@ -649,6 +744,48 @@ fn unsupported_model_item_is_reducer_error() -> anyhow::Result<()> {
 }
 
 #[test]
+fn additional_tools_are_excluded_from_request_conversation() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+
+    let request = writer.write_json_payload(
+        RawPayloadKind::InferenceRequest,
+        &json!({
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{
+                        "type": "function",
+                        "name": "lookup",
+                        "parameters": {"type": "object", "properties": {}}
+                    }]
+                },
+                message("user", "find it")
+            ]
+        }),
+    )?;
+    append_inference_start(&writer, "inference-1", "turn-1", request)?;
+
+    let rollout = replay_bundle(temp.path())?;
+    let request_item_ids = &rollout.inference_calls["inference-1"].request_item_ids;
+
+    assert_eq!(request_item_ids.len(), 1);
+    assert_eq!(rollout.conversation_items.len(), 1);
+    assert_eq!(
+        rollout.conversation_items[&request_item_ids[0]].body,
+        ConversationBody {
+            parts: vec![ConversationPart::Text {
+                text: "find it".to_string(),
+            }],
+        }
+    );
+
+    Ok(())
+}
+
+#[test]
 fn missing_request_input_is_reducer_error() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_writer(&temp)?;
@@ -765,6 +902,75 @@ fn compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::
             compaction_id: "compaction-1".to_string()
         }],
     );
+    assert_eq!(
+        rollout.conversation_items[&compaction.replacement_item_ids[2]].channel,
+        Some(ConversationChannel::Summary),
+    );
+    assert_eq!(
+        rollout.conversation_items[&compaction.replacement_item_ids[2]].kind,
+        ConversationItemKind::Message,
+    );
+    assert_eq!(
+        rollout.conversation_items[&compaction.replacement_item_ids[2]]
+            .body
+            .parts,
+        vec![ConversationPart::Encoded {
+            label: "encrypted_content".to_string(),
+            value: "encrypted-summary".to_string(),
+        }],
+    );
+
+    Ok(())
+}
+
+#[test]
+fn context_compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+
+    let developer = message("developer", "follow repo rules");
+    let user = message("user", "count files");
+    let request = writer.write_json_payload(
+        RawPayloadKind::InferenceRequest,
+        &json!({
+            "input": [developer, user]
+        }),
+    )?;
+    append_inference_start(&writer, "inference-1", "turn-1", request)?;
+
+    let summary = message("user", "summary from compacted history");
+    let compaction_summary = json!({
+        "type": "context_compaction",
+        "encrypted_content": "encrypted-summary",
+    });
+    let checkpoint = writer.write_json_payload(
+        RawPayloadKind::CompactionCheckpoint,
+        &json!({
+            "input_history": [developer, user],
+            "replacement_history": [user, summary, compaction_summary]
+        }),
+    )?;
+    writer.append_with_context(
+        trace_context("turn-1"),
+        RawTraceEventPayload::CompactionInstalled {
+            compaction_id: "compaction-1".to_string(),
+            checkpoint_payload: checkpoint,
+        },
+    )?;
+
+    start_turn(&writer, "turn-2")?;
+    let post_compaction_request = writer.write_json_payload(
+        RawPayloadKind::InferenceRequest,
+        &json!({
+            "input": [developer, user, summary, compaction_summary]
+        }),
+    )?;
+    append_inference_start(&writer, "inference-2", "turn-2", post_compaction_request)?;
+
+    let rollout = replay_bundle(temp.path())?;
+    let compaction = &rollout.compactions["compaction-1"];
+
     assert_eq!(
         rollout.conversation_items[&compaction.replacement_item_ids[2]].channel,
         Some(ConversationChannel::Summary),

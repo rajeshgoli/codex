@@ -3,7 +3,7 @@ use crate::ToolDefinition;
 use crate::ToolName;
 use crate::parse_dynamic_tool;
 use crate::parse_mcp_tool;
-use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -55,7 +55,7 @@ pub struct ResponsesApiNamespace {
     pub tools: Vec<ResponsesApiNamespaceTool>,
 }
 
-pub(crate) fn default_namespace_description(namespace_name: &str) -> String {
+pub fn default_namespace_description(namespace_name: &str) -> String {
     format!("Tools in the {namespace_name} namespace.")
 }
 
@@ -67,26 +67,11 @@ pub enum ResponsesApiNamespaceTool {
 }
 
 pub fn dynamic_tool_to_responses_api_tool(
-    tool: &DynamicToolSpec,
+    tool: &DynamicToolFunctionSpec,
 ) -> Result<ResponsesApiTool, serde_json::Error> {
     Ok(tool_definition_to_responses_api_tool(parse_dynamic_tool(
         tool,
     )?))
-}
-
-pub fn dynamic_tool_to_loadable_tool_spec(
-    tool: &DynamicToolSpec,
-) -> Result<LoadableToolSpec, serde_json::Error> {
-    let output_tool = dynamic_tool_to_responses_api_tool(tool)?;
-    Ok(match tool.namespace.as_ref() {
-        Some(namespace) => LoadableToolSpec::Namespace(ResponsesApiNamespace {
-            name: namespace.clone(),
-            // the user doesn't provide a description for dynamic tools, so we use the default
-            description: default_namespace_description(namespace),
-            tools: vec![ResponsesApiNamespaceTool::Function(output_tool)],
-        }),
-        None => LoadableToolSpec::Function(output_tool),
-    })
 }
 
 pub fn coalesce_loadable_tool_specs(

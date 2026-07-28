@@ -48,8 +48,10 @@ use std::path::PathBuf;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use unicode_width::UnicodeWidthChar;
 
+/// Replacement for a tab character in rendered diff content.
+const TAB_REPLACEMENT: &str = "    ";
 /// Display width of a tab character in columns.
-const TAB_WIDTH: usize = 4;
+const TAB_WIDTH: usize = TAB_REPLACEMENT.len();
 
 // -- Diff background palette --------------------------------------------------
 //
@@ -77,6 +79,7 @@ const LIGHT_256_GUTTER_FG_IDX: u8 = 236;
 
 use crate::color::is_light;
 use crate::color::perceptual_distance;
+use crate::diff_model::FileChange;
 use crate::exec_command::relativize_to_home;
 use crate::render::Insets;
 use crate::render::highlight::DiffScopeBackgroundRgbs;
@@ -94,7 +97,6 @@ use crate::terminal_palette::indexed_color;
 use crate::terminal_palette::rgb_color;
 use crate::terminal_palette::stdout_color_level;
 use codex_git_utils::get_git_repo_root;
-use codex_protocol::protocol::FileChange;
 use codex_terminal_detection::TerminalName;
 use codex_terminal_detection::terminal_info;
 
@@ -299,7 +301,7 @@ pub struct DiffSummary {
 }
 
 impl DiffSummary {
-    pub fn new(changes: HashMap<PathBuf, FileChange>, cwd: AbsolutePathBuf) -> Self {
+    pub(crate) fn new(changes: HashMap<PathBuf, FileChange>, cwd: AbsolutePathBuf) -> Self {
         Self { changes, cwd }
     }
 }
@@ -989,7 +991,10 @@ fn wrap_styled_spans(spans: &[RtSpan<'static>], max_cols: usize) -> Vec<Vec<RtSp
                     break;
                 };
                 let ch_len = ch.len_utf8();
-                current_line.push(RtSpan::styled(remaining[..ch_len].to_string(), style));
+                current_line.push(RtSpan::styled(
+                    remaining[..ch_len].replace('\t', TAB_REPLACEMENT),
+                    style,
+                ));
                 // Use fallback width 1 (not 0) so this branch always advances
                 // even if `ch` has unknown/zero display width.
                 col = ch.width().unwrap_or(if ch == '\t' { TAB_WIDTH } else { 1 });
@@ -998,7 +1003,7 @@ fn wrap_styled_spans(spans: &[RtSpan<'static>], max_cols: usize) -> Vec<Vec<RtSp
             }
 
             let (chunk, rest) = remaining.split_at(byte_end);
-            current_line.push(RtSpan::styled(chunk.to_string(), style));
+            current_line.push(RtSpan::styled(chunk.replace('\t', TAB_REPLACEMENT), style));
             col += chars_col;
             remaining = rest;
 
@@ -1307,6 +1312,7 @@ fn style_gutter_dim() -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use insta::assert_debug_snapshot;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
     use ratatui::Terminal;
@@ -1369,6 +1375,15 @@ mod tests {
                     .render_ref(f.area(), f.buffer_mut())
             })
             .expect("draw");
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| !cell.symbol().contains('\t')),
+            "diff buffer should not contain literal tabs"
+        );
         assert_snapshot!(name, terminal.backend());
     }
 
@@ -2201,6 +2216,58 @@ mod tests {
     }
 
     #[test]
+    fn cpp_module_extensions_use_cpp_highlighting() {
+        let highlighted_tokens = ["cpp", "cppm", "CPPM", "cxxm", "CxXm", "ixx", "IXX"]
+            .into_iter()
+            .map(|extension| {
+                let mut changes: HashMap<PathBuf, FileChange> = HashMap::new();
+                changes.insert(
+                    PathBuf::from(format!("math.{extension}")),
+                    FileChange::Add {
+                        content:
+                            "export module math;\nexport int sum(int a, int b) { return a + b; }\n"
+                                .to_string(),
+                    },
+                );
+
+                let lines =
+                    create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
+                let rgb_tokens = lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .filter(|span| matches!(span.style.fg, Some(ratatui::style::Color::Rgb(..))))
+                    .map(|span| span.content.to_string())
+                    .collect::<Vec<_>>();
+                assert!(
+                    !rgb_tokens.is_empty(),
+                    "add diff for .{extension} file should produce syntax-highlighted (RGB) spans"
+                );
+                (extension, rgb_tokens.join("|"))
+            })
+            .collect::<Vec<_>>();
+
+        assert_debug_snapshot!("cpp_module_extension_highlighting", highlighted_tokens);
+    }
+
+    #[test]
+    fn unknown_extension_falls_back_without_syntax_highlighting() {
+        let mut changes: HashMap<PathBuf, FileChange> = HashMap::new();
+        changes.insert(
+            PathBuf::from("math.unknown-extension"),
+            FileChange::Add {
+                content: "export module math;\nexport int value = 42;\n".to_string(),
+            },
+        );
+
+        let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
+        assert!(lines.iter().all(|line| {
+            line.spans
+                .iter()
+                .all(|span| !matches!(span.style.fg, Some(ratatui::style::Color::Rgb(..))))
+        }));
+    }
+
+    #[test]
     fn delete_diff_uses_path_extension_for_highlighting() {
         let mut changes: HashMap<PathBuf, FileChange> = HashMap::new();
         changes.insert(
@@ -2298,12 +2365,15 @@ mod tests {
     fn wrap_styled_spans_tabs_have_visible_width() {
         // A tab should count as TAB_WIDTH columns, not zero.
         // With max_cols=8, a tab (4 cols) + "abcde" (5 cols) = 9 cols → must wrap.
-        let spans = vec![RtSpan::raw("\tabcde")];
+        let style = Style::default().fg(Color::Green);
+        let spans = vec![RtSpan::styled("\tabcde", style)];
         let result = wrap_styled_spans(&spans, /*max_cols*/ 8);
-        assert!(
-            result.len() >= 2,
-            "tab + 5 chars should exceed 8 cols and wrap, got {} line(s): {result:?}",
-            result.len()
+        assert_eq!(
+            result,
+            vec![
+                vec![RtSpan::styled("    abcd", style)],
+                vec![RtSpan::styled("e", style)],
+            ]
         );
     }
 
@@ -2320,7 +2390,7 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        assert_eq!(line_text, vec!["abcd", "\t", "界"]);
+        assert_eq!(line_text, vec!["abcd", "    ", "界"]);
 
         let line_width = |line: &[RtSpan<'static>]| -> usize {
             line.iter()

@@ -1,4 +1,3 @@
-use super::ConfiguredToolSpec;
 use super::ResponsesApiNamespace;
 use super::ResponsesApiWebSearchFilters;
 use super::ResponsesApiWebSearchUserLocation;
@@ -58,17 +57,10 @@ fn tool_spec_name_covers_all_variants() {
         .name(),
         "tool_search"
     );
-    assert_eq!(ToolSpec::LocalShell {}.name(), "local_shell");
-    assert_eq!(
-        ToolSpec::ImageGeneration {
-            output_format: "png".to_string(),
-        }
-        .name(),
-        "image_generation"
-    );
     assert_eq!(
         ToolSpec::WebSearch {
             external_web_access: Some(true),
+            indexed_web_access: None,
             filters: None,
             user_location: None,
             search_context_size: None,
@@ -89,29 +81,6 @@ fn tool_spec_name_covers_all_variants() {
         })
         .name(),
         "exec"
-    );
-}
-
-#[test]
-fn configured_tool_spec_name_delegates_to_tool_spec() {
-    assert_eq!(
-        ConfiguredToolSpec::new(
-            ToolSpec::Function(ResponsesApiTool {
-                name: "lookup_order".to_string(),
-                description: "Look up an order".to_string(),
-                strict: false,
-                defer_loading: None,
-                parameters: JsonSchema::object(
-                    BTreeMap::new(),
-                    /*required*/ None,
-                    /*additional_properties*/ None
-                ),
-                output_schema: None,
-            }),
-            /*supports_parallel_tool_calls*/ true,
-        )
-        .name(),
-        "lookup_order"
     );
 }
 
@@ -224,6 +193,7 @@ fn web_search_tool_spec_serializes_expected_wire_shape() {
     assert_eq!(
         serde_json::to_value(ToolSpec::WebSearch {
             external_web_access: Some(true),
+            indexed_web_access: Some(true),
             filters: Some(ResponsesApiWebSearchFilters {
                 allowed_domains: Some(vec!["example.com".to_string()]),
             }),
@@ -241,6 +211,7 @@ fn web_search_tool_spec_serializes_expected_wire_shape() {
         json!({
             "type": "web_search",
             "external_web_access": true,
+            "indexed_web_access": true,
             "filters": {
                 "allowed_domains": ["example.com"],
             },

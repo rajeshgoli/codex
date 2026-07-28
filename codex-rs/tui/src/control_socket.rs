@@ -2,10 +2,11 @@ use crate::app_command::AppCommand;
 use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
 use crate::app_event_sender::AppEventSender;
+use crate::chatwidget::normalize_thread_name;
+use codex_app_server_protocol::CommandExecutionApprovalDecision;
+use codex_app_server_protocol::FileChangeApprovalDecision;
+use codex_app_server_protocol::ToolRequestUserInputResponse;
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::Op;
-use codex_protocol::protocol::ReviewDecision;
-use codex_protocol::request_user_input::RequestUserInputResponse;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -174,15 +175,18 @@ impl RequestCache {
     }
 
     fn insert(&mut self, request_id: String, response: ControlResponse) {
-        if self.entries.contains_key(&request_id) {
-            self.entries.insert(request_id, response);
-            return;
-        }
-        self.order.push_back(request_id.clone());
-        self.entries.insert(request_id, response);
-        while self.order.len() > REQUEST_CACHE_CAPACITY {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
+        match self.entries.entry(request_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(response);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                self.order.push_back(request_id);
+                entry.insert(response);
+                while self.order.len() > REQUEST_CACHE_CAPACITY {
+                    if let Some(oldest) = self.order.pop_front() {
+                        self.entries.remove(&oldest);
+                    }
+                }
             }
         }
     }
@@ -300,7 +304,14 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
     }
 
     let request_id = request.request_id.clone();
-    let mut cache = state.cache.lock().expect("control cache lock poisoned");
+    let Ok(mut cache) = state.cache.lock() else {
+        return response_err(
+            &request_id,
+            &state.epoch,
+            "internal_error",
+            "control cache lock poisoned",
+        );
+    };
     if let Some(cached) = cache.get(&request_id) {
         return cached;
     }
@@ -339,12 +350,15 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                 )
             } else {
                 match parse_thread_id(thread_id) {
-                    Ok(target_thread_id) => match dispatch_app_event(
+                    Ok(Some(_thread_id)) => response_err(
+                        &request_id,
+                        &state.epoch,
+                        "unsupported_request",
+                        "thread_id is not supported for submit_message in this build",
+                    ),
+                    Ok(None) => match dispatch_app_event(
                         state,
-                        AppEvent::SubmitExternalLiteralUserMessage {
-                            text: message,
-                            target_thread_id,
-                        },
+                        AppEvent::SubmitExternalLiteralUserMessage { text: message },
                     ) {
                         Ok(()) => response_ok(
                             &request_id,
@@ -360,10 +374,11 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
             }
         }
         ControlCommand::SetThreadName { name, thread_id } => {
-            if let Some(name) = crate::legacy_core::util::normalize_thread_name(&name) {
+            if let Some(name) = normalize_thread_name(&name) {
                 match parse_thread_id(thread_id) {
                     Ok(thread_id) => {
-                        match dispatch_op(state, thread_id, Op::SetThreadName { name }) {
+                        match dispatch_command(state, thread_id, AppCommand::set_thread_name(name))
+                        {
                             Ok(()) => response_ok(
                                 &request_id,
                                 &state.epoch,
@@ -392,33 +407,49 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
             thread_id,
             turn_id,
         } => match parse_thread_id(thread_id) {
-            Ok(thread_id) => match parse_review_decision(decision.as_str()) {
-                Some(decision) => {
-                    let op = match approval_kind {
-                        ApprovalKind::Exec => Op::ExecApproval {
-                            id,
-                            turn_id,
-                            decision,
-                        },
-                        ApprovalKind::Patch => Op::PatchApproval { id, decision },
-                    };
-                    match dispatch_op(state, thread_id, op) {
-                        Ok(()) => response_ok(
-                            &request_id,
-                            &state.epoch,
-                            json!({"status": "accepted", "operation": "submit_approval"}),
-                        ),
-                        Err(err) => {
-                            response_err(&request_id, &state.epoch, "event_channel_closed", err)
+            Ok(thread_id) => match approval_kind {
+                ApprovalKind::Exec => match parse_exec_approval_decision(decision.as_str()) {
+                    Some(decision) => {
+                        let command = AppCommand::exec_approval(id, turn_id, decision);
+                        match dispatch_command(state, thread_id, command) {
+                            Ok(()) => response_ok(
+                                &request_id,
+                                &state.epoch,
+                                json!({"status": "accepted", "operation": "submit_approval"}),
+                            ),
+                            Err(err) => {
+                                response_err(&request_id, &state.epoch, "event_channel_closed", err)
+                            }
                         }
                     }
-                }
-                None => response_err(
-                    &request_id,
-                    &state.epoch,
-                    "invalid_request",
-                    "decision must be one of: approved, approved_for_session, denied, abort",
-                ),
+                    None => response_err(
+                        &request_id,
+                        &state.epoch,
+                        "invalid_request",
+                        "exec approval decision must be one of: approved, approved_for_session, denied, abort",
+                    ),
+                },
+                ApprovalKind::Patch => match parse_patch_approval_decision(decision.as_str()) {
+                    Some(decision) => {
+                        let command = AppCommand::patch_approval(id, decision);
+                        match dispatch_command(state, thread_id, command) {
+                            Ok(()) => response_ok(
+                                &request_id,
+                                &state.epoch,
+                                json!({"status": "accepted", "operation": "submit_approval"}),
+                            ),
+                            Err(err) => {
+                                response_err(&request_id, &state.epoch, "event_channel_closed", err)
+                            }
+                        }
+                    }
+                    None => response_err(
+                        &request_id,
+                        &state.epoch,
+                        "invalid_request",
+                        "patch approval decision must be one of: approved, approved_for_session, denied, abort",
+                    ),
+                },
             },
             Err(err) => response_err(&request_id, &state.epoch, "invalid_request", err),
         },
@@ -427,13 +458,11 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
             response,
             thread_id,
         } => match parse_thread_id(thread_id) {
-            Ok(thread_id) => match serde_json::from_value::<RequestUserInputResponse>(response) {
+            Ok(thread_id) => match serde_json::from_value::<ToolRequestUserInputResponse>(response)
+            {
                 Ok(parsed_response) => {
-                    let op = Op::UserInputAnswer {
-                        id,
-                        response: parsed_response,
-                    };
-                    match dispatch_op(state, thread_id, op) {
+                    let command = AppCommand::user_input_answer(id, parsed_response);
+                    match dispatch_command(state, thread_id, command) {
                         Ok(()) => response_ok(
                             &request_id,
                             &state.epoch,
@@ -483,18 +512,31 @@ fn parse_thread_id(raw: Option<String>) -> Result<Option<ThreadId>, String> {
     }
 }
 
-fn parse_review_decision(raw: &str) -> Option<ReviewDecision> {
+fn parse_exec_approval_decision(raw: &str) -> Option<CommandExecutionApprovalDecision> {
     match raw {
-        "approved" => Some(ReviewDecision::Approved),
-        "approved_for_session" => Some(ReviewDecision::ApprovedForSession),
-        "denied" => Some(ReviewDecision::Denied),
-        "abort" => Some(ReviewDecision::Abort),
+        "approved" => Some(CommandExecutionApprovalDecision::Accept),
+        "approved_for_session" => Some(CommandExecutionApprovalDecision::AcceptForSession),
+        "denied" => Some(CommandExecutionApprovalDecision::Decline),
+        "abort" => Some(CommandExecutionApprovalDecision::Cancel),
         _ => None,
     }
 }
 
-fn dispatch_op(state: &ControlState, thread_id: Option<ThreadId>, op: Op) -> Result<(), String> {
-    let op = AppCommand::from(op);
+fn parse_patch_approval_decision(raw: &str) -> Option<FileChangeApprovalDecision> {
+    match raw {
+        "approved" => Some(FileChangeApprovalDecision::Accept),
+        "approved_for_session" => Some(FileChangeApprovalDecision::AcceptForSession),
+        "denied" => Some(FileChangeApprovalDecision::Decline),
+        "abort" => Some(FileChangeApprovalDecision::Cancel),
+        _ => None,
+    }
+}
+
+fn dispatch_command(
+    state: &ControlState,
+    thread_id: Option<ThreadId>,
+    op: AppCommand,
+) -> Result<(), String> {
     match thread_id {
         Some(thread_id) => dispatch_app_event(state, AppEvent::SubmitThreadOp { thread_id, op }),
         None => dispatch_app_event(state, AppEvent::CodexOp(op)),
@@ -782,12 +824,8 @@ mod tests {
         assert_eq!(first.epoch, second.epoch);
 
         match rx.try_recv() {
-            Ok(AppEvent::SubmitExternalLiteralUserMessage {
-                text,
-                target_thread_id,
-            }) => {
-                assert_eq!(text, "hello");
-                assert_eq!(target_thread_id, None);
+            Ok(AppEvent::SubmitExternalLiteralUserMessage { text }) => {
+                assert_eq!(text, "hello")
             }
             other => panic!("expected one external user message event, got {other:?}"),
         }
@@ -795,36 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_message_with_thread_id_uses_external_message_event() {
-        let (state, mut rx) = test_state();
-        let thread_id = ThreadId::new();
-        let response = process_request(
-            &state,
-            ControlRequest {
-                request_id: "req-thread-message".to_string(),
-                expected_epoch: None,
-                command: ControlCommand::SubmitMessage {
-                    message: "hello thread".to_string(),
-                    thread_id: Some(thread_id.to_string()),
-                },
-            },
-        );
-
-        assert!(response.ok);
-        match rx.try_recv() {
-            Ok(AppEvent::SubmitExternalLiteralUserMessage {
-                text,
-                target_thread_id,
-            }) => {
-                assert_eq!(text, "hello thread");
-                assert_eq!(target_thread_id, Some(thread_id));
-            }
-            other => panic!("expected external user message event, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn set_thread_name_dispatches_thread_name_op() {
+    fn set_thread_name_dispatches_thread_name_command() {
         let (state, mut rx) = test_state();
         let response = process_request(
             &state,
@@ -832,7 +841,7 @@ mod tests {
                 request_id: "req-set-name".to_string(),
                 expected_epoch: None,
                 command: ControlCommand::SetThreadName {
-                    name: "worker-one".to_string(),
+                    name: "  worker-one  ".to_string(),
                     thread_id: None,
                 },
             },
@@ -843,12 +852,12 @@ mod tests {
             Ok(AppEvent::CodexOp(AppCommand::SetThreadName { name })) => {
                 assert_eq!(name, "worker-one");
             }
-            other => panic!("expected set thread name op, got {other:?}"),
+            other => panic!("expected set thread name command, got {other:?}"),
         }
     }
 
     #[test]
-    fn set_thread_name_with_thread_id_dispatches_thread_op() {
+    fn set_thread_name_with_thread_id_dispatches_thread_command() {
         let (state, mut rx) = test_state();
         let thread_id = ThreadId::new();
         let response = process_request(
@@ -872,7 +881,7 @@ mod tests {
                 assert_eq!(actual_thread_id, thread_id);
                 assert_eq!(name, "worker-two");
             }
-            other => panic!("expected thread-scoped set thread name op, got {other:?}"),
+            other => panic!("expected thread-scoped set thread name command, got {other:?}"),
         }
     }
 
@@ -893,7 +902,7 @@ mod tests {
 
         assert!(!response.ok);
         assert_eq!(
-            response.error.as_ref().map(|e| e.code.as_str()),
+            response.error.as_ref().map(|error| error.code.as_str()),
             Some("invalid_request")
         );
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));

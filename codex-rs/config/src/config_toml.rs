@@ -27,8 +27,6 @@ use crate::types::ToolSuggestConfig;
 use crate::types::Tui;
 use crate::types::UriBasedFileOpener;
 use crate::types::WindowsToml;
-use codex_app_server_protocol::Tools;
-use codex_app_server_protocol::UserSavedConfig;
 use codex_features::FeaturesToml;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
@@ -37,11 +35,11 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
+use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
-use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchMode;
@@ -57,6 +55,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
+use serde::de::Error as SerdeError;
+use serde_json::Value as JsonValue;
 
 const RESERVED_MODEL_PROVIDER_IDS: [&str; 4] = [
     AMAZON_BEDROCK_PROVIDER_ID,
@@ -64,6 +64,89 @@ const RESERVED_MODEL_PROVIDER_IDS: [&str; 4] = [
     OLLAMA_OSS_PROVIDER_ID,
     LMSTUDIO_OSS_PROVIDER_ID,
 ];
+
+pub const DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
+
+const fn default_allow_login_shell() -> Option<bool> {
+    Some(true)
+}
+
+fn default_history() -> Option<History> {
+    Some(History::default())
+}
+
+const fn default_project_doc_max_bytes() -> Option<usize> {
+    Some(DEFAULT_PROJECT_DOC_MAX_BYTES)
+}
+
+fn default_project_doc_fallback_filenames() -> Option<Vec<String>> {
+    Some(Vec::new())
+}
+
+const fn default_hide_agent_reasoning() -> Option<bool> {
+    Some(false)
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+/// Backward-compatible shape for ChatGPT workspace login restrictions in config.toml.
+#[derive(Serialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(untagged)]
+pub enum ForcedChatgptWorkspaceIds {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl ForcedChatgptWorkspaceIds {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::Single(value) => vec![value],
+            Self::Multiple(values) => values,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ForcedChatgptWorkspaceIds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Single(String),
+            Multiple(Vec<String>),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Single(value) if value.contains(',') => Err(D::Error::custom(
+                "forced_chatgpt_workspace_id must be a single workspace ID string or a TOML list \
+of strings; comma-separated strings are not supported. Use \
+`forced_chatgpt_workspace_id = [\"123e4567-e89b-42d3-a456-426614174000\", \
+\"123e4567-e89b-42d3-a456-426614174001\"]` instead.",
+            )),
+            Repr::Single(value) => Ok(Self::Single(value)),
+            Repr::Multiple(values) => Ok(Self::Multiple(values)),
+        }
+    }
+}
+
+/// Orchestrator-owned feature settings.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct OrchestratorToml {
+    pub skills: Option<OrchestratorFeatureToml>,
+    pub mcp: Option<OrchestratorFeatureToml>,
+}
+
+/// Settings for a feature owned by the orchestrator.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct OrchestratorFeatureToml {
+    pub enabled: Option<bool>,
+}
 
 /// Base config deserialized from ~/.codex/config.toml.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
@@ -82,6 +165,10 @@ pub struct ConfigToml {
 
     /// Token usage threshold triggering auto-compaction of conversation history.
     pub model_auto_compact_token_limit: Option<i64>,
+
+    /// Controls whether the auto-compaction limit applies to the full context or
+    /// only to tokens after the carried prefix in the current compaction window.
+    pub model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,
 
     /// Default approval policy for executing commands.
     pub approval_policy: Option<AskForApproval>,
@@ -106,6 +193,7 @@ pub struct ConfigToml {
     /// If `false`, the model can never use a login shell: `login = true`
     /// requests are rejected, and omitting `login` defaults to a non-login
     /// shell.
+    #[serde(default = "default_allow_login_shell")]
     pub allow_login_shell: Option<bool>,
 
     /// Sandbox mode to use.
@@ -140,6 +228,9 @@ pub struct ConfigToml {
     /// Whether to inject the `<apps_instructions>` developer block.
     pub include_apps_instructions: Option<bool>,
 
+    /// Whether to inject the `<collaboration_mode>` developer block.
+    pub include_collaboration_mode_instructions: Option<bool>,
+
     /// Whether to inject the `<environment_context>` user block.
     pub include_environment_context: Option<bool>,
 
@@ -152,14 +243,9 @@ pub struct ConfigToml {
     /// Compact prompt used for history compaction.
     pub compact_prompt: Option<String>,
 
-    /// Optional commit attribution text for commit message co-author trailers.
-    ///
-    /// Set to an empty string to disable automatic commit attribution.
-    pub commit_attribution: Option<String>,
-
-    /// When set, restricts ChatGPT login to a specific workspace identifier.
+    /// When set, restricts ChatGPT login to one or more workspace identifiers.
     #[serde(default)]
-    pub forced_chatgpt_workspace_id: Option<String>,
+    pub forced_chatgpt_workspace_id: Option<ForcedChatgptWorkspaceIds>,
 
     /// When set, restricts the login mechanism users may use.
     #[serde(default)]
@@ -202,9 +288,11 @@ pub struct ConfigToml {
     pub model_providers: HashMap<String, ModelProviderInfo>,
 
     /// Maximum number of bytes to include from an AGENTS.md project doc file.
+    #[serde(default = "default_project_doc_max_bytes")]
     pub project_doc_max_bytes: Option<usize>,
 
     /// Ordered list of fallback filenames to look for when AGENTS.md is missing.
+    #[serde(default = "default_project_doc_fallback_filenames")]
     pub project_doc_fallback_filenames: Option<Vec<String>>,
 
     /// Token budget applied when storing tool/function outputs in the context manager.
@@ -222,9 +310,6 @@ pub struct ConfigToml {
     #[schemars(skip)]
     pub js_repl_node_module_dirs: Option<Vec<AbsolutePathBuf>>,
 
-    /// Optional absolute path to patched zsh used by zsh-exec-bridge-backed shell execution.
-    pub zsh_path: Option<AbsolutePathBuf>,
-
     /// Profile to use from the `profiles` map.
     pub profile: Option<String>,
 
@@ -233,16 +318,20 @@ pub struct ConfigToml {
     pub profiles: HashMap<String, ConfigProfile>,
 
     /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
-    #[serde(default)]
+    #[serde(default = "default_history")]
     pub history: Option<History>,
 
     /// Directory where Codex stores the SQLite state DB.
     /// Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses `$CODEX_HOME`.
     pub sqlite_home: Option<AbsolutePathBuf>,
 
-    /// Directory where Codex writes log files, for example `codex-tui.log`.
+    /// Directory where Codex writes log files. Setting this value explicitly
+    /// also enables the TUI text log in this directory.
     /// Defaults to `$CODEX_HOME/log`.
     pub log_dir: Option<AbsolutePathBuf>,
+
+    /// Debugging and reproducibility settings.
+    pub debug: Option<DebugToml>,
 
     /// Optional URI-based file opener. If set, citations to files in the model
     /// output will be hyperlinked using the specified URI scheme.
@@ -253,6 +342,7 @@ pub struct ConfigToml {
 
     /// When set to `true`, `AgentReasoning` events will be hidden from the
     /// UI/output. Defaults to `false`.
+    #[serde(default = "default_hide_agent_reasoning")]
     pub hide_agent_reasoning: Option<bool>,
 
     /// When set to `true`, `AgentReasoningRawContentEvent` events will be shown in the UI/output.
@@ -265,9 +355,6 @@ pub struct ConfigToml {
     /// Optional verbosity control for GPT-5 models (Responses API `text.verbosity`).
     pub model_verbosity: Option<Verbosity>,
 
-    /// Override to force-enable reasoning summaries for the configured model.
-    pub model_supports_reasoning_summaries: Option<bool>,
-
     /// Optional path to a JSON model catalog (applied on startup only).
     /// Per-thread `config` overrides are accepted but do not reapply this (no-ops).
     pub model_catalog_json: Option<AbsolutePathBuf>,
@@ -275,11 +362,18 @@ pub struct ConfigToml {
     /// Optionally specify a personality for the model
     pub personality: Option<Personality>,
 
-    /// Optional explicit service tier preference for new turns (`fast` or `flex`).
-    pub service_tier: Option<ServiceTier>,
+    /// Optional explicit service tier request id for new turns (for example
+    /// `default`, `priority`, or `flex`; legacy `fast` also works).
+    pub service_tier: Option<String>,
 
     /// Base URL for requests to ChatGPT (as opposed to the OpenAI API).
     pub chatgpt_base_url: Option<String>,
+
+    /// Optional product SKU forwarded on host-owned Codex Apps MCP requests.
+    pub apps_mcp_product_sku: Option<String>,
+
+    /// Orchestrator-owned feature settings.
+    pub orchestrator: Option<OrchestratorToml>,
 
     /// Base URL override for the built-in `openai` model provider.
     pub openai_base_url: Option<String>,
@@ -293,6 +387,10 @@ pub struct ConfigToml {
     /// `/v1/realtime`
     /// connection) without changing normal provider HTTP requests.
     pub experimental_realtime_ws_base_url: Option<String>,
+    /// Experimental / do not use. Overrides only the WebRTC realtime call
+    /// creation base URL. This is separate from `experimental_realtime_ws_base_url`
+    /// because WebRTC call creation is HTTP, while sideband control is websocket.
+    pub experimental_realtime_webrtc_call_base_url: Option<String>,
     /// Experimental / do not use. Selects the realtime websocket model/snapshot
     /// used for the `Op::RealtimeConversation` connection.
     pub experimental_realtime_ws_model: Option<String>,
@@ -313,19 +411,20 @@ pub struct ConfigToml {
     /// active.
     pub experimental_realtime_start_instructions: Option<String>,
 
-    /// Experimental / do not use. When set, app-server uses a remote thread
-    /// store at this endpoint instead of the local filesystem/SQLite store.
-    pub experimental_thread_store_endpoint: Option<String>,
-
     /// Experimental / do not use. When set, app-server fetches thread-scoped
     /// config from a remote service at this endpoint.
     pub experimental_thread_config_endpoint: Option<String>,
+
+    /// Removed. Former remote thread-store endpoint setting kept only so we can
+    /// fail fast instead of silently falling back to local persistence.
+    #[schemars(skip)]
+    pub experimental_thread_store_endpoint: Option<String>,
 
     /// Experimental / do not use. Selects the thread store implementation.
     pub experimental_thread_store: Option<ThreadStoreToml>,
     pub projects: Option<HashMap<String, ProjectConfig>>,
 
-    /// Controls the web search tool mode: disabled, cached, or live.
+    /// Controls the web search tool mode: disabled, cached, indexed, or live.
     pub web_search: Option<WebSearchMode>,
 
     /// Nested tools section for feature toggles
@@ -395,6 +494,10 @@ pub struct ConfigToml {
     #[serde(default)]
     pub apps: Option<AppsConfigToml>,
 
+    /// Opaque desktop settings stored alongside the rest of config.toml.
+    #[serde(default)]
+    pub desktop: Option<HashMap<String, JsonValue>>,
+
     /// OTEL configuration.
     pub otel: Option<OtelConfigToml>,
 
@@ -402,32 +505,52 @@ pub struct ConfigToml {
     #[serde(default)]
     pub windows: Option<WindowsToml>,
 
-    /// Tracks whether the Windows onboarding screen has been acknowledged.
-    pub windows_wsl_setup_acknowledged: Option<bool>,
-
     /// Collection of in-product notices (different from notifications)
     /// See [`crate::types::Notice`] for more details
     pub notice: Option<Notice>,
 
-    /// Legacy, now use features
-    /// Deprecated: ignored. Use `model_instructions_file`.
-    #[schemars(skip)]
-    pub experimental_instructions_file: Option<AbsolutePathBuf>,
     pub experimental_compact_prompt_file: Option<AbsolutePathBuf>,
     pub experimental_use_unified_exec_tool: Option<bool>,
-    pub experimental_use_freeform_apply_patch: Option<bool>,
     /// Preferred OSS provider for local models, e.g. "lmstudio" or "ollama".
     pub oss_provider: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ConfigLockfileToml {
+    pub version: u32,
+    pub codex_version: String,
+
+    /// Replayable effective config captured in the lockfile.
+    pub config: ConfigToml,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct DebugToml {
+    pub config_lockfile: Option<DebugConfigLockToml>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct DebugConfigLockToml {
+    /// Directory where Codex writes effective session config lock files.
+    pub export_dir: Option<AbsolutePathBuf>,
+
+    /// Lockfile to replay as the authoritative effective config.
+    pub load_path: Option<AbsolutePathBuf>,
+
+    /// Allow replaying a lock generated by a different Codex version.
+    pub allow_codex_version_mismatch: Option<bool>,
+
+    /// Save fields resolved from the model catalog/session configuration.
+    pub save_fields_resolved_from_model_catalog: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThreadStoreToml {
     Local {},
-    Remote {
-        endpoint: String,
-    },
-    #[cfg(debug_assertions)]
     #[schemars(skip)]
     InMemory {
         id: String,
@@ -438,31 +561,6 @@ pub enum ThreadStoreToml {
 pub struct AutoReviewToml {
     /// Additional policy instructions inserted into the guardian prompt.
     pub policy: Option<String>,
-}
-
-impl From<ConfigToml> for UserSavedConfig {
-    fn from(config_toml: ConfigToml) -> Self {
-        let profiles = config_toml
-            .profiles
-            .into_iter()
-            .map(|(k, v)| (k, v.into()))
-            .collect();
-
-        Self {
-            approval_policy: config_toml.approval_policy,
-            sandbox_mode: config_toml.sandbox_mode,
-            sandbox_settings: config_toml.sandbox_workspace_write.map(From::from),
-            forced_chatgpt_workspace_id: config_toml.forced_chatgpt_workspace_id,
-            forced_login_method: config_toml.forced_login_method,
-            model: config_toml.model,
-            model_reasoning_effort: config_toml.model_reasoning_effort,
-            model_reasoning_summary: config_toml.model_reasoning_summary,
-            model_verbosity: config_toml.model_verbosity,
-            tools: config_toml.tools.map(From::from),
-            profile: config_toml.profile,
-            profiles,
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
@@ -542,10 +640,14 @@ pub struct ToolsToml {
         deserialize_with = "deserialize_optional_web_search_tool_config"
     )]
     pub web_search: Option<WebSearchToolConfig>,
+    pub experimental_request_user_input: Option<ExperimentalRequestUserInput>,
+}
 
-    /// Enable the `view_image` tool that lets the agent attach local images.
-    #[serde(default)]
-    pub view_image: Option<bool>,
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ExperimentalRequestUserInput {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -576,14 +678,20 @@ where
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AgentsToml {
-    /// Maximum number of agent threads that can be open concurrently.
-    /// When unset, no limit is enforced.
+    /// Whether multi-agent tools are enabled. Defaults to true.
+    /// An enabled `features.multi_agent_v2` setting takes precedence.
+    pub enabled: Option<bool>,
+    /// Maximum number of spawned agent threads that can be open concurrently per session.
+    /// When unset, the selected multi-agent backend uses its default.
+    #[serde(alias = "max_threads")]
     #[schemars(range(min = 1))]
-    pub max_threads: Option<usize>,
-    /// Maximum nesting depth allowed for spawned agent threads.
-    /// Root sessions start at depth 0.
-    #[schemars(range(min = 1))]
+    pub max_concurrent_threads_per_session: Option<usize>,
+    /// Maximum nesting depth for V1 agent threads. Ignored by V2.
     pub max_depth: Option<i32>,
+    /// Default model for spawned subagents when the spawn call does not select one.
+    pub default_subagent_model: Option<String>,
+    /// Default reasoning effort for spawned subagents when the spawn call does not select one.
+    pub default_subagent_reasoning_effort: Option<ReasoningEffort>,
     /// Default maximum runtime in seconds for agent job workers.
     #[schemars(range(min = 1))]
     pub job_max_runtime_seconds: Option<u64>,
@@ -619,15 +727,6 @@ pub struct AgentRoleToml {
     pub nickname_candidates: Option<Vec<String>>,
 }
 
-impl From<ToolsToml> for Tools {
-    fn from(tools_toml: ToolsToml) -> Self {
-        Self {
-            web_search: tools_toml.web_search.is_some().then_some(true),
-            view_image: tools_toml.view_image,
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct GhostSnapshotToml {
@@ -650,36 +749,27 @@ impl ConfigToml {
     pub async fn derive_permission_profile(
         &self,
         sandbox_mode_override: Option<SandboxMode>,
-        profile_sandbox_mode: Option<SandboxMode>,
         windows_sandbox_level: WindowsSandboxLevel,
         active_project: Option<&ProjectConfig>,
         permission_profile_constraint: Option<&crate::Constrained<PermissionProfile>>,
     ) -> PermissionProfile {
-        let sandbox_mode_was_explicit = sandbox_mode_override.is_some()
-            || profile_sandbox_mode.is_some()
-            || self.sandbox_mode.is_some();
-        let resolved_sandbox_mode = sandbox_mode_override
-            .or(profile_sandbox_mode)
-            .or(self.sandbox_mode)
-            .or(if sandbox_mode_was_explicit {
-                None
-            } else {
+        let configured_sandbox_mode = sandbox_mode_override.or(self.sandbox_mode);
+        let resolved_sandbox_mode = configured_sandbox_mode
+            .or_else(|| {
                 // If no sandbox_mode is set but this directory has a trust decision,
                 // default to workspace-write except on unsandboxed Windows where we
                 // default to read-only.
-                active_project.and_then(|p| {
-                    if p.is_trusted() || p.is_untrusted() {
+                active_project
+                    .filter(|project| project.is_trusted() || project.is_untrusted())
+                    .map(|_| {
                         if cfg!(target_os = "windows")
                             && windows_sandbox_level == WindowsSandboxLevel::Disabled
                         {
-                            Some(SandboxMode::ReadOnly)
+                            SandboxMode::ReadOnly
                         } else {
-                            Some(SandboxMode::WorkspaceWrite)
+                            SandboxMode::WorkspaceWrite
                         }
-                    } else {
-                        None
-                    }
-                })
+                    })
             })
             .unwrap_or_default();
         let effective_sandbox_mode = if cfg!(target_os = "windows")
@@ -717,7 +807,7 @@ impl ConfigToml {
             },
             SandboxMode::DangerFullAccess => PermissionProfile::Disabled,
         };
-        if !sandbox_mode_was_explicit
+        if configured_sandbox_mode.is_none()
             && let Some(constraint) = permission_profile_constraint
             && let Err(err) = constraint.can_set(&permission_profile)
         {
@@ -759,27 +849,6 @@ impl ConfigToml {
 
         None
     }
-
-    pub fn get_config_profile(
-        &self,
-        override_profile: Option<String>,
-    ) -> Result<ConfigProfile, std::io::Error> {
-        let profile = override_profile.or_else(|| self.profile.clone());
-
-        match profile {
-            Some(key) => {
-                if let Some(profile) = self.profiles.get(key.as_str()) {
-                    return Ok(profile.clone());
-                }
-
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("config profile `{key}` not found"),
-                ))
-            }
-            None => Ok(ConfigProfile::default()),
-        }
-    }
 }
 
 /// Canonicalize the path and convert it to a string to be used as a key in the
@@ -820,7 +889,7 @@ fn project_config_for_lookup_key(
         .iter()
         .filter(|(key, _)| normalize_project_lookup_key((*key).clone()) == lookup_key)
         .collect();
-    normalized_matches.sort_by(|(left, _), (right, _)| left.cmp(right));
+    normalized_matches.sort_by_key(|(key, _)| *key);
     normalized_matches
         .first()
         .map(|(_, project_config)| (**project_config).clone())
@@ -898,5 +967,58 @@ pub fn validate_oss_provider(provider: &str) -> std::io::Result<()> {
                 "Invalid OSS provider '{provider}'. Must be one of: {LMSTUDIO_OSS_PROVIDER_ID}, {OLLAMA_OSS_PROVIDER_ID}"
             ),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    const WORKSPACE_ID_A: &str = "123e4567-e89b-42d3-a456-426614174000";
+    const WORKSPACE_ID_B: &str = "123e4567-e89b-42d3-a456-426614174001";
+
+    #[test]
+    fn forced_chatgpt_workspace_id_accepts_single_string() {
+        let config: ConfigToml = toml::from_str(&format!(
+            r#"forced_chatgpt_workspace_id = "{WORKSPACE_ID_A}""#
+        ))
+        .expect("single workspace id should deserialize");
+
+        assert_eq!(
+            config
+                .forced_chatgpt_workspace_id
+                .expect("workspace id should be set")
+                .into_vec(),
+            vec![WORKSPACE_ID_A.to_string()]
+        );
+    }
+
+    #[test]
+    fn forced_chatgpt_workspace_id_accepts_string_list() {
+        let config: ConfigToml = toml::from_str(&format!(
+            r#"forced_chatgpt_workspace_id = ["{WORKSPACE_ID_A}", "{WORKSPACE_ID_B}"]"#
+        ))
+        .expect("workspace id list should deserialize");
+
+        assert_eq!(
+            config
+                .forced_chatgpt_workspace_id
+                .expect("workspace ids should be set")
+                .into_vec(),
+            vec![WORKSPACE_ID_A.to_string(), WORKSPACE_ID_B.to_string()]
+        );
+    }
+
+    #[test]
+    fn forced_chatgpt_workspace_id_rejects_comma_separated_string() {
+        let err = toml::from_str::<ConfigToml>(&format!(
+            r#"forced_chatgpt_workspace_id = "{WORKSPACE_ID_A},{WORKSPACE_ID_B}""#
+        ))
+        .expect_err("comma-separated string should be rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("TOML list of strings"));
+        assert!(message.contains("comma-separated strings are not supported"));
     }
 }

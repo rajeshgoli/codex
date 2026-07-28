@@ -1,20 +1,39 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
+use super::App;
 use crate::app_command::AppCommand;
-use crate::app_command::AppCommandView;
 use crate::app_server_approval_conversions::granted_permission_profile_from_request;
+use crate::app_server_session::AppServerSession;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
-use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
-use codex_app_server_protocol::McpServerElicitationAction;
+use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::McpServerElicitationRequestResponse;
 use codex_app_server_protocol::PermissionsRequestApprovalResponse;
 use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_app_server_protocol::ServerRequest;
-use codex_app_server_protocol::ToolRequestUserInputResponse;
-use codex_protocol::mcp::RequestId as McpRequestId;
-use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequestPermissionProfile;
+
+impl App {
+    pub(super) async fn reject_app_server_request(
+        &self,
+        app_server_client: &AppServerSession,
+        request_id: AppServerRequestId,
+        reason: String,
+    ) -> std::result::Result<(), String> {
+        app_server_client
+            .reject_server_request(
+                request_id,
+                JSONRPCErrorError {
+                    code: -32000,
+                    message: reason,
+                    data: None,
+                },
+            )
+            .await
+            .map_err(|err| format!("failed to reject app-server request: {err}"))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AppServerRequestResolution {
@@ -44,7 +63,7 @@ pub(crate) enum ResolvedAppServerRequest {
     },
     McpElicitation {
         server_name: String,
-        request_id: McpRequestId,
+        request_id: AppServerRequestId,
     },
 }
 
@@ -54,7 +73,7 @@ pub(super) struct PendingAppServerRequests {
     file_change_approvals: HashMap<String, AppServerRequestId>,
     permissions_approvals: HashMap<String, AppServerRequestId>,
     user_inputs: HashMap<String, VecDeque<PendingUserInputRequest>>,
-    mcp_requests: HashMap<McpLegacyRequestKey, AppServerRequestId>,
+    mcp_requests: HashMap<McpRequestKey, AppServerRequestId>,
 }
 
 impl PendingAppServerRequests {
@@ -85,6 +104,18 @@ impl PendingAppServerRequests {
                 None
             }
             ServerRequest::PermissionsRequestApproval { request_id, params } => {
+                // TODO(anp): Remove this duplicate validation once core permission paths remain
+                // PathUri after crossing the app-server boundary. Native permission paths do not
+                // yet have an ingress validation step, so validate them here before recording the
+                // request as pending. Discovering an invalid path later in a UI delivery path
+                // would leave the app-server RPC waiting without a clean rejection path.
+                if let Err(err) = CoreRequestPermissionProfile::try_from(params.permissions.clone())
+                {
+                    return Some(UnsupportedAppServerRequest {
+                        request_id: request_id.clone(),
+                        message: format!("failed to localize requested filesystem paths: {err}"),
+                    });
+                }
                 self.permissions_approvals
                     .insert(params.item_id.clone(), request_id.clone());
                 None
@@ -101,9 +132,9 @@ impl PendingAppServerRequests {
             }
             ServerRequest::McpServerElicitationRequest { request_id, params } => {
                 self.mcp_requests.insert(
-                    McpLegacyRequestKey {
+                    McpRequestKey {
                         server_name: params.server_name.clone(),
-                        request_id: app_server_request_id_to_mcp_request_id(request_id),
+                        request_id: request_id.clone(),
                     },
                     request_id.clone(),
                 );
@@ -116,6 +147,18 @@ impl PendingAppServerRequests {
                 })
             }
             ServerRequest::ChatgptAuthTokensRefresh { .. } => None,
+            ServerRequest::AttestationGenerate { request_id, .. } => {
+                Some(UnsupportedAppServerRequest {
+                    request_id: request_id.clone(),
+                    message: "Attestation generation is not available in TUI.".to_string(),
+                })
+            }
+            ServerRequest::CurrentTimeRead { request_id, .. } => {
+                Some(UnsupportedAppServerRequest {
+                    request_id: request_id.clone(),
+                    message: "External current time is not available in TUI.".to_string(),
+                })
+            }
             ServerRequest::ApplyPatchApproval { request_id, .. } => {
                 Some(UnsupportedAppServerRequest {
                     request_id: request_id.clone(),
@@ -141,30 +184,32 @@ impl PendingAppServerRequests {
         T: Into<AppCommand>,
     {
         let op: AppCommand = op.into();
-        let resolution = match op.view() {
-            AppCommandView::ExecApproval { id, decision, .. } => self
+        let resolution = match &op {
+            AppCommand::ExecApproval { id, decision, .. } => self
                 .exec_approvals
                 .remove(id)
                 .map(|request_id| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
                         request_id,
                         result: serde_json::to_value(CommandExecutionRequestApprovalResponse {
-                            decision: decision.clone().into(),
+                            decision: decision.clone(),
                         })
                         .map_err(|err| {
-                            format!("failed to serialize command execution approval response: {err}")
+                            format!(
+                                "failed to serialize command execution approval response: {err}"
+                            )
                         })?,
                     })
                 })
                 .transpose()?,
-            AppCommandView::PatchApproval { id, decision } => self
+            AppCommand::PatchApproval { id, decision } => self
                 .file_change_approvals
                 .remove(id)
                 .map(|request_id| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
                         request_id,
                         result: serde_json::to_value(FileChangeRequestApprovalResponse {
-                            decision: file_change_decision(decision)?,
+                            decision: decision.clone(),
                         })
                         .map_err(|err| {
                             format!("failed to serialize file change approval response: {err}")
@@ -172,7 +217,7 @@ impl PendingAppServerRequests {
                     })
                 })
                 .transpose()?,
-            AppCommandView::RequestPermissionsResponse { id, response } => self
+            AppCommand::RequestPermissionsResponse { id, response } => self
                 .permissions_approvals
                 .remove(id)
                 .map(|request_id| {
@@ -191,30 +236,18 @@ impl PendingAppServerRequests {
                     })
                 })
                 .transpose()?,
-            AppCommandView::UserInputAnswer { id, response } => self
+            AppCommand::UserInputAnswer { id, response } => self
                 .pop_user_input_request_for_turn(id)
                 .map(|pending| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
                         request_id: pending.request_id,
-                        result: serde_json::to_value(
-                            serde_json::from_value::<ToolRequestUserInputResponse>(
-                                serde_json::to_value(response).map_err(|err| {
-                                    format!("failed to encode request_user_input response: {err}")
-                                })?,
-                            )
-                            .map_err(|err| {
-                                format!(
-                                    "failed to decode request_user_input response for app-server: {err}"
-                                )
-                            })?,
-                        )
-                        .map_err(|err| {
+                        result: serde_json::to_value(response).map_err(|err| {
                             format!("failed to serialize request_user_input response: {err}")
                         })?,
                     })
                 })
                 .transpose()?,
-            AppCommandView::ResolveElicitation {
+            AppCommand::ResolveElicitation {
                 server_name,
                 request_id,
                 decision,
@@ -222,7 +255,7 @@ impl PendingAppServerRequests {
                 meta,
             } => self
                 .mcp_requests
-                .remove(&McpLegacyRequestKey {
+                .remove(&McpRequestKey {
                     server_name: server_name.to_string(),
                     request_id: request_id.clone(),
                 })
@@ -230,17 +263,7 @@ impl PendingAppServerRequests {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
                         request_id,
                         result: serde_json::to_value(McpServerElicitationRequestResponse {
-                            action: match decision {
-                                codex_protocol::approvals::ElicitationAction::Accept => {
-                                    McpServerElicitationAction::Accept
-                                }
-                                codex_protocol::approvals::ElicitationAction::Decline => {
-                                    McpServerElicitationAction::Decline
-                                }
-                                codex_protocol::approvals::ElicitationAction::Cancel => {
-                                    McpServerElicitationAction::Cancel
-                                }
-                            },
+                            action: *decision,
                             content: content.clone(),
                             meta: meta.clone(),
                         })
@@ -334,6 +357,8 @@ impl PendingAppServerRequests {
                 .any(|pending_request_id| pending_request_id == request_id),
             ServerRequest::DynamicToolCall { .. }
             | ServerRequest::ChatgptAuthTokensRefresh { .. }
+            | ServerRequest::AttestationGenerate { .. }
+            | ServerRequest::CurrentTimeRead { .. }
             | ServerRequest::ApplyPatchApproval { .. }
             | ServerRequest::ExecCommandApproval { .. } => true,
         }
@@ -383,44 +408,26 @@ struct PendingUserInputRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct McpLegacyRequestKey {
+struct McpRequestKey {
     server_name: String,
-    request_id: McpRequestId,
-}
-
-fn app_server_request_id_to_mcp_request_id(request_id: &AppServerRequestId) -> McpRequestId {
-    match request_id {
-        AppServerRequestId::String(value) => McpRequestId::String(value.clone()),
-        AppServerRequestId::Integer(value) => McpRequestId::Integer(*value),
-    }
-}
-
-fn file_change_decision(decision: &ReviewDecision) -> Result<FileChangeApprovalDecision, String> {
-    match decision {
-        ReviewDecision::Approved => Ok(FileChangeApprovalDecision::Accept),
-        ReviewDecision::ApprovedForSession => Ok(FileChangeApprovalDecision::AcceptForSession),
-        ReviewDecision::Denied => Ok(FileChangeApprovalDecision::Decline),
-        ReviewDecision::TimedOut => Ok(FileChangeApprovalDecision::Decline),
-        ReviewDecision::Abort => Ok(FileChangeApprovalDecision::Cancel),
-        ReviewDecision::ApprovedExecpolicyAmendment { .. } => {
-            Err("execpolicy amendment is not a valid file change approval decision".to_string())
-        }
-        ReviewDecision::NetworkPolicyAmendment { .. } => {
-            Err("network policy amendment is not a valid file change approval decision".to_string())
-        }
-    }
+    request_id: AppServerRequestId,
 }
 
 #[cfg(test)]
 mod tests {
     use super::PendingAppServerRequests;
     use super::ResolvedAppServerRequest;
+    use super::UnsupportedAppServerRequest;
+    use crate::app_command::AppCommand as Op;
     use codex_app_server_protocol::AdditionalFileSystemPermissions;
     use codex_app_server_protocol::AdditionalNetworkPermissions;
+    use codex_app_server_protocol::CommandExecutionApprovalDecision;
     use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
+    use codex_app_server_protocol::FileChangeApprovalDecision;
     use codex_app_server_protocol::FileChangeRequestApprovalParams;
     use codex_app_server_protocol::McpElicitationObjectType;
     use codex_app_server_protocol::McpElicitationSchema;
+    use codex_app_server_protocol::McpServerElicitationAction;
     use codex_app_server_protocol::McpServerElicitationRequest;
     use codex_app_server_protocol::McpServerElicitationRequestParams;
     use codex_app_server_protocol::PermissionGrantScope;
@@ -431,13 +438,8 @@ mod tests {
     use codex_app_server_protocol::ToolRequestUserInputAnswer;
     use codex_app_server_protocol::ToolRequestUserInputParams;
     use codex_app_server_protocol::ToolRequestUserInputResponse;
-    use codex_protocol::approvals::ElicitationAction;
-    use codex_protocol::approvals::ExecPolicyAmendment;
-    use codex_protocol::mcp::RequestId as McpRequestId;
     use codex_protocol::models::FileSystemPermissions;
     use codex_protocol::models::NetworkPermissions;
-    use codex_protocol::protocol::Op;
-    use codex_protocol::protocol::ReviewDecision;
     use codex_protocol::request_permissions::RequestPermissionProfile;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
@@ -455,7 +457,9 @@ mod tests {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 item_id: "call-1".to_string(),
+                started_at_ms: 0,
                 approval_id: Some("approval-1".to_string()),
+                environment_id: None,
                 reason: None,
                 network_approval_context: None,
                 command: Some("ls".to_string()),
@@ -474,13 +478,61 @@ mod tests {
             .take_resolution(&Op::ExecApproval {
                 id: "approval-1".to_string(),
                 turn_id: None,
-                decision: ReviewDecision::Approved,
+                decision: CommandExecutionApprovalDecision::Accept,
             })
             .expect("resolution should serialize")
             .expect("request should be pending");
 
         assert_eq!(resolution.request_id, AppServerRequestId::Integer(41));
         assert_eq!(resolution.result, json!({ "decision": "accept" }));
+    }
+
+    #[test]
+    fn rejects_permissions_with_paths_that_cannot_be_localized() {
+        let mut pending = PendingAppServerRequests::default();
+        let request_id = AppServerRequestId::Integer(7);
+        let permissions = codex_app_server_protocol::RequestPermissionProfile {
+            network: None,
+            file_system: Some(AdditionalFileSystemPermissions {
+                read: Some(vec![
+                    serde_json::from_value(json!("relative/path"))
+                        .expect("relative API path should deserialize"),
+                ]),
+                write: None,
+                glob_scan_max_depth: None,
+                entries: None,
+            }),
+        };
+        let localization_error =
+            RequestPermissionProfile::try_from(permissions.clone()).expect_err("relative path");
+        let cwd = AbsolutePathBuf::try_from(PathBuf::from(if cfg!(windows) {
+            r"C:\tmp"
+        } else {
+            "/tmp"
+        }))
+        .expect("path must be absolute");
+
+        assert_eq!(
+            pending.note_server_request(&ServerRequest::PermissionsRequestApproval {
+                request_id: request_id.clone(),
+                params: PermissionsRequestApprovalParams {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "perm-1".to_string(),
+                    environment_id: None,
+                    started_at_ms: 0,
+                    cwd,
+                    reason: None,
+                    permissions,
+                },
+            }),
+            Some(UnsupportedAppServerRequest {
+                request_id,
+                message: format!(
+                    "failed to localize requested filesystem paths: {localization_error}"
+                ),
+            })
+        );
     }
 
     #[test]
@@ -507,6 +559,8 @@ mod tests {
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-1".to_string(),
                     item_id: "perm-1".to_string(),
+                    environment_id: None,
+                    started_at_ms: 0,
                     cwd: absolute_path(if cfg!(windows) { r"C:\tmp" } else { "/tmp" }),
                     reason: None,
                     permissions: serde_json::from_value(json!({
@@ -525,6 +579,7 @@ mod tests {
                     turn_id: "turn-2".to_string(),
                     item_id: "tool-1".to_string(),
                     questions: Vec::new(),
+                    auto_resolution_ms: None,
                 },
             }),
             None
@@ -559,19 +614,19 @@ mod tests {
                         enabled: Some(true),
                     }),
                     file_system: Some(AdditionalFileSystemPermissions {
-                        read: Some(vec![absolute_path(read_path)]),
-                        write: Some(vec![absolute_path(write_path)]),
+                        read: Some(vec![absolute_path(read_path).into()]),
+                        write: Some(vec![absolute_path(write_path).into()]),
                         glob_scan_max_depth: None,
                         entries: Some(vec![
                             codex_app_server_protocol::FileSystemSandboxEntry {
                                 path: codex_app_server_protocol::FileSystemPath::Path {
-                                    path: absolute_path(read_path),
+                                    path: absolute_path(read_path).into(),
                                 },
                                 access: codex_app_server_protocol::FileSystemAccessMode::Read,
                             },
                             codex_app_server_protocol::FileSystemSandboxEntry {
                                 path: codex_app_server_protocol::FileSystemPath::Path {
-                                    path: absolute_path(write_path),
+                                    path: absolute_path(write_path).into(),
                                 },
                                 access: codex_app_server_protocol::FileSystemAccessMode::Write,
                             },
@@ -586,10 +641,10 @@ mod tests {
         let user_input = pending
             .take_resolution(&Op::UserInputAnswer {
                 id: "turn-2".to_string(),
-                response: codex_protocol::request_user_input::RequestUserInputResponse {
+                response: ToolRequestUserInputResponse {
                     answers: std::iter::once((
                         "question".to_string(),
-                        codex_protocol::request_user_input::RequestUserInputAnswer {
+                        ToolRequestUserInputAnswer {
                             answers: vec!["yes".to_string()],
                         },
                     ))
@@ -643,8 +698,8 @@ mod tests {
         let resolution = pending
             .take_resolution(&Op::ResolveElicitation {
                 server_name: "example".to_string(),
-                request_id: McpRequestId::Integer(12),
-                decision: ElicitationAction::Accept,
+                request_id: AppServerRequestId::Integer(12),
+                decision: McpServerElicitationAction::Accept,
                 content: Some(json!({ "answer": "yes" })),
                 meta: Some(json!({ "source": "tui" })),
             })
@@ -703,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_patch_decisions_for_file_change_requests() {
+    fn resolves_patch_approval_through_app_server_request_id() {
         let mut pending = PendingAppServerRequests::default();
         assert_eq!(
             pending.note_server_request(&ServerRequest::FileChangeRequestApproval {
@@ -712,6 +767,7 @@ mod tests {
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-1".to_string(),
                     item_id: "patch-1".to_string(),
+                    started_at_ms: 0,
                     reason: None,
                     grant_root: None,
                 },
@@ -719,22 +775,16 @@ mod tests {
             None
         );
 
-        let error = pending
+        let resolution = pending
             .take_resolution(&Op::PatchApproval {
                 id: "patch-1".to_string(),
-                decision: ReviewDecision::ApprovedExecpolicyAmendment {
-                    proposed_execpolicy_amendment: ExecPolicyAmendment::new(vec![
-                        "echo".to_string(),
-                        "hi".to_string(),
-                    ]),
-                },
+                decision: FileChangeApprovalDecision::Cancel,
             })
-            .expect_err("invalid patch decision should fail");
+            .expect("resolution should serialize")
+            .expect("request should be pending");
 
-        assert_eq!(
-            error,
-            "execpolicy amendment is not a valid file change approval decision"
-        );
+        assert_eq!(resolution.request_id, AppServerRequestId::Integer(13));
+        assert_eq!(resolution.result, json!({ "decision": "cancel" }));
     }
 
     #[test]
@@ -747,7 +797,9 @@ mod tests {
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),
+                    started_at_ms: 0,
                     approval_id: Some("approval-1".to_string()),
+                    environment_id: None,
                     reason: None,
                     network_approval_context: None,
                     command: Some("ls".to_string()),
@@ -803,7 +855,7 @@ mod tests {
             pending.resolve_notification(&AppServerRequestId::Integer(12)),
             Some(ResolvedAppServerRequest::McpElicitation {
                 server_name: "example".to_string(),
-                request_id: McpRequestId::Integer(12),
+                request_id: AppServerRequestId::Integer(12),
             })
         );
     }
@@ -818,6 +870,7 @@ mod tests {
                 turn_id: "turn-1".to_string(),
                 item_id: "tool-1".to_string(),
                 questions: Vec::new(),
+                auto_resolution_ms: None,
             },
         });
 
@@ -840,11 +893,12 @@ mod tests {
                     turn_id: "turn-1".to_string(),
                     item_id: item_id.to_string(),
                     questions: Vec::new(),
+                    auto_resolution_ms: None,
                 },
             });
         }
 
-        let response = codex_protocol::request_user_input::RequestUserInputResponse {
+        let response = ToolRequestUserInputResponse {
             answers: HashMap::new(),
         };
         let first_response = pending

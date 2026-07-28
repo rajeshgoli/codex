@@ -12,70 +12,68 @@ use std::path::PathBuf;
 
 use codex_app_server_protocol::AddCreditsNudgeCreditType;
 use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
-use codex_app_server_protocol::AppInfo;
+use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
+use codex_app_server_protocol::GetAccountRateLimitsResponse;
+use codex_app_server_protocol::GetAccountTokenUsageResponse;
 use codex_app_server_protocol::MarketplaceAddResponse;
+use codex_app_server_protocol::MarketplaceRemoveResponse;
+use codex_app_server_protocol::MarketplaceUpgradeResponse;
 use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::McpServerStatusDetail;
 use codex_app_server_protocol::PluginInstallResponse;
 use codex_app_server_protocol::PluginListResponse;
+use codex_app_server_protocol::PluginMarketplaceEntry;
 use codex_app_server_protocol::PluginReadParams;
 use codex_app_server_protocol::PluginReadResponse;
 use codex_app_server_protocol::PluginUninstallResponse;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadGoalStatus;
+use codex_connectors::AppInfo;
 use codex_file_search::FileMatch;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
-use codex_protocol::protocol::GetHistoryEntryResponseEvent;
-use codex_protocol::protocol::RateLimitSnapshot;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::ApprovalPreset;
 
 use crate::app_command::AppCommand;
+use crate::app_server_session::AppServerStartedThread;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::chatwidget::UserMessage;
+use crate::goal_files::GoalDraft;
+use codex_app_server_protocol::AskForApproval;
 use codex_config::types::ApprovalsReviewer;
 use codex_features::Feature;
 use codex_plugin::PluginCapabilitySummary;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::Personality;
-use codex_protocol::config_types::ServiceTier;
-use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::protocol::AskForApproval;
-use codex_realtime_webrtc::RealtimeWebrtcEvent;
-use codex_realtime_webrtc::RealtimeWebrtcSessionHandle;
 
 use crate::history_cell::HistoryCell;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RealtimeAudioDeviceKind {
-    Microphone,
-    Speaker,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadGoalSetMode {
     ConfirmIfExists,
     ReplaceExisting,
+    UpdateExisting {
+        status: ThreadGoalStatus,
+        token_budget: Option<i64>,
+    },
 }
 
-impl RealtimeAudioDeviceKind {
-    pub(crate) fn title(self) -> &'static str {
-        match self {
-            Self::Microphone => "Microphone",
-            Self::Speaker => "Speaker",
-        }
-    }
+#[derive(Debug, Clone)]
+pub(crate) struct HistoryLookupResponse {
+    pub(crate) offset: usize,
+    pub(crate) log_id: u64,
+    pub(crate) entry: Option<String>,
+}
 
-    pub(crate) fn noun(self) -> &'static str {
-        match self {
-            Self::Microphone => "microphone",
-            Self::Speaker => "speaker",
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsolidationScrollbackReflow {
+    IfResizeReflowRan,
+    Required,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,21 +89,52 @@ pub(crate) struct ConnectorsSnapshot {
     pub(crate) connectors: Vec<AppInfo>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PluginLocation {
+    Local { marketplace_path: AbsolutePathBuf },
+    Remote { marketplace_name: String },
+}
+
+impl PluginLocation {
+    pub(crate) fn into_request_params(self) -> (Option<AbsolutePathBuf>, Option<String>) {
+        match self {
+            PluginLocation::Local { marketplace_path } => (Some(marketplace_path), None),
+            PluginLocation::Remote { marketplace_name } => (None, Some(marketplace_name)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PluginRemoteSectionError {
+    pub(crate) section_id: String,
+    pub(crate) label: String,
+    pub(crate) message: String,
+}
+
 /// Distinguishes why a rate-limit refresh was requested so the completion
 /// handler can route the result correctly.
 ///
 /// A `StartupPrefetch` fires once, concurrently with the rest of TUI init, and
-/// only updates the cached snapshots (no status card to finalize). A
-/// `StatusCommand` is tied to a specific `/status` invocation and must call
-/// `finish_status_rate_limit_refresh` when done so the card stops showing a
-/// "refreshing" state.
+/// updates the cached snapshots and any available reset-credit notice (no
+/// status card to finalize). A `StatusCommand` is tied to a specific `/status`
+/// invocation and must call `finish_status_rate_limit_refresh` when done so the
+/// card stops showing a "refreshing" state. A `UsageMenu` refreshes a cached
+/// zero reset count so the disabled menu entry can become available without a
+/// restart. A `ResetPicker` refreshes the rate limits and detailed reset-credit
+/// rows before showing redemption choices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RateLimitRefreshOrigin {
-    /// Eagerly fetched after bootstrap so the first `/status` already has data.
-    StartupPrefetch,
+    /// Eagerly fetched after bootstrap for `/status` data and reset availability.
+    StartupPrefetch { reset_hint_request_id: u64 },
     /// User-initiated via `/status`; the `request_id` correlates with the
     /// status card that should be updated when the fetch completes.
     StatusCommand { request_id: u64 },
+    /// User reopened `/usage` while the cached reset-credit count was zero.
+    UsageMenu { request_id: u64 },
+    /// User opened the reset-credit picker.
+    ResetPicker { request_id: u64 },
+    /// Refresh requested after a reset credit was successfully consumed.
+    ResetConsume { request_id: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,18 +164,56 @@ pub(crate) enum AppEvent {
         op: AppCommand,
     },
 
+    /// Interrupt, fork, and retry a safety-buffered turn with the server-selected model.
+    RetrySafetyBufferedTurn {
+        thread_id: ThreadId,
+        turn_id: String,
+        model: String,
+        turn: AppCommand,
+        prompt: UserMessage,
+    },
+
     /// Deliver a synthetic history lookup response to a specific thread channel.
     ThreadHistoryEntryResponse {
         thread_id: ThreadId,
-        event: GetHistoryEntryResponseEvent,
+        event: HistoryLookupResponse,
+    },
+
+    /// Persist a submitted prompt in the cross-session message history.
+    AppendMessageHistoryEntry {
+        thread_id: ThreadId,
+        text: String,
+    },
+
+    /// Persist a branch discovered from an App git-action directive into thread metadata.
+    SyncThreadGitBranch {
+        thread_id: ThreadId,
+        branch: String,
+    },
+
+    /// Fetch a persistent cross-session message history entry by offset.
+    LookupMessageHistoryEntry {
+        thread_id: ThreadId,
+        offset: usize,
+        log_id: u64,
     },
 
     /// Start a new session.
     NewSession,
 
+    /// Result of the fresh startup thread that is attached after the input UI is live.
+    StartupThreadStarted {
+        result: Result<AppServerStartedThread, String>,
+    },
+
     /// Clear the terminal UI (screen + scrollback), start a fresh session, and keep the
     /// previous chat resumable.
     ClearUi,
+
+    /// Re-render the transcript using the selected scrollback rendering mode.
+    RawOutputModeChanged {
+        enabled: bool,
+    },
 
     /// Clear the current context, start a fresh session, and submit an initial user message.
     ///
@@ -159,11 +226,27 @@ pub(crate) enum AppEvent {
     /// Open the resume picker inside the running TUI session.
     OpenResumePicker,
 
+    /// Open the Claude Code migration picker inside the running TUI session.
+    OpenExternalAgentConfigMigration,
+
     /// Resume a thread by UUID or thread name inside the running TUI session.
     ResumeSessionByIdOrName(String),
 
+    /// Archive the current active main thread and exit after it succeeds.
+    ArchiveCurrentThread,
+
+    /// Permanently delete the current active main thread and exit after it succeeds.
+    DeleteCurrentThread,
+
     /// Fork the current session into a new thread.
     ForkCurrentSession,
+
+    /// Branch before a selected prompt and reopen it in the new thread's composer.
+    ForkSessionForPromptEdit {
+        thread_id: ThreadId,
+        nth_user_message: usize,
+        prompt: UserMessage,
+    },
 
     /// Request to exit the application.
     ///
@@ -180,7 +263,7 @@ pub(crate) enum AppEvent {
     #[allow(dead_code)]
     FatalExitRequest(String),
 
-    /// Forward an `Op` to the Agent. Using an `AppEvent` for this avoids
+    /// Forward a command to the Agent. Using an `AppEvent` for this avoids
     /// bubbling channels through layers of widgets.
     CodexOp(AppCommand),
 
@@ -213,10 +296,15 @@ pub(crate) enum AppEvent {
         thread_id: ThreadId,
     },
 
-    /// Set or replace the current thread goal objective.
-    SetThreadGoalObjective {
+    /// Open an editor for the current thread goal objective.
+    OpenThreadGoalEditor {
+        thread_id: Option<ThreadId>,
+    },
+
+    /// Materialize and set or replace the current thread goal objective.
+    SetThreadGoalDraft {
         thread_id: ThreadId,
-        objective: String,
+        draft: GoalDraft,
         mode: ThreadGoalSetMode,
     },
 
@@ -234,8 +322,51 @@ pub(crate) enum AppEvent {
     /// Result of refreshing rate limits.
     RateLimitsLoaded {
         origin: RateLimitRefreshOrigin,
-        result: Result<Vec<RateLimitSnapshot>, String>,
+        hard_stop_generation: u64,
+        result: Result<GetAccountRateLimitsResponse, String>,
     },
+
+    /// Open the default token-activity view selected from the `/usage` menu.
+    OpenTokenActivity,
+
+    /// Open the reset-credit flow selected from the `/usage` menu.
+    OpenRateLimitResetCredits,
+
+    /// Consume one reset credit using a stable idempotency key.
+    ConsumeRateLimitResetCredit {
+        idempotency_key: String,
+        credit_id: Option<String>,
+    },
+
+    /// Result of consuming one reset credit.
+    RateLimitResetCreditConsumed {
+        request_id: u64,
+        idempotency_key: String,
+        credit_id: Option<String>,
+        result: Result<ConsumeAccountRateLimitResetCreditResponse, String>,
+    },
+
+    /// Fetch account-wide token activity for a `/usage` history card.
+    RefreshTokenActivity {
+        request_id: u64,
+    },
+
+    /// Result of fetching account-wide token activity.
+    TokenActivityLoaded {
+        request_id: u64,
+        result: Result<GetAccountTokenUsageResponse, String>,
+    },
+
+    /// Fetch workspace messages for the status-line headline item.
+    RefreshStatusLineWorkspaceHeadline {
+        request_id: u64,
+    },
+
+    /// Commit settled asynchronous usage output after active-output barriers clear.
+    CommitPendingUsageOutput,
+
+    /// Commit settled asynchronous usage output after stream shutdown.
+    CommitPendingUsageOutputAfterStreamShutdown,
 
     /// Send a user-confirmed request to notify the workspace owner.
     SendAddCreditsNudgeEmail {
@@ -272,8 +403,50 @@ pub(crate) enum AppEvent {
         url: String,
     },
 
+    /// Open the current thread in Codex Desktop.
+    OpenDesktopThread {
+        thread_id: ThreadId,
+    },
+
+    /// Persist a pet selection and reload the ambient pet.
+    PetSelected {
+        pet_id: String,
+    },
+
+    /// Persist terminal pets as disabled and remove the ambient pet.
+    PetDisabled,
+
+    /// Start loading the side preview for the pet picker.
+    PetPreviewRequested {
+        pet_id: String,
+    },
+
+    /// Result of loading the side preview for the pet picker.
+    PetPreviewLoaded {
+        request_id: u64,
+        result: Result<crate::pets::AmbientPet, String>,
+    },
+
+    /// Result of loading the selected ambient pet before config persistence.
+    PetSelectionLoaded {
+        request_id: u64,
+        pet_id: String,
+        result: Result<Option<crate::pets::AmbientPet>, String>,
+    },
+
+    /// Result of restoring the configured ambient pet during startup.
+    ConfiguredPetLoaded {
+        pet_id: String,
+        result: Result<Option<crate::pets::AmbientPet>, String>,
+    },
+
     /// Refresh app connector state and mention bindings.
     RefreshConnectors {
+        force_refetch: bool,
+    },
+
+    /// Fetch app connector state from the app server after the widget accepts a refresh request.
+    FetchConnectorsList {
         force_refetch: bool,
     },
 
@@ -282,10 +455,34 @@ pub(crate) enum AppEvent {
         cwd: PathBuf,
     },
 
+    /// Fetch lifecycle hook inventory for the provided working directory.
+    FetchHooksList {
+        cwd: PathBuf,
+    },
+
     /// Result of fetching plugin marketplace state.
     PluginsLoaded {
         cwd: PathBuf,
         result: Result<PluginListResponse, String>,
+    },
+
+    /// Open the plugin list from an already cached response.
+    OpenPluginsList {
+        cwd: PathBuf,
+        response: PluginListResponse,
+    },
+
+    /// Result of explicitly fetching remote-backed plugin sections.
+    PluginRemoteSectionsLoaded {
+        cwd: PathBuf,
+        marketplaces: Vec<PluginMarketplaceEntry>,
+        section_errors: Vec<PluginRemoteSectionError>,
+    },
+
+    /// Result of fetching lifecycle hook inventory.
+    HooksLoaded {
+        cwd: PathBuf,
+        result: Result<codex_app_server_protocol::HooksListResponse, String>,
     },
 
     /// Open the prompt for adding a marketplace source.
@@ -307,6 +504,49 @@ pub(crate) enum AppEvent {
         cwd: PathBuf,
         source: String,
         result: Result<MarketplaceAddResponse, String>,
+    },
+
+    /// Open the confirmation prompt for removing a marketplace.
+    OpenMarketplaceRemoveConfirm {
+        marketplace_name: String,
+        marketplace_display_name: String,
+    },
+
+    /// Replace the plugins popup with a marketplace-remove loading state.
+    OpenMarketplaceRemoveLoading {
+        marketplace_display_name: String,
+    },
+
+    /// Remove a marketplace by name.
+    FetchMarketplaceRemove {
+        cwd: PathBuf,
+        marketplace_name: String,
+        marketplace_display_name: String,
+    },
+
+    /// Result of removing a marketplace.
+    MarketplaceRemoveLoaded {
+        cwd: PathBuf,
+        marketplace_name: String,
+        marketplace_display_name: String,
+        result: Result<MarketplaceRemoveResponse, String>,
+    },
+
+    /// Replace the plugins popup with a marketplace-upgrade loading state.
+    OpenMarketplaceUpgradeLoading {
+        marketplace_name: Option<String>,
+    },
+
+    /// Upgrade configured Git marketplaces.
+    FetchMarketplaceUpgrade {
+        cwd: PathBuf,
+        marketplace_name: Option<String>,
+    },
+
+    /// Result of upgrading configured Git marketplaces.
+    MarketplaceUpgradeLoaded {
+        cwd: PathBuf,
+        result: Result<MarketplaceUpgradeResponse, String>,
     },
 
     /// Replace the plugins popup with a plugin-detail loading state.
@@ -339,7 +579,7 @@ pub(crate) enum AppEvent {
     /// Install a specific plugin from a marketplace.
     FetchPluginInstall {
         cwd: PathBuf,
-        marketplace_path: AbsolutePathBuf,
+        location: PluginLocation,
         plugin_name: String,
         plugin_display_name: String,
     },
@@ -347,7 +587,7 @@ pub(crate) enum AppEvent {
     /// Result of installing a plugin.
     PluginInstallLoaded {
         cwd: PathBuf,
-        marketplace_path: AbsolutePathBuf,
+        location: PluginLocation,
         plugin_name: String,
         plugin_display_name: String,
         result: Result<PluginInstallResponse, String>,
@@ -402,12 +642,14 @@ pub(crate) enum AppEvent {
     /// Fetch MCP inventory via app-server RPCs and render it into history.
     FetchMcpInventory {
         detail: McpServerStatusDetail,
+        thread_id: Option<ThreadId>,
     },
 
     /// Result of fetching MCP inventory via app-server RPCs.
     McpInventoryLoaded {
         result: Result<Vec<McpServerStatus>, String>,
         detail: McpServerStatusDetail,
+        thread_id: Option<ThreadId>,
     },
 
     /// Result of the startup skills refresh that runs after the first frame is scheduled.
@@ -422,6 +664,10 @@ pub(crate) enum AppEvent {
     /// Begin buffering initial resume replay rows before they are written to scrollback.
     BeginInitialHistoryReplayBuffer,
 
+    /// Begin buffering thread-switch replay cells so the final scrollback write can reuse the
+    /// resize-reflow tail renderer.
+    BeginThreadSwitchHistoryReplayBuffer,
+
     InsertHistoryCell(Box<dyn HistoryCell>),
 
     /// Finish buffering initial resume replay after all replay events have been queued.
@@ -435,9 +681,15 @@ pub(crate) enum AppEvent {
     /// finalization. The `App` handler walks backward through `transcript_cells`
     /// to find the `AgentMessageCell` run and splices in the consolidated cell.
     /// The `cwd` keeps local file-link display stable across the final re-render.
+    /// `scrollback_reflow` lets table-tail finalization force the already-emitted
+    /// terminal scrollback to be rebuilt from the consolidated source-backed cell.
+    /// `deferred_history_cell` lets callers add the final stream tail to the
+    /// transcript without first writing its provisional render to scrollback.
     ConsolidateAgentMessage {
         source: String,
         cwd: PathBuf,
+        scrollback_reflow: ConsolidationScrollbackReflow,
+        deferred_history_cell: Option<Box<dyn HistoryCell>>,
     },
 
     /// Replace the contiguous run of streaming `ProposedPlanStreamCell`s at the
@@ -446,15 +698,6 @@ pub(crate) enum AppEvent {
     /// Emitted by `ChatWidget::on_plan_item_completed` after plan stream
     /// finalization.
     ConsolidateProposedPlan(String),
-
-    /// Apply rollback semantics to local transcript cells.
-    ///
-    /// This is emitted when rollback was not initiated by the current
-    /// backtrack flow so trimming occurs in AppEvent queue order relative to
-    /// inserted history cells.
-    ApplyThreadRollback {
-        num_turns: u32,
-    },
 
     StartCommitAnimation,
     StopCommitAnimation,
@@ -466,11 +709,13 @@ pub(crate) enum AppEvent {
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),
 
-    /// Update the active collaboration mask in the running app and widget.
-    UpdateCollaborationMode(CollaborationModeMask),
-
     /// Update the current personality in the running app and widget.
     UpdatePersonality(Personality),
+
+    /// Finish a settings selection after its preceding update events have been applied.
+    SettingsSelectionClosed,
+    /// Run after any nested settings events emitted while handling the close event.
+    SettingsSelectionSettled,
 
     /// Persist the selected model and reasoning effort to the appropriate config.
     PersistModelSelection {
@@ -485,40 +730,23 @@ pub(crate) enum AppEvent {
 
     /// Persist the selected service tier to the appropriate config.
     PersistServiceTierSelection {
-        service_tier: Option<ServiceTier>,
+        service_tier: Option<String>,
     },
-
-    /// Open the device picker for a realtime microphone or speaker.
-    OpenRealtimeAudioDeviceSelection {
-        kind: RealtimeAudioDeviceKind,
-    },
-
-    /// Persist the selected realtime microphone or speaker to top-level config.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
-    PersistRealtimeAudioDeviceSelection {
-        kind: RealtimeAudioDeviceKind,
-        name: Option<String>,
-    },
-
-    /// Restart the selected realtime microphone or speaker locally.
-    RestartRealtimeAudioDevice {
-        kind: RealtimeAudioDeviceKind,
-    },
-
-    /// Result of creating a TUI-owned realtime WebRTC offer.
-    RealtimeWebrtcOfferCreated {
-        result: Result<RealtimeWebrtcOffer, String>,
-    },
-
-    /// Peer-connection lifecycle event from a TUI-owned realtime WebRTC session.
-    RealtimeWebrtcEvent(RealtimeWebrtcEvent),
-
-    /// Local microphone level from a TUI-owned realtime WebRTC session.
-    RealtimeWebrtcLocalAudioLevel(u16),
 
     /// Open the reasoning selection popup after picking a model.
     OpenReasoningPopup {
         model: ModelPreset,
+    },
+
+    /// Open the explicit Max/Ultra reasoning selection popup for a model.
+    OpenAdvancedReasoningPopup {
+        model: ModelPreset,
+    },
+
+    /// Apply an advanced reasoning effort to the active conversation without changing defaults.
+    ApplyAdvancedReasoning {
+        model: String,
+        effort: ReasoningEffort,
     },
 
     /// Open the Plan-mode reasoning scope prompt for the selected model/effort.
@@ -536,6 +764,7 @@ pub(crate) enum AppEvent {
     OpenFullAccessConfirmation {
         preset: ApprovalPreset,
         return_to_permissions: bool,
+        profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Open the Windows world-writable directories warning.
@@ -545,6 +774,7 @@ pub(crate) enum AppEvent {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     OpenWorldWritableWarningConfirmation {
         preset: Option<ApprovalPreset>,
+        profile_selection: Option<PermissionProfileSelection>,
         /// Up to 3 sample world-writable directories to display in the warning.
         sample_paths: Vec<String>,
         /// If there are more than `sample_paths`, this carries the remaining count.
@@ -557,24 +787,28 @@ pub(crate) enum AppEvent {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     OpenWindowsSandboxEnablePrompt {
         preset: ApprovalPreset,
+        profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Open the Windows sandbox fallback prompt after declining or failing elevation.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     OpenWindowsSandboxFallbackPrompt {
         preset: ApprovalPreset,
+        profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Begin the elevated Windows sandbox setup flow.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     BeginWindowsSandboxElevatedSetup {
         preset: ApprovalPreset,
+        profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Begin the non-elevated Windows sandbox setup flow.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     BeginWindowsSandboxLegacySetup {
         preset: ApprovalPreset,
+        profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Begin a non-elevated grant of read access for an additional directory.
@@ -595,6 +829,7 @@ pub(crate) enum AppEvent {
     EnableWindowsSandboxForAgentMode {
         preset: ApprovalPreset,
         mode: WindowsSandboxEnableMode,
+        profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Update the Windows sandbox feature mode without changing approval presets.
@@ -603,8 +838,11 @@ pub(crate) enum AppEvent {
     /// Update the current approval policy in the running app and widget.
     UpdateAskForApprovalPolicy(AskForApproval),
 
-    /// Update the current permission profile in the running app and widget.
-    UpdatePermissionProfile(PermissionProfile),
+    /// Update the current built-in active permission profile in the running app and widget.
+    UpdateActivePermissionProfile(ActivePermissionProfile),
+
+    /// Select a named permission profile, optionally applying built-in mode settings too.
+    SelectPermissionProfile(PermissionProfileSelection),
 
     /// Update the current approvals reviewer in the running app and widget.
     UpdateApprovalsReviewer(ApprovalsReviewer),
@@ -623,9 +861,6 @@ pub(crate) enum AppEvent {
     /// Clear all persisted local memory artifacts via the app-server.
     ResetMemories,
 
-    /// Update whether the full access warning prompt has been acknowledged.
-    UpdateFullAccessWarningAcknowledged(bool),
-
     /// Update whether the world-writable directories warning has been acknowledged.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     UpdateWorldWritableWarningAcknowledged(bool),
@@ -635,9 +870,6 @@ pub(crate) enum AppEvent {
 
     /// Update the Plan-mode-specific reasoning effort in memory.
     UpdatePlanModeReasoningEffort(Option<ReasoningEffort>),
-
-    /// Persist the acknowledgement flag for the full access warning prompt.
-    PersistFullAccessWarningAcknowledged,
 
     /// Persist the acknowledgement flag for the world-writable directories warning.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -680,19 +912,40 @@ pub(crate) enum AppEvent {
         enabled: bool,
     },
 
+    /// Enable or disable a hook by stable hook key.
+    SetHookEnabled {
+        key: String,
+        enabled: bool,
+    },
+
+    /// Trust the current definition for a hook by stable hook key.
+    TrustHook {
+        key: String,
+        current_hash: String,
+    },
+
+    /// Trust the current definitions for one or more hooks by stable hook key.
+    TrustHooks {
+        updates: Vec<crate::hooks_rpc::HookTrustUpdate>,
+    },
+
+    /// Result of persisting hook enabled state.
+    HookEnabledSet {
+        key: String,
+        enabled: bool,
+        result: Result<(), String>,
+    },
+
+    /// Result of persisting hook trust state.
+    HookTrusted {
+        result: Result<(), String>,
+    },
+
     /// Notify that the manage skills popup was closed.
     ManageSkillsClosed,
 
     /// Re-open the permissions presets popup.
     OpenPermissionsPopup,
-
-    /// Live update for the in-progress voice recording placeholder. Carries
-    /// the placeholder `id` and the text to display (e.g., an ASCII meter).
-    #[cfg(not(target_os = "linux"))]
-    UpdateRecordingMeter {
-        id: String,
-        text: String,
-    },
 
     /// Open the branch picker option from the review popup.
     OpenReviewBranchPicker(PathBuf),
@@ -715,7 +968,6 @@ pub(crate) enum AppEvent {
     /// text) while still rendering the injected input in the transcript.
     SubmitExternalLiteralUserMessage {
         text: String,
-        target_thread_id: Option<ThreadId>,
     },
 
     /// Open the approval popup.
@@ -756,9 +1008,20 @@ pub(crate) enum AppEvent {
         cwd: PathBuf,
         branch: Option<String>,
     },
+    /// Async update of Git summary fields for status line rendering.
+    StatusLineGitSummaryUpdated {
+        cwd: PathBuf,
+        summary: crate::chatwidget::StatusLineGitSummary,
+    },
+    /// Async update of the workspace notification headline for status line rendering.
+    StatusLineWorkspaceHeadlineUpdated {
+        request_id: u64,
+        result: Result<crate::workspace_messages::WorkspaceHeadlineFetchResult, String>,
+    },
     /// Apply a user-confirmed status-line item ordering/selection.
     StatusLineSetup {
         items: Vec<StatusLineItem>,
+        use_theme_colors: bool,
     },
     /// Dismiss the status-line setup UI without changing config.
     StatusLineSetupCancelled,
@@ -779,6 +1042,9 @@ pub(crate) enum AppEvent {
         name: String,
     },
 
+    /// Runtime syntax theme preview changed; refresh theme-derived UI colors.
+    SyntaxThemePreviewed,
+
     /// Open set/remove actions for the selected keymap action.
     OpenKeymapActionMenu {
         context: String,
@@ -798,6 +1064,9 @@ pub(crate) enum AppEvent {
         intent: KeymapEditIntent,
     },
 
+    /// Open the keymap keypress inspector.
+    OpenKeymapDebug,
+
     /// Apply a captured key to the selected keymap action.
     KeymapCaptured {
         context: String,
@@ -813,10 +1082,13 @@ pub(crate) enum AppEvent {
     },
 }
 
-#[derive(Debug)]
-pub(crate) struct RealtimeWebrtcOffer {
-    pub(crate) offer_sdp: String,
-    pub(crate) handle: RealtimeWebrtcSessionHandle,
+/// Named profile selection to apply after any required UI guardrails complete.
+#[derive(Debug, Clone)]
+pub(crate) struct PermissionProfileSelection {
+    pub profile_id: String,
+    pub approval_policy: Option<AskForApproval>,
+    pub approvals_reviewer: Option<ApprovalsReviewer>,
+    pub display_label: String,
 }
 
 /// The exit strategy requested by the UI layer.

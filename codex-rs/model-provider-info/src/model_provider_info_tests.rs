@@ -140,6 +140,24 @@ fn test_supports_remote_compaction_for_openai() {
 }
 
 #[test]
+fn test_personal_access_token_uses_chatgpt_codex_base_url() {
+    let api_provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None)
+        .to_api_provider(Some(AuthMode::PersonalAccessToken))
+        .expect("OpenAI provider should build API provider");
+
+    assert_eq!(api_provider.base_url, CHATGPT_CODEX_BASE_URL);
+}
+
+#[test]
+fn test_header_auth_uses_chatgpt_codex_base_url() {
+    let api_provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None)
+        .to_api_provider(Some(AuthMode::Headers))
+        .expect("OpenAI provider should build API provider");
+
+    assert_eq!(api_provider.base_url, CHATGPT_CODEX_BASE_URL);
+}
+
+#[test]
 fn test_supports_remote_compaction_for_azure_name() {
     let provider = ModelProviderInfo {
         name: "Azure".into(),
@@ -187,6 +205,31 @@ fn test_supports_remote_compaction_for_non_openai_non_azure_provider() {
     };
 
     assert!(!provider.supports_remote_compaction());
+}
+
+#[test]
+fn test_uses_openai_actor_authorization() {
+    let mut provider = ModelProviderInfo {
+        http_headers: Some(maplit::hashmap! {
+            "X-OpenAI-Actor-Authorization".to_string() => "actor-token".to_string(),
+        }),
+        ..ModelProviderInfo::default()
+    };
+    assert!(provider.uses_openai_actor_authorization());
+
+    provider.http_headers = None;
+    assert!(!provider.uses_openai_actor_authorization());
+
+    provider.http_headers = Some(maplit::hashmap! {
+        OPENAI_ACTOR_AUTHORIZATION_HEADER.to_string() => "  ".to_string(),
+    });
+    assert!(!provider.uses_openai_actor_authorization());
+
+    provider.http_headers = Some(maplit::hashmap! {
+        OPENAI_ACTOR_AUTHORIZATION_HEADER.to_string() => "actor-token".to_string(),
+    });
+    provider.requires_openai_auth = true;
+    assert!(!provider.uses_openai_actor_authorization());
 }
 
 #[test]
@@ -256,7 +299,10 @@ fn test_create_amazon_bedrock_provider() {
             }),
             wire_api: WireApi::Responses,
             query_params: None,
-            http_headers: None,
+            http_headers: Some(maplit::hashmap! {
+                AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string() =>
+                    AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE.to_string(),
+            }),
             env_http_headers: None,
             request_max_retries: None,
             stream_max_retries: None,
@@ -265,6 +311,21 @@ fn test_create_amazon_bedrock_provider() {
             requires_openai_auth: false,
             supports_websockets: false,
         }
+    );
+}
+
+#[test]
+fn test_amazon_bedrock_provider_adds_mantle_client_agent_header() {
+    let api_provider = ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None)
+        .to_api_provider(/*auth_mode*/ None)
+        .expect("Amazon Bedrock provider should build API provider");
+
+    assert_eq!(
+        api_provider
+            .headers
+            .get(AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some(AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE)
     );
 }
 

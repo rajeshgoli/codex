@@ -1,3 +1,4 @@
+use core_test_support::test_codex::local_selections;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -70,7 +71,10 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
     // Populate cache via initial refresh.
     let models_manager = test.thread_manager.get_models_manager();
     let _ = models_manager
-        .list_models(RefreshStrategy::OnlineIfUncached)
+        .list_models(
+            RefreshStrategy::OnlineIfUncached,
+            codex_core::test_support::default_http_client_factory(),
+        )
         .await;
 
     let cache_path = config.codex_home.join(CACHE_FILE);
@@ -92,24 +96,29 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
         turn_permission_fields(PermissionProfile::Disabled, test.cwd_path());
 
     codex
-        .submit(Op::UserTurn {
-            environments: None,
+        .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "hi".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
-            cwd: test.cwd_path().to_path_buf(),
-            approval_policy: codex_protocol::protocol::AskForApproval::Never,
-            approvals_reviewer: None,
-            sandbox_policy,
-            permission_profile,
-            model: test.session_configured.model.clone(),
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                environments: Some(local_selections(test.config.cwd.clone())),
+                approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                    mode: codex_protocol::config_types::ModeKind::Default,
+                    settings: codex_protocol::config_types::Settings {
+                        model: test.session_configured.model.clone(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
         })
         .await?;
 
@@ -129,7 +138,10 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
     // Cached models remain usable offline.
     let offline_models = test
         .thread_manager
-        .list_models(RefreshStrategy::Offline)
+        .list_models(
+            RefreshStrategy::Offline,
+            codex_core::test_support::default_http_client_factory(),
+        )
         .await;
     assert!(
         offline_models
@@ -172,7 +184,10 @@ async fn uses_cache_when_version_matches() -> Result<()> {
     let test = builder.build(&server).await?;
     let models_manager = test.thread_manager.get_models_manager();
     let models = models_manager
-        .list_models(RefreshStrategy::OnlineIfUncached)
+        .list_models(
+            RefreshStrategy::OnlineIfUncached,
+            codex_core::test_support::default_http_client_factory(),
+        )
         .await;
 
     assert!(
@@ -219,7 +234,10 @@ async fn refreshes_when_cache_version_missing() -> Result<()> {
     let test = builder.build(&server).await?;
     let models_manager = test.thread_manager.get_models_manager();
     let models = models_manager
-        .list_models(RefreshStrategy::OnlineIfUncached)
+        .list_models(
+            RefreshStrategy::OnlineIfUncached,
+            codex_core::test_support::default_http_client_factory(),
+        )
         .await;
 
     assert!(
@@ -267,7 +285,10 @@ async fn refreshes_when_cache_version_differs() -> Result<()> {
     let test = builder.build(&server).await?;
     let models_manager = test.thread_manager.get_models_manager();
     let models = models_manager
-        .list_models(RefreshStrategy::OnlineIfUncached)
+        .list_models(
+            RefreshStrategy::OnlineIfUncached,
+            codex_core::test_support::default_http_client_factory(),
+        )
         .await;
 
     assert!(
@@ -341,10 +362,13 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
         supported_in_api: true,
         priority,
         additional_speed_tiers: Vec::new(),
+        service_tiers: Vec::new(),
+        default_service_tier: None,
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
-        supports_reasoning_summaries: false,
+        include_skills_usage_instructions: false,
+        supports_reasoning_summary_parameter: true,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,
@@ -357,10 +381,15 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
         context_window: Some(272_000),
         max_context_window: None,
         auto_compact_token_limit: None,
+        comp_hash: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        use_responses_lite: false,
+        auto_review_model_override: None,
+        tool_mode: None,
+        multi_agent_version: None,
     }
 }

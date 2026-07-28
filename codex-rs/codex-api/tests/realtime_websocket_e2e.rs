@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used)]
 use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
@@ -34,24 +35,22 @@ where
     Handler: FnOnce(RealtimeWsStream) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    let listener = match TcpListener::bind("127.0.0.1:0").await {
-        Ok(listener) => listener,
-        Err(err) => panic!("failed to bind test websocket listener: {err}"),
-    };
-    let addr = match listener.local_addr() {
-        Ok(addr) => addr.to_string(),
-        Err(err) => panic!("failed to read local websocket listener address: {err}"),
-    };
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test websocket listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("test websocket listener should have a local address")
+        .to_string();
 
     let server = tokio::spawn(async move {
-        let (stream, _) = match listener.accept().await {
-            Ok(stream) => stream,
-            Err(err) => panic!("failed to accept test websocket connection: {err}"),
-        };
-        let ws = match accept_async(stream).await {
-            Ok(ws) => ws,
-            Err(err) => panic!("failed to complete websocket handshake: {err}"),
-        };
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("test websocket connection should be accepted");
+        let ws = accept_async(stream)
+            .await
+            .expect("test websocket handshake should complete");
         handler(ws).await;
     });
 
@@ -166,7 +165,7 @@ async fn realtime_ws_e2e_session_create_and_event_flow() {
     assert_eq!(
         created,
         RealtimeEvent::SessionUpdated {
-            session_id: "sess_mock".to_string(),
+            realtime_session_id: "sess_mock".to_string(),
             instructions: Some("backend prompt".to_string()),
         }
     );
@@ -271,7 +270,7 @@ async fn realtime_ws_connect_webrtc_sideband_retries_join_until_server_is_availa
     assert_eq!(
         event,
         RealtimeEvent::SessionUpdated {
-            session_id: "sess_joined".to_string(),
+            realtime_session_id: "sess_joined".to_string(),
             instructions: Some("backend prompt".to_string()),
         }
     );
@@ -358,7 +357,7 @@ async fn realtime_ws_e2e_send_while_next_event_waits() {
     assert_eq!(
         next_event,
         RealtimeEvent::SessionUpdated {
-            session_id: "sess_after_send".to_string(),
+            realtime_session_id: "sess_after_send".to_string(),
             instructions: Some("backend prompt".to_string()),
         }
     );
@@ -474,7 +473,7 @@ async fn realtime_ws_e2e_ignores_unknown_text_events() {
     assert_eq!(
         event,
         RealtimeEvent::SessionUpdated {
-            session_id: "sess_after_unknown".to_string(),
+            realtime_session_id: "sess_after_unknown".to_string(),
             instructions: Some("backend prompt".to_string()),
         }
     );

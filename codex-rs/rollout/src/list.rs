@@ -1,6 +1,5 @@
 #![allow(warnings, clippy::all)]
 
-use async_trait::async_trait;
 use codex_utils_path as path_utils;
 use std::cmp::Reverse;
 use std::ffi::OsStr;
@@ -18,15 +17,19 @@ use uuid::Uuid;
 
 use super::ARCHIVED_SESSIONS_SUBDIR;
 use super::SESSIONS_SUBDIR;
+use super::compression;
 use crate::protocol::EventMsg;
 use crate::state_db;
 use codex_file_search as file_search;
 use codex_protocol::ThreadId;
+use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::USER_MESSAGE_BEGIN;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::user_message_preview;
+use serde_json::Value;
 
 /// Returned page of thread (thread) summaries.
 #[derive(Debug, Default, PartialEq)]
@@ -50,6 +53,8 @@ pub struct ThreadItem {
     pub thread_id: Option<ThreadId>,
     /// First user message captured for this thread, if any.
     pub first_user_message: Option<String>,
+    /// Best available user-facing preview for discovery and list display.
+    pub preview: Option<String>,
     /// Working directory from session metadata.
     pub cwd: Option<PathBuf>,
     /// Git branch from session metadata.
@@ -60,6 +65,10 @@ pub struct ThreadItem {
     pub git_origin_url: Option<String>,
     /// Session source from session metadata.
     pub source: Option<SessionSource>,
+    /// Persisted thread history contract selected when this thread was created.
+    pub history_mode: ThreadHistoryMode,
+    /// Immediate control/spawn parent thread id from session metadata.
+    pub parent_thread_id: Option<ThreadId>,
     /// Random unique nickname from session metadata for AgentControl-spawned sub-agents.
     pub agent_nickname: Option<String>,
     /// Role (agent_role) from session metadata for AgentControl-spawned sub-agents.
@@ -73,6 +82,8 @@ pub struct ThreadItem {
     pub created_at: Option<String>,
     /// RFC3339 timestamp string for the most recent update (from file mtime).
     pub updated_at: Option<String>,
+    /// RFC3339 timestamp string used for product recency ordering.
+    pub recency_at: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -85,14 +96,16 @@ pub type ConversationsPage = ThreadsPage;
 #[derive(Default)]
 struct HeadTailSummary {
     saw_session_meta: bool,
-    saw_user_event: bool,
     thread_id: Option<ThreadId>,
     first_user_message: Option<String>,
+    preview: Option<String>,
     cwd: Option<PathBuf>,
     git_branch: Option<String>,
     git_sha: Option<String>,
     git_origin_url: Option<String>,
     source: Option<SessionSource>,
+    history_mode: ThreadHistoryMode,
+    parent_thread_id: Option<ThreadId>,
     agent_nickname: Option<String>,
     agent_role: Option<String>,
     model_provider: Option<String>,
@@ -110,6 +123,7 @@ const USER_EVENT_SCAN_LIMIT: usize = 200;
 pub enum ThreadSortKey {
     CreatedAt,
     UpdatedAt,
+    RecencyAt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,19 +146,28 @@ pub struct ThreadListConfig<'a> {
     pub layout: ThreadListLayout,
 }
 
-/// Pagination cursor identifying the timestamp of the last item in a page.
+/// Pagination cursor identifying the last item in a page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cursor {
     ts: OffsetDateTime,
+    id: Option<ThreadId>,
 }
 
 impl Cursor {
-    fn new(ts: OffsetDateTime) -> Self {
-        Self { ts }
+    pub(crate) fn new(ts: OffsetDateTime) -> Self {
+        Self { ts, id: None }
+    }
+
+    pub(crate) fn with_thread_id(ts: OffsetDateTime, id: ThreadId) -> Self {
+        Self { ts, id: Some(id) }
     }
 
     pub(crate) fn timestamp(&self) -> OffsetDateTime {
         self.ts
+    }
+
+    pub(crate) fn thread_id(&self) -> Option<ThreadId> {
+        self.id
     }
 }
 
@@ -189,15 +212,14 @@ impl AnchorState {
 ///
 /// We need to apply different logic if we're ultimately going to be returning
 /// threads ordered by created_at or updated_at.
-#[async_trait]
 trait RolloutFileVisitor {
-    async fn visit(
+    fn visit(
         &mut self,
         ts: OffsetDateTime,
         id: Uuid,
         path: PathBuf,
         scanned: usize,
-    ) -> ControlFlow<()>;
+    ) -> impl std::future::Future<Output = ControlFlow<()>> + Send;
 }
 
 /// Collects thread items during directory traversal in created_at order,
@@ -212,7 +234,6 @@ struct FilesByCreatedAtVisitor<'a> {
     cwd_filters: Option<&'a [PathBuf]>,
 }
 
-#[async_trait]
 impl<'a> RolloutFileVisitor for FilesByCreatedAtVisitor<'a> {
     async fn visit(
         &mut self,
@@ -257,7 +278,6 @@ struct FilesByUpdatedAtVisitor<'a> {
     candidates: &'a mut Vec<ThreadCandidate>,
 }
 
-#[async_trait]
 impl<'a> RolloutFileVisitor for FilesByUpdatedAtVisitor<'a> {
     async fn visit(
         &mut self,
@@ -285,7 +305,10 @@ impl serde::Serialize for Cursor {
             .ts
             .format(&Rfc3339)
             .map_err(|e| serde::ser::Error::custom(format!("format error: {e}")))?;
-        serializer.serialize_str(&ts_str)
+        match self.id {
+            Some(id) => serializer.serialize_str(&format!("{ts_str}|{id}")),
+            None => serializer.serialize_str(&ts_str),
+        }
     }
 }
 
@@ -306,7 +329,7 @@ impl From<codex_state::Anchor> for Cursor {
             .timestamp_nanos_opt()
             .and_then(|nanos| OffsetDateTime::from_unix_timestamp_nanos(nanos as i128).ok())
             .unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        Self::new(ts)
+        Self { ts, id: anchor.id }
     }
 }
 
@@ -417,7 +440,7 @@ async fn traverse_directories_for_paths(
             )
             .await
         }
-        ThreadSortKey::UpdatedAt => {
+        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => {
             traverse_directories_for_paths_updated(
                 root,
                 page_size,
@@ -452,7 +475,7 @@ async fn traverse_flat_paths(
             )
             .await
         }
-        ThreadSortKey::UpdatedAt => {
+        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => {
             traverse_flat_paths_updated(
                 root,
                 page_size,
@@ -700,35 +723,48 @@ async fn traverse_flat_paths_updated(
     })
 }
 
-/// Pagination cursor token format: an RFC3339 timestamp.
+/// Pagination cursor token format: an RFC3339 timestamp with an optional thread ID tie-breaker.
 pub fn parse_cursor(token: &str) -> Option<Cursor> {
-    if token.contains('|') {
-        return None;
-    }
+    let (timestamp, id) = match token.rsplit_once('|') {
+        Some((timestamp, id)) => (timestamp, Some(ThreadId::from_string(id).ok()?)),
+        None => (token, None),
+    };
 
-    let ts = OffsetDateTime::parse(token, &Rfc3339).ok().or_else(|| {
-        let format: &[FormatItem] =
-            format_description!("[year]-[month]-[day]T[hour]-[minute]-[second]");
-        PrimitiveDateTime::parse(token, format)
-            .ok()
-            .map(PrimitiveDateTime::assume_utc)
-    })?;
+    let ts = OffsetDateTime::parse(timestamp, &Rfc3339)
+        .ok()
+        .or_else(|| {
+            let format: &[FormatItem] =
+                format_description!("[year]-[month]-[day]T[hour]-[minute]-[second]");
+            PrimitiveDateTime::parse(timestamp, format)
+                .ok()
+                .map(PrimitiveDateTime::assume_utc)
+        })?;
 
-    Some(Cursor::new(ts))
+    Some(Cursor { ts, id })
 }
 
 fn build_next_cursor(items: &[ThreadItem], sort_key: ThreadSortKey) -> Option<Cursor> {
     let last = items.last()?;
     let file_name = last.path.file_name()?.to_string_lossy();
-    let (created_ts, _id) = parse_timestamp_uuid_from_filename(&file_name)?;
+    let (created_ts, id) = parse_timestamp_uuid_from_filename(&file_name)?;
     let ts = match sort_key {
         ThreadSortKey::CreatedAt => created_ts,
         ThreadSortKey::UpdatedAt => {
             let updated_at = last.updated_at.as_deref()?;
             OffsetDateTime::parse(updated_at, &Rfc3339).ok()?
         }
+        ThreadSortKey::RecencyAt => {
+            let recency_at = last.recency_at.as_deref().or(last.updated_at.as_deref())?;
+            OffsetDateTime::parse(recency_at, &Rfc3339).ok()?
+        }
     };
-    Some(Cursor::new(ts))
+    match sort_key {
+        ThreadSortKey::RecencyAt => Some(Cursor::with_thread_id(
+            ts,
+            ThreadId::from_string(&id.to_string()).ok()?,
+        )),
+        ThreadSortKey::CreatedAt | ThreadSortKey::UpdatedAt => Some(Cursor::new(ts)),
+    }
 }
 
 async fn build_thread_item(
@@ -738,7 +774,8 @@ async fn build_thread_item(
     cwd_filters: Option<&[PathBuf]>,
     updated_at: Option<String>,
 ) -> Option<ThreadItem> {
-    // Read head and detect message events; stop once meta + user are found.
+    // Read head and detect preview-bearing events; goal previews can appear before
+    // the first normal user message.
     let summary = read_head_summary(&path, HEAD_RECORD_LIMIT)
         .await
         .unwrap_or_default();
@@ -764,16 +801,19 @@ async fn build_thread_item(
     {
         return None;
     }
-    // Apply filters: must have session meta and at least one user message event
-    if summary.saw_session_meta && summary.saw_user_event {
+    // Apply filters: must have session meta and a discoverable preview.
+    if summary.saw_session_meta && summary.preview.is_some() {
         let HeadTailSummary {
             thread_id,
             first_user_message,
+            preview,
             cwd,
             git_branch,
             git_sha,
             git_origin_url,
             source,
+            history_mode,
+            parent_thread_id,
             agent_nickname,
             agent_role,
             model_provider,
@@ -789,16 +829,20 @@ async fn build_thread_item(
             path,
             thread_id,
             first_user_message,
+            preview,
             cwd,
             git_branch,
             git_sha,
             git_origin_url,
             source,
+            history_mode,
+            parent_thread_id,
             agent_nickname,
             agent_role,
             model_provider,
             cli_version,
             created_at,
+            recency_at: summary_updated_at.clone(),
             updated_at: summary_updated_at,
         });
     }
@@ -886,21 +930,18 @@ async fn collect_flat_rollout_files(
         {
             continue;
         }
-        let file_name = entry.file_name();
-        let Some(name_str) = file_name.to_str() else {
+        let Some(rollout_file) = compression::RolloutFile::from_path(entry.path()) else {
             continue;
         };
-        if !name_str.starts_with("rollout-") || !name_str.ends_with(".jsonl") {
-            continue;
-        }
-        let Some((ts, id)) = parse_timestamp_uuid_from_filename(name_str) else {
+        let Some((ts, id)) = parse_timestamp_uuid_from_filename(rollout_file.plain_file_name())
+        else {
             continue;
         };
         *scanned_files += 1;
         if *scanned_files > MAX_SCAN_FILES {
             break;
         }
-        collected.push((ts, id, entry.path()));
+        collected.push((ts, id, rollout_file.into_path()));
     }
     collected.sort_by_key(|(ts, sid, _path)| (Reverse(*ts), Reverse(*sid)));
     Ok(collected)
@@ -909,12 +950,10 @@ async fn collect_flat_rollout_files(
 async fn collect_rollout_day_files(
     day_path: &Path,
 ) -> io::Result<Vec<(OffsetDateTime, Uuid, PathBuf)>> {
-    let mut day_files = collect_files(day_path, |name_str, path| {
-        if !name_str.starts_with("rollout-") || !name_str.ends_with(".jsonl") {
-            return None;
-        }
-
-        parse_timestamp_uuid_from_filename(name_str).map(|(ts, id)| (ts, id, path.to_path_buf()))
+    let mut day_files = collect_files(day_path, |_name_str, path| {
+        let rollout_file = compression::RolloutFile::from_path(path.to_path_buf())?;
+        parse_timestamp_uuid_from_filename(rollout_file.plain_file_name())
+            .map(|(ts, id)| (ts, id, rollout_file.into_path()))
     })
     .await?;
     // Stable ordering within the same second: (timestamp desc, uuid desc)
@@ -923,7 +962,8 @@ async fn collect_rollout_day_files(
 }
 
 pub(crate) fn parse_timestamp_uuid_from_filename(name: &str) -> Option<(OffsetDateTime, Uuid)> {
-    // Expected: rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl
+    // Expected: rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl[.zst]
+    let name = compression::parse_rollout_file_name(name)?;
     let core = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
 
     // Scan from the right for a '-' such that the suffix parses as a UUID.
@@ -976,23 +1016,22 @@ async fn collect_flat_files_by_updated_at(
         {
             continue;
         }
-        let file_name = entry.file_name();
-        let Some(name_str) = file_name.to_str() else {
+        let Some(rollout_file) = compression::RolloutFile::from_path(entry.path()) else {
             continue;
         };
-        if !name_str.starts_with("rollout-") || !name_str.ends_with(".jsonl") {
-            continue;
-        }
-        let Some((_ts, id)) = parse_timestamp_uuid_from_filename(name_str) else {
+        let Some((_ts, id)) = parse_timestamp_uuid_from_filename(rollout_file.plain_file_name())
+        else {
             continue;
         };
         *scanned_files += 1;
         if *scanned_files > MAX_SCAN_FILES {
             break;
         }
-        let updated_at = file_modified_time(&entry.path()).await.unwrap_or(None);
+        let updated_at = file_modified_time(rollout_file.path())
+            .await
+            .unwrap_or(None);
         candidates.push(ThreadCandidate {
-            path: entry.path(),
+            path: rollout_file.into_path(),
             id,
             updated_at,
         });
@@ -1068,17 +1107,13 @@ impl<'a> ProviderMatcher<'a> {
 }
 
 async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTailSummary> {
-    use tokio::io::AsyncBufReadExt;
-
-    let file = tokio::fs::File::open(path).await?;
-    let reader = tokio::io::BufReader::new(file);
-    let mut lines = reader.lines();
+    let mut lines = compression::open_rollout_line_reader(path).await?;
     let mut summary = HeadTailSummary::default();
     let mut lines_scanned = 0usize;
 
     while lines_scanned < head_limit
         || (summary.saw_session_meta
-            && !summary.saw_user_event
+            && (summary.preview.is_none() || summary.first_user_message.is_none())
             && lines_scanned < head_limit + USER_EVENT_SCAN_LIMIT)
     {
         let line_opt = lines.next_line().await?;
@@ -1090,12 +1125,27 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
         lines_scanned += 1;
 
         let parsed: Result<RolloutLine, _> = serde_json::from_str(trimmed);
-        let Ok(rollout_line) = parsed else { continue };
+        let rollout_line = match parsed {
+            Ok(rollout_line) => rollout_line,
+            Err(_) => {
+                if !summary.saw_session_meta
+                    && let Ok(value) = serde_json::from_str::<Value>(trimmed)
+                {
+                    // The first SessionMeta belongs to this rollout. Later SessionMeta lines can
+                    // be copied from fork history, so only an unknown mode before the first parsed
+                    // SessionMeta should make this thread unreadable.
+                    crate::recorder::reject_unknown_thread_history_mode(&value)?;
+                }
+                continue;
+            }
+        };
 
         match rollout_line.item {
             RolloutItem::SessionMeta(session_meta_line) => {
                 if !summary.saw_session_meta {
                     summary.source = Some(session_meta_line.meta.source.clone());
+                    summary.history_mode = session_meta_line.meta.history_mode;
+                    summary.parent_thread_id = session_meta_line.meta.parent_thread_id;
                     summary.agent_nickname = session_meta_line.meta.agent_nickname.clone();
                     summary.agent_role = session_meta_line.meta.agent_role.clone();
                     summary.model_provider = session_meta_line.meta.model_provider.clone();
@@ -1118,32 +1168,46 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                     summary.saw_session_meta = true;
                 }
             }
-            RolloutItem::ResponseItem(_) => {
-                summary.created_at = summary
+            RolloutItem::ResponseItem(_) | RolloutItem::InterAgentCommunication(_) => {
+                summary
                     .created_at
-                    .clone()
-                    .or_else(|| Some(rollout_line.timestamp.clone()));
+                    .get_or_insert_with(|| rollout_line.timestamp.clone());
             }
+            RolloutItem::InterAgentCommunicationMetadata { .. } => {}
             RolloutItem::TurnContext(_) => {
+                // Not included in `head`; skip.
+            }
+            RolloutItem::WorldState(_) => {
                 // Not included in `head`; skip.
             }
             RolloutItem::Compacted(_) => {
                 // Not included in `head`; skip.
             }
             RolloutItem::EventMsg(ev) => {
-                if let EventMsg::UserMessage(user) = ev {
-                    summary.saw_user_event = true;
-                    if summary.first_user_message.is_none() {
-                        let message = strip_user_message_prefix(user.message.as_str()).to_string();
-                        if !message.is_empty() {
-                            summary.first_user_message = Some(message);
+                if let Some(preview) = event_msg_preview(&ev) {
+                    // Legacy rollouts persist UserMessage while paginated rollouts persist
+                    // ItemCompleted(UserMessage), so summaries must recognize both formats.
+                    let is_user_message = match &ev {
+                        EventMsg::UserMessage(_) => true,
+                        EventMsg::ItemCompleted(event) => {
+                            matches!(event.item, TurnItem::UserMessage(_))
                         }
+                        _ => false,
+                    };
+                    if summary.preview.is_none() {
+                        summary.preview = Some(preview.clone());
+                    }
+                    if is_user_message && summary.first_user_message.is_none() {
+                        summary.first_user_message = Some(preview);
                     }
                 }
             }
         }
 
-        if summary.saw_session_meta && summary.saw_user_event {
+        if summary.saw_session_meta
+            && summary.preview.is_some()
+            && summary.first_user_message.is_some()
+        {
             break;
         }
     }
@@ -1154,11 +1218,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
 /// Read up to `HEAD_RECORD_LIMIT` records from the start of the rollout file at `path`.
 /// This should be enough to produce a summary including the session meta line.
 pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Value>> {
-    use tokio::io::AsyncBufReadExt;
-
-    let file = tokio::fs::File::open(path).await?;
-    let reader = tokio::io::BufReader::new(file);
-    let mut lines = reader.lines();
+    let mut lines = compression::open_rollout_line_reader(path).await?;
     let mut head = Vec::new();
 
     while head.len() < HEAD_RECORD_LIMIT {
@@ -1181,8 +1241,15 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
                         head.push(value);
                     }
                 }
-                RolloutItem::Compacted(_)
+                RolloutItem::InterAgentCommunication(communication) => {
+                    if let Ok(value) = serde_json::to_value(communication.to_model_input_item()) {
+                        head.push(value);
+                    }
+                }
+                RolloutItem::InterAgentCommunicationMetadata { .. }
+                | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::WorldState(_)
                 | RolloutItem::EventMsg(_) => {}
             }
         }
@@ -1191,10 +1258,20 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
     Ok(head)
 }
 
-fn strip_user_message_prefix(text: &str) -> &str {
-    match text.find(USER_MESSAGE_BEGIN) {
-        Some(idx) => text[idx + USER_MESSAGE_BEGIN.len()..].trim(),
-        None => text.trim(),
+fn event_msg_preview(event: &EventMsg) -> Option<String> {
+    match event {
+        EventMsg::UserMessage(user) => user_message_preview(user),
+        EventMsg::ItemCompleted(event) => match &event.item {
+            TurnItem::UserMessage(user) => {
+                user_message_preview(&user.as_legacy_user_message_event())
+            }
+            _ => None,
+        },
+        EventMsg::ThreadGoalUpdated(event) => {
+            let objective = event.goal.objective.trim();
+            (!objective.is_empty()).then(|| objective.to_string())
+        }
+        _ => None,
     }
 }
 
@@ -1217,13 +1294,9 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
 }
 
 async fn file_modified_time(path: &Path) -> io::Result<Option<OffsetDateTime>> {
-    let meta = tokio::fs::metadata(path).await?;
-    let modified = meta.modified().ok();
-    let Some(modified) = modified else {
-        return Ok(None);
-    };
-    let dt = OffsetDateTime::from(modified);
-    Ok(truncate_to_millis(dt))
+    Ok(compression::file_modified_time(path)
+        .await?
+        .and_then(truncate_to_millis))
 }
 
 fn format_rfc3339(dt: OffsetDateTime) -> Option<String> {
@@ -1239,6 +1312,7 @@ async fn find_thread_path_by_id_str_in_subdir(
     codex_home: &Path,
     subdir: &str,
     id_str: &str,
+    state_db_ctx: Option<&codex_state::StateRuntime>,
 ) -> io::Result<Option<PathBuf>> {
     // Validate UUID format early.
     if Uuid::parse_str(id_str).is_err() {
@@ -1253,55 +1327,141 @@ async fn find_thread_path_by_id_str_in_subdir(
         _ => None,
     };
     let thread_id = ThreadId::from_string(id_str).ok();
-    let state_db_ctx = state_db::open_if_present(codex_home, "").await;
-    if let Some(state_db_ctx) = state_db_ctx.as_deref()
+    let mut unverified_db_path = None;
+    let mut fallback_reason = state_db_ctx.is_none().then_some("db_unavailable");
+    if let Some(state_db_ctx) = state_db_ctx
         && let Some(thread_id) = thread_id
-        && let Some(db_path) = state_db::find_rollout_path_by_id(
-            Some(state_db_ctx),
-            thread_id,
-            archived_only,
-            "find_path_query",
-        )
-        .await
     {
-        if tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
-            return Ok(Some(db_path));
+        match state_db_ctx
+            .find_rollout_path_by_id(thread_id, archived_only)
+            .await
+        {
+            Ok(Some(db_path)) => {
+                if let Some(existing_db_path) =
+                    compression::existing_rollout_path(db_path.as_path()).await
+                {
+                    match read_session_meta_line(&existing_db_path).await {
+                        Ok(meta_line) if meta_line.meta.id == thread_id => {
+                            return Ok(Some(existing_db_path));
+                        }
+                        Ok(meta_line) => {
+                            tracing::error!(
+                                "state db returned rollout path for thread {id_str} but file belongs to thread {}: {}",
+                                meta_line.meta.id,
+                                existing_db_path.display()
+                            );
+                            tracing::warn!(
+                                "state db discrepancy during find_thread_path_by_id_str_in_subdir: mismatched_db_path"
+                            );
+                            codex_state::record_fallback(
+                                "find_thread_path",
+                                "mismatch",
+                                /*telemetry_override*/ None,
+                            );
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                "state db returned rollout path for thread {id_str} that could not be verified: {}: {err}",
+                                existing_db_path.display()
+                            );
+                            unverified_db_path = Some(existing_db_path);
+                        }
+                    }
+                } else {
+                    tracing::error!(
+                        "state db returned stale rollout path for thread {id_str}: {}",
+                        db_path.display()
+                    );
+                    tracing::warn!(
+                        "state db discrepancy during find_thread_path_by_id_str_in_subdir: stale_db_path"
+                    );
+                    codex_state::record_fallback(
+                        "find_thread_path",
+                        "stale_path",
+                        /*telemetry_override*/ None,
+                    );
+                }
+            }
+            Ok(None) => fallback_reason = Some("missing_row"),
+            Err(err) => {
+                tracing::warn!(
+                    "state db find_rollout_path_by_id failed during find_path_query: {err}"
+                );
+                fallback_reason = Some("db_error");
+            }
         }
-        tracing::error!(
-            "state db returned stale rollout path for thread {id_str}: {}",
-            db_path.display()
-        );
-        tracing::warn!(
-            "state db discrepancy during find_thread_path_by_id_str_in_subdir: stale_db_path"
-        );
     }
 
     let mut root = codex_home.to_path_buf();
     root.push(subdir);
     if !root.exists() {
-        return Ok(None);
+        return Ok(unverified_db_path);
     }
-    // This is safe because we know the values are valid.
-    #[allow(clippy::unwrap_used)]
-    let limit = NonZero::new(1).unwrap();
-    let options = file_search::FileSearchOptions {
-        limit,
-        compute_indices: false,
-        respect_gitignore: false,
-        ..Default::default()
+    let (filename_match, filename_scan_error) = match find_rollout_path_by_id_from_filenames(
+        root.as_path(),
+        id_str,
+    )
+    .await
+    {
+        Ok(path) => (path, None),
+        Err(err) => {
+            tracing::warn!(
+                "rollout filename lookup failed during find_thread_path_by_id_str_in_subdir: {err}"
+            );
+            (None, Some(err))
+        }
     };
 
-    let results = file_search::run(id_str, vec![root], options, /*cancel_flag*/ None)
-        .map_err(|e| io::Error::other(format!("file search failed: {e}")))?;
+    let found = match filename_match {
+        Some(path) => Some(path),
+        None => {
+            // This is safe because we know the values are valid.
+            #[allow(clippy::unwrap_used)]
+            let limit = NonZero::new(1).unwrap();
+            let options = file_search::FileSearchOptions {
+                limit,
+                compute_indices: false,
+                respect_gitignore: false,
+                ..Default::default()
+            };
 
-    let found = results.matches.into_iter().next().map(|m| m.full_path());
+            let results = file_search::run(
+                id_str,
+                vec![root.clone()],
+                options,
+                /*cancel_flag*/ None,
+            )
+            .map_err(|e| io::Error::other(format!("file search failed: {e}")))?;
+
+            let found = results
+                .matches
+                .into_iter()
+                .map(|m| m.full_path())
+                .find_map(compression::RolloutFile::from_path)
+                .map(compression::RolloutFile::into_path);
+
+            if found.is_none()
+                && let Some(err) = filename_scan_error
+            {
+                return Err(err);
+            }
+            found
+        }
+    };
     if let Some(found_path) = found.as_ref() {
         tracing::debug!("state db missing rollout path for thread {id_str}");
         tracing::warn!(
             "state db discrepancy during find_thread_path_by_id_str_in_subdir: falling_back"
         );
+        if let Some(reason) = fallback_reason {
+            codex_state::record_fallback(
+                "find_thread_path",
+                reason,
+                /*telemetry_override*/ None,
+            );
+        }
         state_db::read_repair_rollout_path(
-            state_db_ctx.as_deref(),
+            state_db_ctx,
             thread_id,
             archived_only,
             found_path.as_path(),
@@ -1309,7 +1469,47 @@ async fn find_thread_path_by_id_str_in_subdir(
         .await;
     }
 
-    Ok(found)
+    Ok(found.or(unverified_db_path))
+}
+
+async fn find_rollout_path_by_id_from_filenames(
+    root: &Path,
+    id_str: &str,
+) -> io::Result<Option<PathBuf>> {
+    let Ok(target) = Uuid::parse_str(id_str) else {
+        return Ok(None);
+    };
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut read_dir = match tokio::fs::read_dir(dir.as_path()).await {
+            Ok(read_dir) => read_dir,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        while let Some(entry) = read_dir.next_entry().await? {
+            let path = entry.path();
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let Some(rollout_file) = compression::RolloutFile::from_path(path) else {
+                continue;
+            };
+            let Some((_ts, id)) =
+                parse_timestamp_uuid_from_filename(rollout_file.plain_file_name())
+            else {
+                continue;
+            };
+            if id == target {
+                return Ok(Some(rollout_file.into_path()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Locate a recorded thread rollout file by its UUID string using the existing
@@ -1318,16 +1518,19 @@ async fn find_thread_path_by_id_str_in_subdir(
 pub async fn find_thread_path_by_id_str(
     codex_home: &Path,
     id_str: &str,
+    state_db_ctx: Option<&codex_state::StateRuntime>,
 ) -> io::Result<Option<PathBuf>> {
-    find_thread_path_by_id_str_in_subdir(codex_home, SESSIONS_SUBDIR, id_str).await
+    find_thread_path_by_id_str_in_subdir(codex_home, SESSIONS_SUBDIR, id_str, state_db_ctx).await
 }
 
 /// Locate an archived thread rollout file by its UUID string.
 pub async fn find_archived_thread_path_by_id_str(
     codex_home: &Path,
     id_str: &str,
+    state_db_ctx: Option<&codex_state::StateRuntime>,
 ) -> io::Result<Option<PathBuf>> {
-    find_thread_path_by_id_str_in_subdir(codex_home, ARCHIVED_SESSIONS_SUBDIR, id_str).await
+    find_thread_path_by_id_str_in_subdir(codex_home, ARCHIVED_SESSIONS_SUBDIR, id_str, state_db_ctx)
+        .await
 }
 
 /// Extract the `YYYY/MM/DD` directory components from a rollout filename.

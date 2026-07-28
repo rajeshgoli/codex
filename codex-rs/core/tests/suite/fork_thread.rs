@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use codex_core::ForkSnapshot;
 use codex_core::NewThread;
 use codex_core::parse_turn_item;
@@ -50,13 +52,14 @@ async fn fork_thread_twice_drops_to_first_message() {
     for text in ["first", "second", "third"] {
         codex
             .submit(Op::UserInput {
-                environments: None,
                 items: vec![UserInput::Text {
                     text: text.to_string(),
                     text_elements: Vec::new(),
                 }],
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
             })
             .await
             .unwrap();
@@ -100,9 +103,8 @@ async fn fork_thread_twice_drops_to_first_message() {
         .fork_thread(
             ForkSnapshot::TruncateBeforeNthUserMessage(1),
             config_for_fork.clone(),
-            codex_core::thread_store_from_config(&config_for_fork),
             base_path.clone(),
-            /*persist_extended_history*/ false,
+            /*thread_source*/ None,
             /*parent_trace*/ None,
         )
         .await
@@ -125,9 +127,8 @@ async fn fork_thread_twice_drops_to_first_message() {
         .fork_thread(
             ForkSnapshot::TruncateBeforeNthUserMessage(0),
             config_for_fork.clone(),
-            codex_core::thread_store_from_config(&config_for_fork),
             fork1_path.clone(),
-            /*persist_extended_history*/ false,
+            /*thread_source*/ None,
             /*parent_trace*/ None,
         )
         .await
@@ -173,13 +174,14 @@ async fn fork_thread_from_history_does_not_require_source_rollout_path() {
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "fork me from stored history".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -194,14 +196,14 @@ async fn fork_thread_from_history_does_not_require_source_rollout_path() {
         .fork_thread_from_history(
             ForkSnapshot::Interrupted,
             test.config.clone(),
-            codex_core::thread_store_from_config(&test.config),
             InitialHistory::Resumed(ResumedHistory {
-                conversation_id: test.session_configured.session_id,
-                history: source_items.clone(),
+                conversation_id: test.session_configured.thread_id,
+                history: Arc::new(source_items.clone()),
                 rollout_path: None,
             }),
-            /*persist_extended_history*/ false,
+            /*thread_source*/ None,
             /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
         )
         .await
         .expect("fork from stored history");
@@ -223,23 +225,17 @@ async fn fork_thread_from_history_does_not_require_source_rollout_path() {
 }
 
 fn read_rollout_items(path: &std::path::Path) -> Vec<RolloutItem> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) => panic!("failed to read rollout file {}: {err}", path.display()),
-    };
+    let read_message = format!("failed to read rollout file {}", path.display());
+    let text = std::fs::read_to_string(path).expect(&read_message);
     let mut items: Vec<RolloutItem> = Vec::new();
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        let v: serde_json::Value = match serde_json::from_str(line) {
-            Ok(value) => value,
-            Err(err) => panic!("failed to parse rollout JSON line `{line}`: {err}"),
-        };
-        let rl: RolloutLine = match serde_json::from_value(v) {
-            Ok(line) => line,
-            Err(err) => panic!("failed to parse rollout line `{line}`: {err}"),
-        };
+        let parse_json_message = format!("failed to parse rollout JSON line `{line}`");
+        let v: serde_json::Value = serde_json::from_str(line).expect(&parse_json_message);
+        let parse_line_message = format!("failed to parse rollout line `{line}`");
+        let rl: RolloutLine = serde_json::from_value(v).expect(&parse_line_message);
         match rl.item {
             RolloutItem::SessionMeta(_) => {}
             other => items.push(other),

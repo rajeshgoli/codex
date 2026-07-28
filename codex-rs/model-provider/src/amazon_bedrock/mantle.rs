@@ -1,7 +1,11 @@
 use codex_aws_auth::AwsAuthConfig;
+use codex_login::auth::BedrockApiKeyAuth;
 use codex_model_provider_info::ModelProviderAwsAuthInfo;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
+
+use super::auth::BedrockAuthMethod;
+use super::auth::resolve_auth_method;
 
 const BEDROCK_MANTLE_SERVICE_NAME: &str = "bedrock-mantle";
 const BEDROCK_MANTLE_SUPPORTED_REGIONS: [&str; 12] = [
@@ -35,13 +39,37 @@ pub(super) fn region_from_config(aws: &ModelProviderAwsAuthInfo) -> Option<Strin
         .map(str::to_string)
 }
 
+/// Returns whether Amazon Bedrock Mantle is available in `region`.
+pub fn is_supported_amazon_bedrock_region(region: &str) -> bool {
+    BEDROCK_MANTLE_SUPPORTED_REGIONS.contains(&region)
+}
+
 pub(super) fn base_url(region: &str) -> Result<String> {
-    if BEDROCK_MANTLE_SUPPORTED_REGIONS.contains(&region) {
+    if is_supported_amazon_bedrock_region(region) {
         Ok(format!("https://bedrock-mantle.{region}.api.aws/openai/v1"))
     } else {
         Err(CodexErr::Fatal(format!(
             "Amazon Bedrock Mantle does not support region `{region}`"
         )))
+    }
+}
+
+pub(super) async fn runtime_base_url(
+    managed_auth: Option<&BedrockApiKeyAuth>,
+    aws: &ModelProviderAwsAuthInfo,
+) -> Result<String> {
+    let region = resolve_region(managed_auth, aws).await?;
+    base_url(&region)
+}
+
+async fn resolve_region(
+    managed_auth: Option<&BedrockApiKeyAuth>,
+    aws: &ModelProviderAwsAuthInfo,
+) -> Result<String> {
+    match resolve_auth_method(managed_auth, aws).await? {
+        BedrockAuthMethod::ManagedBearerToken { region, .. }
+        | BedrockAuthMethod::EnvBearerToken { region, .. } => Ok(region),
+        BedrockAuthMethod::AwsSdkAuth { context } => Ok(context.region().to_string()),
     }
 }
 

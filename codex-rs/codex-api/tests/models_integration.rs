@@ -75,10 +75,13 @@ async fn models_client_hits_models_endpoint() {
             supported_in_api: true,
             priority: 1,
             additional_speed_tiers: Vec::new(),
+            service_tiers: Vec::new(),
+            default_service_tier: None,
             upgrade: None,
             base_instructions: "base instructions".to_string(),
             model_messages: None,
-            supports_reasoning_summaries: false,
+            include_skills_usage_instructions: false,
+            supports_reasoning_summary_parameter: true,
             default_reasoning_summary: ReasoningSummary::Auto,
             support_verbosity: false,
             default_verbosity: None,
@@ -91,11 +94,16 @@ async fn models_client_hits_models_endpoint() {
             context_window: Some(272_000),
             max_context_window: None,
             auto_compact_token_limit: None,
+            comp_hash: None,
             effective_context_window_percent: 95,
             experimental_supported_tools: Vec::new(),
             input_modalities: default_input_modalities(),
             used_fallback_model_metadata: false,
             supports_search_tool: false,
+            use_responses_lite: false,
+            auto_review_model_override: None,
+            tool_mode: None,
+            multi_agent_version: None,
         }],
     };
 
@@ -110,10 +118,12 @@ async fn models_client_hits_models_endpoint() {
         .await;
 
     let transport = ReqwestTransport::new(reqwest::Client::new());
-    let client = ModelsClient::new(transport, provider(&base_url), Arc::new(DummyAuth));
+    let provider = provider(&base_url);
+    let request_url = ModelsClient::<ReqwestTransport>::request_url(&provider, "0.1.0");
+    let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
 
     let (models, _) = client
-        .list_models("0.1.0", HeaderMap::new())
+        .list_models(request_url, HeaderMap::new())
         .await
         .expect("models request should succeed");
 

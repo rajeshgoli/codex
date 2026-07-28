@@ -1,6 +1,7 @@
 use crate::ClientNotification;
 use crate::ClientRequest;
 use crate::ServerNotification;
+use crate::ServerNotificationEnvelope;
 use crate::ServerRequest;
 use crate::experimental_api::experimental_fields;
 use crate::export_client_notification_schemas;
@@ -14,6 +15,9 @@ use crate::export_server_responses;
 use crate::protocol::common::EXPERIMENTAL_CLIENT_METHOD_PARAM_TYPES;
 use crate::protocol::common::EXPERIMENTAL_CLIENT_METHOD_RESPONSE_TYPES;
 use crate::protocol::common::EXPERIMENTAL_CLIENT_METHODS;
+use crate::protocol::common::EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES;
+use crate::protocol::common::EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES;
+use crate::protocol::common::EXPERIMENTAL_SERVER_METHODS;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -39,6 +43,14 @@ use ts_rs::TS;
 pub(crate) const GENERATED_TS_HEADER: &str = "// GENERATED CODE! DO NOT MODIFY BY HAND!\n\n";
 const IGNORED_DEFINITIONS: &[&str] = &["Option<()>"];
 const JSON_V1_ALLOWLIST: &[&str] = &["InitializeParams", "InitializeResponse"];
+const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
+    "EnvironmentShellInfo",
+    "EnvironmentStatusKind",
+    "PathUri",
+    "RemoteControlClient",
+    "RemoteControlClientsListOrder",
+    "ThreadBackgroundTerminal",
+];
 const SPECIAL_DEFINITIONS: &[&str] = &[
     "ClientNotification",
     "ClientRequest",
@@ -48,7 +60,8 @@ const SPECIAL_DEFINITIONS: &[&str] = &[
 const FLAT_V2_SHARED_DEFINITIONS: &[&str] = &["ClientRequest", "ServerNotification"];
 const V1_CLIENT_REQUEST_METHODS: &[&str] =
     &["getConversationSummary", "gitDiffToRemote", "getAuthStatus"];
-const EXCLUDED_SERVER_NOTIFICATION_METHODS_FOR_JSON: &[&str] = &["rawResponseItem/completed"];
+const EXCLUDED_SERVER_NOTIFICATION_METHODS_FOR_JSON: &[&str] =
+    &["rawResponseItem/completed", "rawResponse/completed"];
 
 #[derive(Clone)]
 pub struct GeneratedSchema {
@@ -118,6 +131,7 @@ pub fn generate_ts_with_options(
     ServerRequest::export_all_to(out_dir)?;
     export_server_responses(out_dir)?;
     ServerNotification::export_all_to(out_dir)?;
+    ServerNotificationEnvelope::export_all_to(out_dir)?;
 
     if !options.experimental_api {
         filter_experimental_ts(out_dir)?;
@@ -244,10 +258,10 @@ fn filter_experimental_ts(out_dir: &Path) -> Result<()> {
     let registered_fields = experimental_fields();
     let experimental_method_types = experimental_method_types();
     // Most generated TS files are filtered by schema processing, but
-    // `ClientRequest.ts` and any type with `#[experimental(...)]` fields need
-    // direct post-processing because they encode method/field information in
-    // file-local unions/interfaces.
-    filter_client_request_ts(out_dir, EXPERIMENTAL_CLIENT_METHODS)?;
+    // Request unions and types with `#[experimental(...)]` fields need direct
+    // post-processing because they encode method/field information locally.
+    filter_request_ts(out_dir, "ClientRequest.ts", EXPERIMENTAL_CLIENT_METHODS)?;
+    filter_request_ts(out_dir, "ServerRequest.ts", EXPERIMENTAL_SERVER_METHODS)?;
     filter_experimental_type_fields_ts(out_dir, &registered_fields)?;
     remove_generated_type_files(out_dir, &experimental_method_types, "ts")?;
     Ok(())
@@ -256,10 +270,13 @@ fn filter_experimental_ts(out_dir: &Path) -> Result<()> {
 pub(crate) fn filter_experimental_ts_tree(tree: &mut BTreeMap<PathBuf, String>) -> Result<()> {
     let registered_fields = experimental_fields();
     let experimental_method_types = experimental_method_types();
-    if let Some(content) = tree.get_mut(Path::new("ClientRequest.ts")) {
-        let filtered =
-            filter_client_request_ts_contents(std::mem::take(content), EXPERIMENTAL_CLIENT_METHODS);
-        *content = filtered;
+    for (file_name, experimental_methods) in [
+        ("ClientRequest.ts", EXPERIMENTAL_CLIENT_METHODS),
+        ("ServerRequest.ts", EXPERIMENTAL_SERVER_METHODS),
+    ] {
+        if let Some(content) = tree.get_mut(Path::new(file_name)) {
+            *content = filter_request_ts_contents(std::mem::take(content), experimental_methods);
+        }
     }
 
     let mut fields_by_type_name: HashMap<String, HashSet<String>> = HashMap::new();
@@ -288,21 +305,21 @@ pub(crate) fn filter_experimental_ts_tree(tree: &mut BTreeMap<PathBuf, String>) 
     Ok(())
 }
 
-/// Removes union arms from `ClientRequest.ts` for methods marked experimental.
-fn filter_client_request_ts(out_dir: &Path, experimental_methods: &[&str]) -> Result<()> {
-    let path = out_dir.join("ClientRequest.ts");
+/// Removes union arms from a generated request type for methods marked experimental.
+fn filter_request_ts(out_dir: &Path, file_name: &str, experimental_methods: &[&str]) -> Result<()> {
+    let path = out_dir.join(file_name);
     if !path.exists() {
         return Ok(());
     }
     let mut content =
         fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-    content = filter_client_request_ts_contents(content, experimental_methods);
+    content = filter_request_ts_contents(content, experimental_methods);
 
     fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }
 
-fn filter_client_request_ts_contents(mut content: String, experimental_methods: &[&str]) -> String {
+fn filter_request_ts_contents(mut content: String, experimental_methods: &[&str]) -> String {
     let Some((prefix, body, suffix)) = split_type_alias(&content) else {
         return content;
     };
@@ -399,6 +416,7 @@ fn filter_experimental_schema(bundle: &mut Value) -> Result<()> {
     filter_experimental_fields_in_root(bundle, &registered_fields);
     filter_experimental_fields_in_definitions(bundle, &registered_fields);
     prune_experimental_methods(bundle, EXPERIMENTAL_CLIENT_METHODS);
+    prune_experimental_methods(bundle, EXPERIMENTAL_SERVER_METHODS);
     remove_experimental_method_type_definitions(bundle);
     Ok(())
 }
@@ -554,6 +572,9 @@ fn experimental_method_types() -> HashSet<String> {
     let mut type_names = HashSet::new();
     collect_experimental_type_names(EXPERIMENTAL_CLIENT_METHOD_PARAM_TYPES, &mut type_names);
     collect_experimental_type_names(EXPERIMENTAL_CLIENT_METHOD_RESPONSE_TYPES, &mut type_names);
+    collect_experimental_type_names(EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES, &mut type_names);
+    collect_experimental_type_names(EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES, &mut type_names);
+    collect_experimental_type_names(EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES, &mut type_names);
     type_names
 }
 
@@ -948,10 +969,8 @@ impl ScanState {
             '(' => self.depth.paren += 1,
             ')' => self.depth.paren = (self.depth.paren - 1).max(0),
             '<' => self.depth.angle += 1,
-            '>' => {
-                if self.depth.angle > 0 {
-                    self.depth.angle -= 1;
-                }
+            '>' if self.depth.angle > 0 => {
+                self.depth.angle -= 1;
             }
             _ => {}
         }
@@ -1324,6 +1343,7 @@ where
             strip_v1_client_request_variants_from_json_schema(&mut schema_value);
         } else if file_stem == "ServerNotification" {
             strip_v1_server_notification_variants_from_json_schema(&mut schema_value);
+            add_server_notification_emitted_at_to_json_schema(&mut schema_value)?;
         }
         enforce_numbered_definition_collision_overrides(file_stem, &mut schema_value);
         annotate_schema(&mut schema_value, Some(file_stem));
@@ -1354,6 +1374,25 @@ where
         logical_name: logical_name.to_string(),
         value: schema_value,
     })
+}
+
+fn add_server_notification_emitted_at_to_json_schema(schema: &mut Value) -> Result<()> {
+    let schema = schema
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("expected ServerNotification schema to be an object"))?;
+    schema.insert(
+        "properties".to_string(),
+        serde_json::json!({
+            "emittedAtMs": {
+                "description": "Unix timestamp (in milliseconds) when app-server emitted this notification.",
+                "format": "int64",
+                "type": "integer"
+            }
+        }),
+    );
+    // Keep this optional in generated client schemas for compatibility with
+    // older app-server versions. New servers still always emit it.
+    Ok(())
 }
 
 fn enforce_numbered_definition_collision_overrides(schema_name: &str, schema: &mut Value) {
@@ -2114,6 +2153,13 @@ mod tests {
             client_request_ts.contains("MockExperimentalMethodParams"),
             false
         );
+        let server_request_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("ServerRequest.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing ServerRequest.ts fixture"))?,
+        )?;
+        assert_eq!(server_request_ts.contains("currentTime/read"), false);
+        assert_eq!(server_request_ts.contains("CurrentTimeReadParams"), false);
         let typescript_index = std::str::from_utf8(
             fixture_tree
                 .get(Path::new("index.ts"))
@@ -2132,6 +2178,22 @@ mod tests {
         );
         assert_eq!(
             fixture_tree.contains_key(Path::new("v2/MockExperimentalMethodResponse.ts")),
+            false
+        );
+        assert_eq!(
+            fixture_tree.contains_key(Path::new("v2/CurrentTimeReadParams.ts")),
+            false
+        );
+        assert_eq!(
+            fixture_tree.contains_key(Path::new("v2/CurrentTimeReadResponse.ts")),
+            false
+        );
+        assert_eq!(
+            fixture_tree.contains_key(Path::new("v2/RemoteControlClient.ts")),
+            false
+        );
+        assert_eq!(
+            fixture_tree.contains_key(Path::new("v2/RemoteControlClientsListOrder.ts")),
             false
         );
 
@@ -2212,20 +2274,14 @@ mod tests {
                         continue;
                     }
                     match ch {
-                        '\\' => {
-                            if in_single || in_double {
-                                escape = true;
-                            }
+                        '\\' if (in_single || in_double) => {
+                            escape = true;
                         }
-                        '\'' => {
-                            if !in_double {
-                                in_single = !in_single;
-                            }
+                        '\'' if !in_double => {
+                            in_single = !in_single;
                         }
-                        '"' => {
-                            if !in_single {
-                                in_double = !in_double;
-                            }
+                        '"' if !in_single => {
+                            in_double = !in_double;
                         }
                         '{' if !in_single && !in_double => level_brace += 1,
                         '}' if !in_single && !in_double => level_brace -= 1,
@@ -2747,7 +2803,6 @@ export type Config = { stableField: Keep, unstableField: string | null } & ({ [k
         let _guard = TempDirGuard(output_dir.clone());
         let path = output_dir.join("CommandExecParams.ts");
         let content = r#"import type { CommandExecTerminalSize } from "./CommandExecTerminalSize";
-import type { PermissionProfile } from "./PermissionProfile";
 import type { SandboxPolicy } from "./SandboxPolicy";
 
 export type CommandExecParams = {/**
@@ -2770,12 +2825,12 @@ size?: CommandExecTerminalSize | null, /**
  */
 sandboxPolicy?: SandboxPolicy | null,
 /**
- * Optional full permissions profile for this command.
+ * Optional active permissions profile id for this command.
  *
  * Defaults to the user's configured permissions when omitted. Cannot be
  * combined with `sandboxPolicy`.
  */
-permissionProfile?: PermissionProfile | null};
+permissionProfile?: string | null};
 "#;
         fs::write(&path, content)?;
 
@@ -2788,14 +2843,7 @@ permissionProfile?: PermissionProfile | null};
         filter_experimental_type_fields_ts(&output_dir, &[&CUSTOM_FIELD])?;
 
         let filtered = fs::read_to_string(&path)?;
-        assert_eq!(
-            filtered.contains("permissionProfile?: PermissionProfile"),
-            false
-        );
-        assert_eq!(
-            filtered.contains(r#"import type { PermissionProfile } from "./PermissionProfile";"#),
-            false
-        );
+        assert_eq!(filtered.contains("permissionProfile?: string"), false);
         assert_eq!(filtered.contains("sandboxPolicy?: SandboxPolicy"), true);
         assert_eq!(
             filtered.contains(r#"import type { SandboxPolicy } from "./SandboxPolicy";"#),
@@ -2861,6 +2909,11 @@ permissionProfile?: PermissionProfile | null};
         );
         assert_eq!(
             flat_v2_bundle_json.contains("MockExperimentalMethodResponse"),
+            false
+        );
+        assert_eq!(flat_v2_bundle_json.contains("RemoteControlClient"), false);
+        assert_eq!(
+            flat_v2_bundle_json.contains("RemoteControlClientsListOrder"),
             false
         );
         assert_eq!(flat_v2_bundle_json.contains("#/definitions/v2/"), false);
@@ -2936,6 +2989,48 @@ permissionProfile?: PermissionProfile | null};
                 .exists(),
             false
         );
+        assert_eq!(
+            output_dir
+                .join("v2")
+                .join("RemoteControlClient.json")
+                .exists(),
+            false
+        );
+        assert_eq!(
+            output_dir
+                .join("v2")
+                .join("RemoteControlClientsListOrder.json")
+                .exists(),
+            false
+        );
+
+        let _cleanup = fs::remove_dir_all(&output_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn generate_json_includes_remote_control_methods_with_experimental_api() -> Result<()> {
+        let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
+        fs::create_dir(&output_dir)?;
+        generate_json_with_experimental(&output_dir, /*experimental_api*/ true)?;
+
+        let client_request_json = fs::read_to_string(output_dir.join("ClientRequest.json"))?;
+        assert!(client_request_json.contains("remoteControl/pairing/start"));
+        assert!(client_request_json.contains("remoteControl/pairing/status"));
+        assert!(client_request_json.contains("remoteControl/client/list"));
+        assert!(client_request_json.contains("remoteControl/client/revoke"));
+        for schema in [
+            "RemoteControlPairingStartParams.json",
+            "RemoteControlPairingStartResponse.json",
+            "RemoteControlPairingStatusParams.json",
+            "RemoteControlPairingStatusResponse.json",
+            "RemoteControlClientsListParams.json",
+            "RemoteControlClientsListResponse.json",
+            "RemoteControlClientsRevokeParams.json",
+            "RemoteControlClientsRevokeResponse.json",
+        ] {
+            assert!(output_dir.join("v2").join(schema).exists());
+        }
 
         let _cleanup = fs::remove_dir_all(&output_dir);
         Ok(())

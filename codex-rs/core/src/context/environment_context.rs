@@ -1,19 +1,216 @@
-use crate::session::turn_context::TurnContext;
-use crate::shell::Shell;
-use codex_protocol::protocol::TurnContextItem;
-use codex_protocol::protocol::TurnContextNetworkItem;
-use std::path::PathBuf;
+use codex_protocol::models::ManagedFileSystemPermissions;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_utils_path_uri::PathUri;
+use std::collections::HashSet;
 
-use super::ContextualUserFragment;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileSystemContext {
+    workspace_roots: Vec<String>,
+    permission_profile: FileSystemPermissionProfileContext,
+}
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct EnvironmentContext {
-    pub(crate) cwd: Option<PathBuf>,
-    pub(crate) shell: String,
-    pub(crate) current_date: Option<String>,
-    pub(crate) timezone: Option<String>,
-    pub(crate) network: Option<NetworkContext>,
-    pub(crate) subagents: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileSystemPermissionProfileContext {
+    Managed(ManagedFileSystemContext),
+    Disabled,
+    External,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManagedFileSystemContext {
+    Restricted {
+        entries: Vec<FileSystemSandboxEntry>,
+        glob_scan_max_depth: Option<usize>,
+    },
+    Unrestricted,
+}
+
+impl FileSystemContext {
+    pub(super) fn from_permission_profile(
+        permission_profile: &PermissionProfile,
+        workspace_roots: &[PathUri],
+    ) -> Self {
+        let materialized_workspace_roots = workspace_roots
+            .iter()
+            .filter_map(|workspace_root| workspace_root.to_abs_path().ok())
+            .collect::<Vec<_>>();
+        let permission_profile = permission_profile
+            .clone()
+            .materialize_project_roots_with_workspace_roots(&materialized_workspace_roots);
+        let workspace_roots = workspace_roots
+            .iter()
+            .map(PathUri::inferred_native_path_string)
+            .collect();
+        let permission_profile = match permission_profile {
+            PermissionProfile::Managed { file_system, .. } => {
+                FileSystemPermissionProfileContext::Managed(ManagedFileSystemContext::from(
+                    file_system,
+                ))
+            }
+            PermissionProfile::Disabled => FileSystemPermissionProfileContext::Disabled,
+            PermissionProfile::External { .. } => FileSystemPermissionProfileContext::External,
+        };
+        Self {
+            workspace_roots,
+            permission_profile,
+        }
+    }
+
+    pub(super) fn render(&self) -> String {
+        let mut rendered = "<filesystem>".to_string();
+        if !self.workspace_roots.is_empty() {
+            rendered.push_str("<workspace_roots>");
+            for root in &self.workspace_roots {
+                push_text_element(&mut rendered, "root", root);
+            }
+            rendered.push_str("</workspace_roots>");
+        }
+        self.permission_profile.render(&mut rendered);
+        rendered.push_str("</filesystem>");
+        rendered
+    }
+}
+
+impl From<ManagedFileSystemPermissions> for ManagedFileSystemContext {
+    fn from(file_system: ManagedFileSystemPermissions) -> Self {
+        match file_system {
+            ManagedFileSystemPermissions::Restricted {
+                mut entries,
+                glob_scan_max_depth,
+            } => {
+                dedupe_file_system_entries(&mut entries);
+                Self::Restricted {
+                    entries,
+                    glob_scan_max_depth: glob_scan_max_depth.map(usize::from),
+                }
+            }
+            ManagedFileSystemPermissions::Unrestricted => Self::Unrestricted,
+        }
+    }
+}
+
+impl FileSystemPermissionProfileContext {
+    fn render(&self, rendered: &mut String) {
+        match self {
+            Self::Managed(file_system) => {
+                rendered.push_str("<permission_profile type=\"managed\">");
+                file_system.render(rendered);
+                rendered.push_str("</permission_profile>");
+            }
+            Self::Disabled => {
+                rendered.push_str(
+                    "<permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile>",
+                );
+            }
+            Self::External => {
+                rendered.push_str(
+                    "<permission_profile type=\"external\"><file_system type=\"external\" /></permission_profile>",
+                );
+            }
+        }
+    }
+}
+
+impl ManagedFileSystemContext {
+    fn render(&self, rendered: &mut String) {
+        match self {
+            Self::Restricted {
+                entries,
+                glob_scan_max_depth,
+            } => {
+                if entries.is_empty() && glob_scan_max_depth.is_none() {
+                    rendered.push_str("<file_system type=\"restricted\" />");
+                    return;
+                }
+
+                rendered.push_str("<file_system type=\"restricted\"");
+                if let Some(glob_scan_max_depth) = glob_scan_max_depth {
+                    rendered.push_str(&format!(" glob_scan_max_depth=\"{glob_scan_max_depth}\""));
+                }
+                rendered.push('>');
+                for entry in entries {
+                    render_file_system_entry(rendered, entry);
+                }
+                rendered.push_str("</file_system>");
+            }
+            Self::Unrestricted => {
+                rendered.push_str("<file_system type=\"unrestricted\" />");
+            }
+        }
+    }
+}
+
+fn render_file_system_entry(rendered: &mut String, entry: &FileSystemSandboxEntry) {
+    rendered.push_str("<entry access=\"");
+    let access = entry.access.to_string();
+    rendered.push_str(&access);
+    if entry.access == FileSystemAccessMode::Deny {
+        rendered.push_str("\" escalatable=\"false");
+    }
+    rendered.push_str("\">");
+    match &entry.path {
+        FileSystemPath::Path { path } => {
+            push_text_element(rendered, "path", path.to_string_lossy().as_ref());
+        }
+        FileSystemPath::GlobPattern { pattern } => {
+            push_text_element(rendered, "glob", pattern);
+        }
+        FileSystemPath::Special { value } => {
+            let value = render_special_path(value);
+            push_text_element(rendered, "special", &value);
+        }
+    }
+    rendered.push_str("</entry>");
+}
+
+fn render_special_path(value: &FileSystemSpecialPath) -> String {
+    match value {
+        FileSystemSpecialPath::Root => ":root".to_string(),
+        FileSystemSpecialPath::Minimal => ":minimal".to_string(),
+        FileSystemSpecialPath::ProjectRoots { subpath } => {
+            render_special_path_with_subpath(":workspace_roots", subpath)
+        }
+        FileSystemSpecialPath::Tmpdir => ":tmpdir".to_string(),
+        FileSystemSpecialPath::SlashTmp => ":slash_tmp".to_string(),
+        FileSystemSpecialPath::Unknown { path, subpath } => {
+            render_special_path_with_subpath(path, subpath)
+        }
+    }
+}
+
+fn render_special_path_with_subpath(base: &str, subpath: &Option<String>) -> String {
+    match subpath {
+        Some(subpath) => format!("{base}/{subpath}"),
+        None => base.to_string(),
+    }
+}
+
+fn dedupe_file_system_entries(entries: &mut Vec<FileSystemSandboxEntry>) {
+    let mut seen = HashSet::new();
+    entries.retain(|entry| seen.insert(entry.clone()));
+}
+
+fn push_text_element(rendered: &mut String, name: &str, value: &str) {
+    rendered.push_str(&format!("<{name}>"));
+    push_xml_escaped_text(rendered, value);
+    rendered.push_str(&format!("</{name}>"));
+}
+
+pub(crate) fn push_xml_escaped_text(rendered: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '&' => rendered.push_str("&amp;"),
+            '<' => rendered.push_str("&lt;"),
+            '>' => rendered.push_str("&gt;"),
+            '"' => rendered.push_str("&quot;"),
+            '\'' => rendered.push_str("&apos;"),
+            _ => rendered.push(ch),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -29,181 +226,22 @@ impl NetworkContext {
             denied_domains,
         }
     }
-}
 
-impl EnvironmentContext {
-    pub(crate) fn new(
-        cwd: Option<PathBuf>,
-        shell: String,
-        current_date: Option<String>,
-        timezone: Option<String>,
-        network: Option<NetworkContext>,
-        subagents: Option<String>,
-    ) -> Self {
-        Self {
-            cwd,
-            shell,
-            current_date,
-            timezone,
-            network,
-            subagents,
+    pub(super) fn render(&self) -> String {
+        let mut rendered = "<network enabled=\"true\">".to_string();
+        Self::push_rendered_domain_element(&mut rendered, "allowed", &self.allowed_domains);
+        Self::push_rendered_domain_element(&mut rendered, "denied", &self.denied_domains);
+        rendered.push_str("</network>");
+        rendered
+    }
+
+    fn push_rendered_domain_element(rendered_network: &mut String, name: &str, domains: &[String]) {
+        if domains.is_empty() {
+            return;
         }
-    }
 
-    /// Compares two environment contexts, ignoring the shell. Useful when
-    /// comparing turn to turn, since the initial environment_context will
-    /// include the shell, and then it is not configurable from turn to turn.
-    pub(crate) fn equals_except_shell(&self, other: &EnvironmentContext) -> bool {
-        let EnvironmentContext {
-            cwd,
-            current_date,
-            timezone,
-            network,
-            subagents,
-            shell: _,
-        } = other;
-        self.cwd == *cwd
-            && self.current_date == *current_date
-            && self.timezone == *timezone
-            && self.network == *network
-            && self.subagents == *subagents
-    }
-
-    pub(crate) fn diff_from_turn_context_item(
-        before: &TurnContextItem,
-        after: &EnvironmentContext,
-    ) -> Self {
-        let before_network = Self::network_from_turn_context_item(before);
-        let cwd = match &after.cwd {
-            Some(cwd) if before.cwd.as_path() != cwd.as_path() => Some(cwd.clone()),
-            _ => None,
-        };
-        let network = if before_network != after.network {
-            after.network.clone()
-        } else {
-            before_network
-        };
-        EnvironmentContext::new(
-            cwd,
-            after.shell.clone(),
-            after.current_date.clone(),
-            after.timezone.clone(),
-            network,
-            /*subagents*/ None,
-        )
-    }
-
-    pub(crate) fn from_turn_context(turn_context: &TurnContext, shell: &Shell) -> Self {
-        Self::new(
-            Some(turn_context.cwd.to_path_buf()),
-            shell.name().to_string(),
-            turn_context.current_date.clone(),
-            turn_context.timezone.clone(),
-            Self::network_from_turn_context(turn_context),
-            /*subagents*/ None,
-        )
-    }
-
-    pub(crate) fn from_turn_context_item(
-        turn_context_item: &TurnContextItem,
-        shell: String,
-    ) -> Self {
-        Self::new(
-            Some(turn_context_item.cwd.clone()),
-            shell,
-            turn_context_item.current_date.clone(),
-            turn_context_item.timezone.clone(),
-            Self::network_from_turn_context_item(turn_context_item),
-            /*subagents*/ None,
-        )
-    }
-
-    pub(crate) fn with_subagents(mut self, subagents: String) -> Self {
-        if !subagents.is_empty() {
-            self.subagents = Some(subagents);
-        }
-        self
-    }
-
-    fn network_from_turn_context(turn_context: &TurnContext) -> Option<NetworkContext> {
-        let network = turn_context
-            .config
-            .config_layer_stack
-            .requirements()
-            .network
-            .as_ref()?;
-
-        Some(NetworkContext::new(
-            network
-                .domains
-                .as_ref()
-                .and_then(codex_config::NetworkDomainPermissionsToml::allowed_domains)
-                .unwrap_or_default(),
-            network
-                .domains
-                .as_ref()
-                .and_then(codex_config::NetworkDomainPermissionsToml::denied_domains)
-                .unwrap_or_default(),
-        ))
-    }
-
-    fn network_from_turn_context_item(
-        turn_context_item: &TurnContextItem,
-    ) -> Option<NetworkContext> {
-        let TurnContextNetworkItem {
-            allowed_domains,
-            denied_domains,
-        } = turn_context_item.network.as_ref()?;
-        Some(NetworkContext::new(
-            allowed_domains.clone(),
-            denied_domains.clone(),
-        ))
+        rendered_network.push_str(&format!("<{name}>"));
+        rendered_network.push_str(&domains.join(","));
+        rendered_network.push_str(&format!("</{name}>"));
     }
 }
-
-impl ContextualUserFragment for EnvironmentContext {
-    const ROLE: &'static str = "user";
-    const START_MARKER: &'static str = codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
-    const END_MARKER: &'static str = codex_protocol::protocol::ENVIRONMENT_CONTEXT_CLOSE_TAG;
-
-    fn body(&self) -> String {
-        let mut lines = Vec::new();
-        if let Some(cwd) = &self.cwd {
-            lines.push(format!("  <cwd>{}</cwd>", cwd.to_string_lossy()));
-        }
-
-        lines.push(format!("  <shell>{}</shell>", self.shell));
-        if let Some(current_date) = &self.current_date {
-            lines.push(format!("  <current_date>{current_date}</current_date>"));
-        }
-        if let Some(timezone) = &self.timezone {
-            lines.push(format!("  <timezone>{timezone}</timezone>"));
-        }
-        match &self.network {
-            Some(network) => {
-                lines.push("  <network enabled=\"true\">".to_string());
-                for allowed in &network.allowed_domains {
-                    lines.push(format!("    <allowed>{allowed}</allowed>"));
-                }
-                for denied in &network.denied_domains {
-                    lines.push(format!("    <denied>{denied}</denied>"));
-                }
-                lines.push("  </network>".to_string());
-            }
-            None => {
-                // TODO(mbolin): Include this line if it helps the model.
-                // lines.push("  <network enabled=\"false\" />".to_string());
-            }
-        }
-        if let Some(subagents) = &self.subagents {
-            lines.push("  <subagents>".to_string());
-            lines.extend(subagents.lines().map(|line| format!("    {line}")));
-            lines.push("  </subagents>".to_string());
-        }
-        format!("\n{}\n", lines.join("\n"))
-    }
-}
-
-#[cfg(test)]
-#[path = "environment_context_tests.rs"]
-mod tests;
