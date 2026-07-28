@@ -297,12 +297,9 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
     }
 
     match LOGGER.mode() {
-        Some(LogMode::EventStream) => match event {
-            // SubmitThreadOp is logged at the submit point, where the routed
-            // thread id is known and duplicate queued-event records can be avoided.
-            AppEvent::SubmitThreadOp { .. } => {}
-            _ => {}
-        },
+        // Event-stream mode records outbound commands and server notifications
+        // at their submit/receive points to avoid duplicate queued-event records.
+        Some(LogMode::EventStream) => {}
         Some(LogMode::Legacy) => match event {
             AppEvent::NewSession => {
                 LOGGER.write_json_line(&json!({
@@ -597,7 +594,12 @@ mod tests {
     use super::validate_schema_version;
 
     fn assert_common_fields(record: &Value) {
-        assert!(record.get("schema_version").and_then(Value::as_u64).is_some());
+        assert!(
+            record
+                .get("schema_version")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
         assert!(record.get("ts").and_then(Value::as_str).is_some());
         assert!(record.get("session_id").and_then(Value::as_str).is_some());
         assert!(record.get("event_type").and_then(Value::as_str).is_some());
@@ -622,7 +624,12 @@ mod tests {
         assert_common_fields(&record);
         assert_eq!(record["schema_version"], Value::from(EVENT_SCHEMA_CURRENT));
         assert!(record.get("seq").and_then(Value::as_u64).is_some());
-        assert!(record.get("session_epoch").and_then(Value::as_u64).is_some());
+        assert!(
+            record
+                .get("session_epoch")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
     }
 
     #[test]
@@ -635,8 +642,14 @@ mod tests {
 
     #[test]
     fn normalizes_legacy_turn_event_names() {
-        assert_eq!(normalize_contract_event_type("task_started"), "turn_started");
-        assert_eq!(normalize_contract_event_type("task_complete"), "turn_complete");
+        assert_eq!(
+            normalize_contract_event_type("task_started"),
+            "turn_started"
+        );
+        assert_eq!(
+            normalize_contract_event_type("task_complete"),
+            "turn_complete"
+        );
         assert_eq!(
             normalize_contract_event_type("turn/started"),
             "turn_started"
@@ -645,6 +658,9 @@ mod tests {
             normalize_contract_event_type("turn/completed"),
             "turn_complete"
         );
-        assert_eq!(normalize_contract_event_type("exec_command_begin"), "exec_command_begin");
+        assert_eq!(
+            normalize_contract_event_type("exec_command_begin"),
+            "exec_command_begin"
+        );
     }
 }

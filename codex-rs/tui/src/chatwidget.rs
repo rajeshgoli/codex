@@ -1673,30 +1673,7 @@ impl ChatWidget {
             return;
         }
 
-        let submitted = self.submit_op(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: text.clone(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-        });
-        if !submitted {
-            return;
-        }
-
-        self.last_rendered_user_message_event = Some(Self::rendered_user_message_event_from_parts(
-            text.clone(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ));
-        self.add_to_history(history_cell::new_user_prompt(
-            text,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ));
-        self.needs_final_message_separator = false;
+        self.submit_user_message_with_shell_escape_policy(text.into(), ShellEscapePolicy::Disallow);
     }
 
     /// True when the UI is in the regular composer state with no running task,
