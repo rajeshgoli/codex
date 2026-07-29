@@ -332,7 +332,6 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
                 state.epoch
             ),
         );
-        cache.insert(request_id, response.clone());
         return response;
     }
 
@@ -1031,5 +1030,15 @@ mod tests {
             Some("stale_epoch")
         );
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        let retry = process_request(
+            &state,
+            ControlRequest {
+                request_id: "req-stale".to_string(),
+                expected_epoch: Some(state.epoch.clone()),
+                command: ControlCommand::GetEpoch,
+            },
+        );
+        assert!(retry.ok);
     }
 }
