@@ -72,7 +72,9 @@ All responses include:
 
 ### Idempotency and Epoch Semantics
 
-- Duplicate `request_id` values return the cached original response.
+- Duplicate `request_id` values return the cached original response after a request passes epoch
+  validation. A `stale_epoch` response is transient and is not cached, so clients can refresh the
+  epoch and retry with the same request ID.
 - `expected_epoch` can be used to detect reconnect/restart races.
 - Epoch values are process-scoped and change when a new interactive process starts.
 
