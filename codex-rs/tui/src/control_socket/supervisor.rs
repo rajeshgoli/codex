@@ -383,6 +383,10 @@ fn remove_existing_socket_if_safe(path: &Path) -> std::io::Result<()> {
             ),
         ));
     }
+    let identity = SocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
     match UnixStream::connect(path) {
         Ok(_) => Err(std::io::Error::new(
             ErrorKind::AlreadyExists,
@@ -394,7 +398,7 @@ fn remove_existing_socket_if_safe(path: &Path) -> std::io::Result<()> {
                 ErrorKind::ConnectionRefused | ErrorKind::NotFound
             ) =>
         {
-            fs::remove_file(path)
+            remove_socket_file_if_owned(path, identity)
         }
         Err(err) => Err(std::io::Error::new(
             ErrorKind::AlreadyExists,
