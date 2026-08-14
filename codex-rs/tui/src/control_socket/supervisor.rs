@@ -1,5 +1,6 @@
 use super::ControlState;
 use super::MAX_CONNECTION_WORKERS;
+use super::RequestCache;
 use super::handle_connection;
 use crate::app_event_sender::AppEventSender;
 use crate::session_log;
@@ -7,6 +8,7 @@ use serde_json::json;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -182,6 +184,7 @@ fn supervise_listener(
     shutdown: Arc<AtomicBool>,
 ) {
     let mut generation_number = 1_u64;
+    let request_cache = Arc::new(Mutex::new(RequestCache::default()));
 
     loop {
         let generation_shutdown = Arc::new(AtomicBool::new(false));
@@ -197,9 +200,10 @@ fn supervise_listener(
             &generation.epoch,
             None,
         );
-        let state = Arc::new(ControlState::new(
+        let state = Arc::new(ControlState::with_cache(
             app_event_tx.clone(),
             generation.epoch.clone(),
+            Arc::clone(&request_cache),
         ));
         let exit = run_listener_generation(
             &generation.listener,
@@ -252,9 +256,16 @@ fn supervise_listener(
         let mut delay = PATH_CHECK_INTERVAL;
         generation = loop {
             if shutdown.load(Ordering::Relaxed) {
+                log_lifecycle(
+                    "control_socket_stopped",
+                    &socket_path,
+                    generation_number,
+                    &generation.epoch,
+                    None,
+                );
                 return;
             }
-            match bind_listener(&socket_path) {
+            match bind_initial_listener(&socket_path) {
                 Ok(listener) => break listener,
                 Err(err) => {
                     tracing::debug!(
@@ -423,6 +434,6 @@ fn log_lifecycle(
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "supervisor_tests.rs"]
 mod tests;

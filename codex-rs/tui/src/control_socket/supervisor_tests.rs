@@ -9,6 +9,7 @@ use std::os::unix::net::UnixStream;
 use std::time::Instant;
 use tempfile::TempDir;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
 
 fn start_handle(path: &Path) -> (ControlSocketHandle, UnboundedReceiver<AppEvent>) {
@@ -80,6 +81,35 @@ fn missing_socket_path_is_rebound_with_a_fresh_epoch() {
 }
 
 #[test]
+fn duplicate_request_is_not_redispatched_after_rebind() {
+    let tempdir = TempDir::new().unwrap();
+    let path = tempdir.path().join("control.sock");
+    let (mut handle, mut rx) = start_handle(&path);
+    let first_epoch = wait_for_epoch(&path, None);
+    let request_id = "submit-across-rebind";
+    let first_request = format!(
+        "{{\"request_id\":\"{request_id}\",\"expected_epoch\":\"{first_epoch}\",\"command\":\"submit_message\",\"message\":\"only once\",\"thread_id\":null}}\n"
+    );
+
+    request(&path, first_request.as_bytes()).unwrap();
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AppEvent::SubmitExternalLiteralUserMessage { text }) if text == "only once"
+    ));
+
+    fs::remove_file(&path).unwrap();
+    let second_epoch = wait_for_epoch(&path, Some(&first_epoch));
+    let retry = format!(
+        "{{\"request_id\":\"{request_id}\",\"expected_epoch\":\"{second_epoch}\",\"command\":\"submit_message\",\"message\":\"only once\",\"thread_id\":null}}\n"
+    );
+    let response = request(&path, retry.as_bytes()).unwrap();
+
+    assert_eq!(response["epoch"], second_epoch);
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    handle.shutdown();
+}
+
+#[test]
 fn cleanup_does_not_remove_a_replacement_socket() {
     let tempdir = TempDir::new().unwrap();
     let path = tempdir.path().join("control.sock");
@@ -94,6 +124,24 @@ fn cleanup_does_not_remove_a_replacement_socket() {
     assert!(path.exists());
     drop(replacement);
     fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn stale_replacement_socket_is_reaped_before_rebind() {
+    let tempdir = TempDir::new().unwrap();
+    let path = tempdir.path().join("control.sock");
+    let (mut handle, _rx) = start_handle(&path);
+    let first_epoch = wait_for_epoch(&path, None);
+
+    fs::remove_file(&path).unwrap();
+    let replacement = UnixListener::bind(&path).unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    drop(replacement);
+
+    let second_epoch = wait_for_epoch(&path, Some(&first_epoch));
+    assert_ne!(first_epoch, second_epoch);
+    handle.shutdown();
+    assert!(!path.exists());
 }
 
 #[test]

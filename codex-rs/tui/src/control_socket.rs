@@ -43,15 +43,28 @@ const MAX_EXTERNAL_BTW_PROMPT_BYTES: usize = 4 * 1024;
 struct ControlState {
     epoch: String,
     app_event_tx: AppEventSender,
-    cache: Mutex<RequestCache>,
+    cache: Arc<Mutex<RequestCache>>,
 }
 
 impl ControlState {
+    #[cfg(test)]
     fn new(app_event_tx: AppEventSender, epoch: String) -> Self {
+        Self::with_cache(
+            app_event_tx,
+            epoch,
+            Arc::new(Mutex::new(RequestCache::default())),
+        )
+    }
+
+    fn with_cache(
+        app_event_tx: AppEventSender,
+        epoch: String,
+        cache: Arc<Mutex<RequestCache>>,
+    ) -> Self {
         Self {
             epoch,
             app_event_tx,
-            cache: Mutex::new(RequestCache::default()),
+            cache,
         }
     }
 }
@@ -222,7 +235,8 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
             "control cache lock poisoned",
         );
     };
-    if let Some(cached) = cache.get(&request_id) {
+    if let Some(mut cached) = cache.get(&request_id) {
+        cached.epoch.clone_from(&state.epoch);
         return cached;
     }
 
