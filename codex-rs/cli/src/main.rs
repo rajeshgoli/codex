@@ -2609,6 +2609,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         mut config_overrides,
         event_stream,
         event_schema_version,
+        control_socket,
         ..
     } = subcommand_cli;
     let subcommand_auto_review = shared.auto_review;
@@ -2634,6 +2635,9 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     }
     if event_schema_version.is_some() {
         interactive.event_schema_version = event_schema_version;
+    }
+    if control_socket.is_some() {
+        interactive.control_socket = control_socket;
     }
     if let Some(prompt) = prompt {
         // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
@@ -3580,6 +3584,18 @@ mod tests {
     }
 
     #[test]
+    fn resume_preserves_subcommand_control_socket() {
+        let interactive = finalize_resume_from_args(
+            ["codex", "resume", "--control-socket", "/tmp/resume.sock"].as_ref(),
+        );
+
+        assert_eq!(
+            interactive.control_socket.as_deref(),
+            Some(std::path::Path::new("/tmp/resume.sock"))
+        );
+    }
+
+    #[test]
     fn resume_picker_logic_none_and_not_last() {
         let interactive = finalize_resume_from_args(["codex", "resume"].as_ref());
         assert!(interactive.resume_picker);
@@ -3749,6 +3765,18 @@ mod tests {
         assert!(!interactive.fork_last);
         assert_eq!(interactive.fork_session_id, None);
         assert!(!interactive.fork_show_all);
+    }
+
+    #[test]
+    fn fork_preserves_subcommand_control_socket() {
+        let interactive = finalize_fork_from_args(
+            ["codex", "fork", "--control-socket", "/tmp/fork.sock"].as_ref(),
+        );
+
+        assert_eq!(
+            interactive.control_socket.as_deref(),
+            Some(std::path::Path::new("/tmp/fork.sock"))
+        );
     }
 
     #[test]
