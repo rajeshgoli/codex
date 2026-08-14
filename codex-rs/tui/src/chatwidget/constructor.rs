@@ -82,14 +82,19 @@ impl ChatWidget {
             .map(|keymap| keymap.chat.clone())
             .unwrap_or_else(|| default_keymap.chat.clone());
         let queued_message_edit_hint_binding = queued_message_edit_hint_binding(
-            &chat_keymap.edit_queued_message,
+            runtime_keymap.as_ref().unwrap_or(&default_keymap),
             current_terminal_info,
+        );
+        let pet_http_client = codex_http_client::RouteAwareClientPool::new(
+            config.http_client_factory(),
+            codex_http_client::ClientRouteClass::Other,
         );
         pets::start_configured_pet_load_if_needed(
             &config,
             /*ambient_pet_missing*/ true,
             frame_requester.clone(),
             app_event_tx.clone(),
+            pet_http_client.clone(),
         );
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
@@ -123,6 +128,7 @@ impl ChatWidget {
             runtime_model_provider_base_url,
             remote_connection: None,
             token_info: None,
+            token_usage_pending: false,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             refreshing_status_outputs: Vec::new(),
             next_status_refresh_request_id: 0,
@@ -130,6 +136,8 @@ impl ChatWidget {
             completed_token_activity_output: None,
             next_token_activity_request_id: 0,
             pending_rate_limit_reset_request_id: None,
+            pending_rate_limit_reset_idempotency_key: None,
+            rate_limit_reset_picker_request_id: None,
             pending_rate_limit_reset_hint_request_id: None,
             pending_usage_menu_rate_limit_request_id: None,
             pending_rate_limit_reset_hint: None,
@@ -177,10 +185,12 @@ impl ChatWidget {
             newly_installed_marketplace_tab_id: None,
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
+            reasoning_header: None,
             reasoning_summary_parts: Vec::new(),
             status_state: StatusState::default(),
             review: ReviewState::default(),
             active_hook_cell: None,
+            pet_http_client,
             ambient_pet: None,
             pet_picker_preview_state: crate::pets::PetPickerPreviewState::default(),
             pet_picker_preview_pet: None,
@@ -194,6 +204,7 @@ impl ChatWidget {
             thread_name: None,
             thread_rename_block_message: None,
             active_side_conversation: false,
+            blocks_direct_input: false,
             normal_placeholder_text: placeholder,
             side_placeholder_text: side_placeholder,
             forked_from: None,

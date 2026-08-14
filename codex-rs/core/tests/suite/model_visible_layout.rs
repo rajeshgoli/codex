@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use codex_config::types::Personality;
+use codex_core::config::Config;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
+use codex_extension_api::ExtensionRegistry;
+use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
@@ -13,6 +16,8 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::user_input::UserInput;
+use codex_skills_extension::SkillsExtensionConfig;
+use codex_skills_extension::install;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::context_snapshot;
@@ -33,6 +38,17 @@ use core_test_support::wait_for_event;
 use serde_json::json;
 
 const PRETURN_CONTEXT_DIFF_CWD: &str = "PRETURN_CONTEXT_DIFF_CWD";
+
+fn skills_extensions() -> Arc<ExtensionRegistry<Config>> {
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    install(&mut extensions, |config: &Config| SkillsExtensionConfig {
+        include_instructions: config.include_skill_instructions,
+        bundled_skills_enabled: config.bundled_skills_enabled(),
+        orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+        shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
+    });
+    Arc::new(extensions.build())
+}
 
 fn context_snapshot_options() -> ContextSnapshotOptions {
     ContextSnapshotOptions::default()
@@ -162,13 +178,16 @@ async fn snapshot_model_visible_layout_turn_overrides() -> Result<()> {
     )
     .await;
 
-    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
-        config
-            .features
-            .enable(Feature::Personality)
-            .expect("test config should allow feature update");
-        config.personality = Some(Personality::Pragmatic);
-    });
+    let mut builder = test_codex()
+        .with_extensions(skills_extensions())
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Personality)
+                .expect("test config should allow feature update");
+            config.personality = Some(Personality::Pragmatic);
+        });
     let test = builder.build(&server).await?;
     let preturn_context_diff_cwd = test.cwd_path().join(PRETURN_CONTEXT_DIFF_CWD);
     fs::create_dir_all(&preturn_context_diff_cwd)?;
@@ -261,9 +280,7 @@ async fn snapshot_model_visible_layout_turn_overrides() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// TODO(ccunningham): Diff `user_instructions` and emit updates when AGENTS.md content changes
-// (for example after cwd changes), then update this test to assert refreshed AGENTS content.
-async fn snapshot_model_visible_layout_cwd_change_does_not_refresh_agents() -> Result<()> {
+async fn snapshot_model_visible_layout_cwd_change_refreshes_agents() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -284,7 +301,9 @@ async fn snapshot_model_visible_layout_cwd_change_does_not_refresh_agents() -> R
     )
     .await;
 
-    let mut builder = test_codex().with_model("gpt-5.4");
+    let mut builder = test_codex()
+        .with_extensions(skills_extensions())
+        .with_model("gpt-5.4");
     let test = builder.build(&server).await?;
     let cwd_one = test.cwd_path().join("agents_one");
     let cwd_two = test.cwd_path().join("agents_two");
@@ -371,18 +390,18 @@ async fn snapshot_model_visible_layout_cwd_change_does_not_refresh_agents() -> R
     assert_eq!(requests.len(), 2, "expected two requests");
     assert_eq!(
         user_instructions_wrapper_count(&requests[0]),
-        0,
-        "expected first request to omit the serialized user-instructions wrapper when cwd-only project docs are introduced after session init"
+        1,
+        "expected first request to include AGENTS.md from its selected cwd"
     );
     assert_eq!(
         user_instructions_wrapper_count(&requests[1]),
-        0,
-        "expected second request to keep omitting the serialized user-instructions wrapper after cwd change with the current session-scoped project doc behavior"
+        2,
+        "expected second request to retain the original AGENTS.md item and append its replacement"
     );
     insta::assert_snapshot!(
-        "model_visible_layout_cwd_change_does_not_refresh_agents",
+        "model_visible_layout_cwd_change_refreshes_agents",
         format_labeled_requests_snapshot(
-            "Second turn changes cwd to a directory with different AGENTS.md; current behavior does not emit refreshed AGENTS instructions.",
+            "Second turn changes cwd to a directory with different AGENTS.md and refreshes the model-visible instructions.",
             &[
                 ("First Request (agents_one)", &requests[0]),
                 ("Second Request (agents_two cwd)", &requests[1]),
@@ -398,17 +417,13 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut initial_builder = test_codex().with_config(|config| {
-        config.model = Some("gpt-5.2".to_string());
-    });
+    let mut initial_builder = test_codex()
+        .with_extensions(skills_extensions())
+        .with_config(|config| {
+            config.model = Some("gpt-5.2".to_string());
+        });
     let initial = initial_builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     let initial_mock = mount_sse_once(
         &server,
@@ -444,15 +459,17 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
     )
     .await;
 
-    let mut resume_builder = test_codex().with_config(|config| {
-        config.model = Some("gpt-5.4".to_string());
-        config
-            .features
-            .enable(Feature::Personality)
-            .expect("test config should allow feature update");
-        config.personality = Some(Personality::Pragmatic);
-    });
-    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
+    let mut resume_builder = test_codex()
+        .with_extensions(skills_extensions())
+        .with_config(|config| {
+            config.model = Some("gpt-5.4".to_string());
+            config
+                .features
+                .enable(Feature::Personality)
+                .expect("test config should allow feature update");
+            config.personality = Some(Personality::Pragmatic);
+        });
+    let resumed = resume_builder.restart(&server, &initial).await?;
     let resume_override_cwd = resumed.cwd_path().join(PRETURN_CONTEXT_DIFF_CWD);
     fs::create_dir_all(&resume_override_cwd)?;
     let resume_override_cwd = resume_override_cwd.abs();
@@ -513,17 +530,13 @@ async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut initial_builder = test_codex().with_config(|config| {
-        config.model = Some("gpt-5.2".to_string());
-    });
+    let mut initial_builder = test_codex()
+        .with_extensions(skills_extensions())
+        .with_config(|config| {
+            config.model = Some("gpt-5.2".to_string());
+        });
     let initial = initial_builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     let initial_mock = mount_sse_once(
         &server,
@@ -559,10 +572,12 @@ async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -
     )
     .await;
 
-    let mut resume_builder = test_codex().with_config(|config| {
-        config.model = Some("gpt-5.4".to_string());
-    });
-    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
+    let mut resume_builder = test_codex()
+        .with_extensions(skills_extensions())
+        .with_config(|config| {
+            config.model = Some("gpt-5.4".to_string());
+        });
+    let resumed = resume_builder.restart(&server, &initial).await?;
     let resume_override_cwd = resumed.cwd_path().join(PRETURN_CONTEXT_DIFF_CWD);
     fs::create_dir_all(&resume_override_cwd)?;
     let resume_override_cwd = resume_override_cwd.abs();

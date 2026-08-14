@@ -1,8 +1,7 @@
 use super::*;
-use crate::SkillsService;
+use crate::HostSkillsService;
 use crate::config::ConfigBuilder;
 use crate::skills_load_input_from_config;
-use codex_config::ConfigLayerStackOrdering;
 use codex_core_plugins::PluginsManager;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -39,11 +38,7 @@ async fn write_role_config(home: &TempDir, name: &str, contents: &str) -> PathBu
 fn session_flags_layer_count(config: &Config) -> usize {
     config
         .config_layer_stack
-        .get_layers(
-            ConfigLayerStackOrdering::LowestPrecedenceFirst,
-            /*include_disabled*/ true,
-        )
-        .into_iter()
+        .all_layers_low_to_high()
         .filter(|layer| layer.name == ConfigLayerSource::SessionFlags)
         .count()
 }
@@ -69,21 +64,6 @@ async fn apply_role_returns_error_for_unknown_role() {
         .expect_err("unknown role should fail");
 
     assert_eq!(err, "unknown agent_type 'missing-role'");
-}
-
-#[tokio::test]
-#[ignore = "No role requiring it for now"]
-async fn apply_explorer_role_sets_model_and_adds_session_flags_layer() {
-    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
-    let before_layers = session_flags_layer_count(&config);
-
-    apply_role_to_config(&mut config, Some("explorer"))
-        .await
-        .expect("explorer role should apply");
-
-    assert_eq!(config.model.as_deref(), Some("gpt-5.4-mini"));
-    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Medium));
-    assert_eq!(session_flags_layer_count(&config), before_layers + 1);
 }
 
 #[tokio::test]
@@ -181,6 +161,7 @@ async fn apply_role_preserves_unspecified_keys() {
     .await;
     config.codex_linux_sandbox_exe = Some(PathBuf::from("/tmp/codex-linux-sandbox"));
     config.main_execve_wrapper_exe = Some(PathBuf::from("/tmp/codex-execve-wrapper"));
+    config.psp = true;
     let role_path = write_role_config(
         &home,
         "instructions-only.toml",
@@ -215,6 +196,7 @@ async fn apply_role_preserves_unspecified_keys() {
         config.main_execve_wrapper_exe,
         Some(PathBuf::from("/tmp/codex-execve-wrapper"))
     );
+    assert!(config.psp);
 }
 
 #[tokio::test]
@@ -317,11 +299,7 @@ writable_roots = ["./sandbox-root"]
 
     let role_layer = config
         .config_layer_stack
-        .get_layers(
-            ConfigLayerStackOrdering::LowestPrecedenceFirst,
-            /*include_disabled*/ true,
-        )
-        .into_iter()
+        .all_layers_low_to_high()
         .rfind(|layer| layer.name == ConfigLayerSource::SessionFlags)
         .expect("expected a session flags layer");
     let sandbox_workspace_write = role_layer
@@ -422,7 +400,7 @@ enabled = false
 
     let plugins_manager = Arc::new(PluginsManager::new(home.path().to_path_buf()));
     let skills_service =
-        SkillsService::new(home.path().abs(), /*bundled_skills_enabled*/ true);
+        HostSkillsService::new(home.path().abs(), /*bundled_skills_enabled*/ true);
     let plugins_input = config.plugins_config_input();
     let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
     let effective_skill_roots = plugin_outcome.effective_plugin_skill_roots();

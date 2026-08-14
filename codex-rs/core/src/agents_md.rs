@@ -19,7 +19,6 @@ use crate::config::Config;
 use crate::context::UserInstructions as ContextUserInstructions;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use codex_config::ConfigLayerSource;
-use codex_config::ConfigLayerStackOrdering;
 use codex_config::default_project_root_markers;
 use codex_config::merge_toml_values;
 use codex_config::project_root_markers_from_config;
@@ -56,7 +55,7 @@ pub(crate) async fn load_project_instructions(
     environments: &TurnEnvironmentSnapshot,
 ) -> Option<LoadedAgentsMd> {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
-    for turn_environment in &environments.turn_environments {
+    for turn_environment in environments.turn_environments() {
         let filesystem = turn_environment.environment.get_filesystem();
         match read_agents_md(
             config,
@@ -160,10 +159,7 @@ async fn agents_md_paths(
     let dir = cwd.clone();
 
     let mut merged = TomlValue::Table(toml::map::Map::new());
-    for layer in config.config_layer_stack.get_layers(
-        ConfigLayerStackOrdering::LowestPrecedenceFirst,
-        /*include_disabled*/ false,
-    ) {
+    for layer in config.config_layer_stack.layers_low_to_high() {
         if matches!(layer.name, ConfigLayerSource::Project { .. }) {
             continue;
         }

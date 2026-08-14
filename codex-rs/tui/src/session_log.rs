@@ -301,14 +301,14 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
         // at their submit/receive points to avoid duplicate queued-event records.
         Some(LogMode::EventStream) => {}
         Some(LogMode::Legacy) => match event {
-            AppEvent::NewSession => {
+            AppEvent::NewSession { .. } => {
                 LOGGER.write_json_line(&json!({
                     "ts": now_ts(),
                     "dir": "to_tui",
                     "kind": "new_session",
                 }));
             }
-            AppEvent::ClearUi => {
+            AppEvent::ClearUi { .. } => {
                 LOGGER.write_json_line(&json!({
                     "ts": now_ts(),
                     "dir": "to_tui",

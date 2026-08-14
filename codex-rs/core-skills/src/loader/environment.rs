@@ -2,6 +2,9 @@ use std::io;
 
 use codex_exec_server::ExecutorFileSystem;
 use codex_protocol::protocol::Product;
+pub use codex_skills::EnvironmentSkillMetadata;
+use codex_skills::ParsedSkillFrontmatter;
+use codex_skills::parse_skill_frontmatter_metadata;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
 
@@ -9,7 +12,6 @@ use crate::model::SkillDependencies;
 use crate::model::SkillPolicy;
 
 use super::MAX_QUALIFIED_NAME_LEN;
-use super::ParsedSkillFrontmatter;
 use super::SkillMetadataFile;
 use super::discovery::DirectorySymlinkPolicy;
 use super::discovery::DiscoveredSkill;
@@ -19,7 +21,6 @@ use super::discovery::SkillDiscoveryOptions;
 use super::discovery::SkillMetadataDiscovery;
 use super::discovery::discover_skills;
 use super::namespace::SkillNamespaceResolver;
-use super::parse_skill_frontmatter_metadata_inner;
 use super::resolve_dependencies;
 use super::resolve_policy;
 use super::sanitize_single_line;
@@ -32,38 +33,6 @@ struct ParsedEnvironmentSkill {
     short_description: Option<String>,
     dependencies: Option<SkillDependencies>,
     policy: Option<SkillPolicy>,
-}
-
-/// URI-native metadata for one skill owned by an execution environment.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EnvironmentSkillMetadata {
-    pub path_to_skills_md: PathUri,
-    pub name: String,
-    pub description: String,
-    pub short_description: Option<String>,
-    pub dependencies: Option<SkillDependencies>,
-    pub policy: Option<SkillPolicy>,
-}
-
-impl EnvironmentSkillMetadata {
-    pub fn allows_implicit_invocation(&self) -> bool {
-        self.policy
-            .as_ref()
-            .and_then(|policy| policy.allow_implicit_invocation)
-            .unwrap_or(true)
-    }
-
-    fn matches_product_restriction(&self, restriction_product: Option<Product>) -> bool {
-        match &self.policy {
-            Some(policy) => {
-                policy.products.is_empty()
-                    || restriction_product.is_some_and(|product| {
-                        product.matches_product_restriction(&policy.products)
-                    })
-            }
-            None => true,
-        }
-    }
 }
 
 impl ParsedEnvironmentSkill {
@@ -88,7 +57,7 @@ impl ParsedEnvironmentSkill {
             name: base_name,
             description,
             short_description,
-        } = parse_skill_frontmatter_metadata_inner(&contents, || default_skill_name(&skill.path))
+        } = parse_skill_frontmatter_metadata(&contents, || default_skill_name(&skill.path))
             .map_err(|err| err.to_string())?;
         let (dependencies, policy) = match &skill.metadata {
             SkillMetadataDiscovery::Present(_) | SkillMetadataDiscovery::Absent => {
@@ -137,6 +106,7 @@ pub async fn load_environment_skills_from_root(
         SkillDiscoveryOptions {
             directory_symlinks: DirectorySymlinkPolicy::Follow,
             hidden_directories: HiddenDirectoryPolicy::Include,
+            mode: codex_utils_plugins::SkillDiscoveryMode::Recursive,
         },
     )
     .await;
