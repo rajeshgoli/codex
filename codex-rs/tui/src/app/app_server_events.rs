@@ -116,6 +116,8 @@ impl App {
         app_server_client: &AppServerSession,
         notification: ServerNotification,
     ) {
+        crate::session_log::log_server_notification(&notification);
+
         if let ServerNotification::ThreadStatusChanged(status) = &notification {
             let _ = self.dynamic_tool_status_updates.send(status.clone());
         }

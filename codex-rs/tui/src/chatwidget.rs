@@ -246,7 +246,7 @@ fn queued_message_edit_hint_binding(
         .or(configured)
 }
 
-fn normalize_thread_name(name: &str) -> Option<String> {
+pub(crate) fn normalize_thread_name(name: &str) -> Option<String> {
     let trimmed = name.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
@@ -1754,6 +1754,14 @@ impl ChatWidget {
             "Vim mode disabled."
         };
         self.add_info_message(message.to_string(), /*hint*/ None);
+    }
+
+    pub(crate) fn submit_external_literal_user_message(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+
+        self.submit_user_message_with_shell_escape_policy(text.into(), ShellEscapePolicy::Disallow);
     }
 
     /// True when the UI is in the regular composer state with no running task,

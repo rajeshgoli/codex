@@ -4160,6 +4160,18 @@ mod tests {
     }
 
     #[test]
+    fn resume_preserves_subcommand_control_socket() {
+        let interactive = finalize_resume_from_args(
+            ["codex", "resume", "--control-socket", "/tmp/resume.sock"].as_ref(),
+        );
+
+        assert_eq!(
+            interactive.control_socket.as_deref(),
+            Some(std::path::Path::new("/tmp/resume.sock"))
+        );
+    }
+
+    #[test]
     fn resume_picker_logic_none_and_not_last() {
         let interactive = finalize_resume_from_args(["codex", "resume"].as_ref());
         assert!(interactive.resume_picker);
