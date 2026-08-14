@@ -13,18 +13,12 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::thread::JoinHandle;
 use std::time::Duration;
 
-#[cfg(unix)]
-use std::fs;
 #[cfg(unix)]
 use std::io::BufReader;
 #[cfg(unix)]
@@ -34,119 +28,17 @@ use std::io::Read;
 #[cfg(unix)]
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
-use std::os::unix::net::UnixListener;
-#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+
+mod supervisor;
+
+pub(crate) use supervisor::ControlSocketHandle;
 
 const REQUEST_CACHE_CAPACITY: usize = 2048;
 const REQUEST_MAX_CHARS: usize = 1 << 20;
 const REQUEST_ID_MAX_CHARS: usize = 256;
 const MAX_CONNECTION_WORKERS: usize = 64;
 const MAX_EXTERNAL_BTW_PROMPT_BYTES: usize = 4 * 1024;
-
-pub(crate) struct ControlSocketHandle {
-    shutdown: Arc<AtomicBool>,
-    join_handle: Option<JoinHandle<()>>,
-    socket_path: PathBuf,
-}
-
-impl ControlSocketHandle {
-    pub(crate) fn start(
-        socket_path: PathBuf,
-        app_event_tx: AppEventSender,
-    ) -> std::io::Result<Self> {
-        #[cfg(not(unix))]
-        {
-            let _ = socket_path;
-            let _ = app_event_tx;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "--control-socket is currently supported on Unix only",
-            ));
-        }
-
-        #[cfg(unix)]
-        {
-            if !socket_path.is_absolute() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "control socket path must be absolute",
-                ));
-            }
-            let parent = socket_path.parent().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "control socket path must include a parent directory",
-                )
-            })?;
-            fs::create_dir_all(parent)?;
-            remove_existing_socket_if_safe(&socket_path)?;
-
-            let listener = UnixListener::bind(&socket_path)?;
-            fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
-            listener.set_nonblocking(true)?;
-
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let shutdown_for_thread = Arc::clone(&shutdown);
-            let socket_path_for_thread = socket_path.clone();
-            let state = Arc::new(ControlState::new(
-                app_event_tx,
-                uuid::Uuid::new_v4().to_string(),
-            ));
-
-            let join_handle = std::thread::Builder::new()
-                .name("codex-control-socket".to_string())
-                .spawn(move || {
-                    run_listener_loop(listener, state, shutdown_for_thread);
-                    if let Err(err) = remove_socket_file_if_socket(&socket_path_for_thread) {
-                        tracing::debug!(
-                            "control socket cleanup ignored for {}: {err}",
-                            socket_path_for_thread.display()
-                        );
-                    }
-                })?;
-
-            Ok(Self {
-                shutdown,
-                join_handle: Some(join_handle),
-                socket_path,
-            })
-        }
-    }
-
-    pub(crate) fn shutdown(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        if let Some(join_handle) = self.join_handle.take()
-            && let Err(err) = join_handle.join()
-        {
-            tracing::debug!("control socket thread join failed: {err:?}");
-        }
-        #[cfg(unix)]
-        if let Err(err) = remove_socket_file_if_socket(&self.socket_path) {
-            tracing::debug!(
-                "control socket post-shutdown cleanup ignored for {}: {err}",
-                self.socket_path.display()
-            );
-        }
-        #[cfg(not(unix))]
-        if let Err(err) = std::fs::remove_file(&self.socket_path) {
-            tracing::debug!(
-                "control socket post-shutdown cleanup ignored for {}: {err}",
-                self.socket_path.display()
-            );
-        }
-    }
-}
-
-impl Drop for ControlSocketHandle {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
 
 struct ControlState {
     epoch: String,
@@ -586,109 +478,6 @@ fn dispatch_app_event(state: &ControlState, event: AppEvent) -> Result<(), Strin
         .app_event_tx
         .send(event)
         .map_err(|_| "control socket is unavailable; app event channel is closed".to_string())
-}
-
-#[cfg(unix)]
-fn remove_existing_socket_if_safe(path: &Path) -> std::io::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_socket() {
-        match UnixStream::connect(path) {
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!("control socket is already active at {}", path.display()),
-                ));
-            }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::ConnectionRefused
-                    || err.kind() == std::io::ErrorKind::NotFound =>
-            {
-                fs::remove_file(path)?;
-                return Ok(());
-            }
-            Err(err) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!(
-                        "control socket path exists and could not be verified as stale ({}): {err}",
-                        path.display()
-                    ),
-                ));
-            }
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!(
-            "refusing to overwrite existing non-socket path: {}",
-            path.display()
-        ),
-    ))
-}
-
-#[cfg(unix)]
-fn remove_socket_file_if_socket(path: &Path) -> std::io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_socket() {
-                fs::remove_file(path)
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("refusing to remove non-socket path: {}", path.display()),
-                ))
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
-#[cfg(unix)]
-fn run_listener_loop(listener: UnixListener, state: Arc<ControlState>, shutdown: Arc<AtomicBool>) {
-    let active_workers = Arc::new(AtomicUsize::new(0));
-    while !shutdown.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if active_workers.load(Ordering::Acquire) >= MAX_CONNECTION_WORKERS {
-                    tracing::warn!(
-                        "control socket worker limit reached ({}); dropping connection",
-                        MAX_CONNECTION_WORKERS
-                    );
-                    drop(stream);
-                    continue;
-                }
-                active_workers.fetch_add(1, Ordering::AcqRel);
-                let connection_state = Arc::clone(&state);
-                let connection_shutdown = Arc::clone(&shutdown);
-                let connection_workers = Arc::clone(&active_workers);
-                if let Err(err) = std::thread::Builder::new()
-                    .name("codex-control-conn".to_string())
-                    .spawn(move || {
-                        if let Err(err) =
-                            handle_connection(stream, connection_state, connection_shutdown)
-                        {
-                            tracing::warn!("control socket connection error: {err}");
-                        }
-                        connection_workers.fetch_sub(1, Ordering::AcqRel);
-                    })
-                {
-                    active_workers.fetch_sub(1, Ordering::AcqRel);
-                    tracing::warn!("failed to spawn control socket worker: {err}");
-                }
-            }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(err) => {
-                tracing::warn!("control socket accept error: {err}");
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-    }
 }
 
 #[cfg(unix)]
