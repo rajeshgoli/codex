@@ -47,15 +47,6 @@ struct ControlState {
 }
 
 impl ControlState {
-    #[cfg(test)]
-    fn new(app_event_tx: AppEventSender, epoch: String) -> Self {
-        Self::with_cache(
-            app_event_tx,
-            epoch,
-            Arc::new(Mutex::new(RequestCache::default())),
-        )
-    }
-
     fn with_cache(
         app_event_tx: AppEventSender,
         epoch: String,
@@ -241,13 +232,15 @@ fn process_request(state: &Arc<ControlState>, request: ControlRequest) -> Contro
     }
 
     let response = match request.command {
-        ControlCommand::GetEpoch => response_ok(
-            &request_id,
-            &state.epoch,
-            json!({
-                "epoch": state.epoch,
-            }),
-        ),
+        ControlCommand::GetEpoch => {
+            return response_ok(
+                &request_id,
+                &state.epoch,
+                json!({
+                    "epoch": state.epoch,
+                }),
+            );
+        }
         ControlCommand::SubmitMessage { message, thread_id } => {
             if message.trim().is_empty() {
                 response_err(

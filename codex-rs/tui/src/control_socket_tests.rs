@@ -8,7 +8,11 @@ fn test_state() -> (
 ) {
     let (tx, rx) = unbounded_channel();
     let sender = AppEventSender::new(tx);
-    let state = Arc::new(ControlState::new(sender, "epoch-1".to_string()));
+    let state = Arc::new(ControlState::with_cache(
+        sender,
+        "epoch-1".to_string(),
+        Arc::new(Mutex::new(RequestCache::default())),
+    ));
     (state, rx)
 }
 
@@ -25,6 +29,35 @@ fn get_epoch_returns_current_epoch() {
     );
     assert!(response.ok);
     assert_eq!(response.epoch, "epoch-1");
+}
+
+#[test]
+fn get_epoch_request_id_returns_fresh_result_across_listener_generations() {
+    let cache = Arc::new(Mutex::new(RequestCache::default()));
+    let (tx, _rx) = unbounded_channel();
+    let first = Arc::new(ControlState::with_cache(
+        AppEventSender::new(tx.clone()),
+        "epoch-1".to_string(),
+        Arc::clone(&cache),
+    ));
+    let second = Arc::new(ControlState::with_cache(
+        AppEventSender::new(tx),
+        "epoch-2".to_string(),
+        cache,
+    ));
+    let request = ControlRequest {
+        request_id: "same-get-epoch".to_string(),
+        expected_epoch: None,
+        command: ControlCommand::GetEpoch,
+    };
+
+    let first_response = process_request(&first, request.clone());
+    let second_response = process_request(&second, request);
+
+    assert_eq!(first_response.epoch, "epoch-1");
+    assert_eq!(first_response.result, Some(json!({"epoch": "epoch-1"})));
+    assert_eq!(second_response.epoch, "epoch-2");
+    assert_eq!(second_response.result, Some(json!({"epoch": "epoch-2"})));
 }
 
 #[test]
