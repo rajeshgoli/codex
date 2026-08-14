@@ -499,6 +499,13 @@ pub(crate) fn log_session_end() {
     }
 }
 
+pub(crate) fn log_control_socket_lifecycle(event_type: &str, payload: Value) {
+    if !LOGGER.is_enabled() || !matches!(LOGGER.mode(), Some(LogMode::EventStream)) {
+        return;
+    }
+    LOGGER.write_event_stream_record(event_type, payload, None);
+}
+
 fn write_legacy_record<T>(dir: &str, kind: &str, obj: &T)
 where
     T: Serialize,
