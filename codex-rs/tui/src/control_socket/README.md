@@ -31,6 +31,7 @@ All requests include:
 - `command` (string, required): one of:
   - `get_epoch`
   - `submit_message`
+  - `submit_btw`
   - `set_thread_name`
   - `submit_approval`
   - `submit_user_input`
@@ -41,6 +42,9 @@ All requests include:
 - `submit_message`
   - `message` (string, required)
   - `thread_id` (UUID string, optional)
+- `submit_btw`
+  - `prompt` (string, required; maximum 4 KiB UTF-8)
+  - Starts a correlated external `/btw` side conversation.
 - `set_thread_name`
   - `name` (string, required)
   - `thread_id` (UUID string, optional)
@@ -76,7 +80,8 @@ All responses include:
   validation. A `stale_epoch` response is transient and is not cached, so clients can refresh the
   epoch and retry with the same request ID.
 - `expected_epoch` can be used to detect reconnect/restart races.
-- Epoch values are process-scoped and change when a new interactive process starts.
+- Epoch values identify a control-listener generation. They change when a new interactive process
+  starts and whenever a degraded control socket is rebound within the same process.
 
 ## Record Shape
 

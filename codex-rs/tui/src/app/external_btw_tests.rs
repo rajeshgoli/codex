@@ -1,5 +1,6 @@
 use super::*;
 use crate::app::test_support::make_test_app;
+use crate::app::test_support::make_test_app_with_channels;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnCompletedNotification;
@@ -78,9 +79,11 @@ async fn unrelated_notifications_remain_visible() {
 
 #[tokio::test]
 async fn fresh_session_transition_clears_active_requests() {
-    let mut app = make_test_app().await;
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    while app_event_rx.try_recv().is_ok() {}
+    let child_thread_id = ThreadId::new();
     app.external_btw_requests.insert(
-        ThreadId::new(),
+        child_thread_id,
         ExternalBtwState {
             request_id: "req-reset".to_string(),
             parent_thread_id: ThreadId::new(),
@@ -91,4 +94,8 @@ async fn fresh_session_transition_clears_active_requests() {
     app.fail_all_external_btw("main_thread_replaced");
 
     assert!(app.external_btw_requests.is_empty());
+    assert!(matches!(
+        app_event_rx.try_recv(),
+        Ok(AppEvent::CleanupExternalBtw { thread_id }) if thread_id == child_thread_id
+    ));
 }

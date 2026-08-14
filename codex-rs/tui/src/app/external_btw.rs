@@ -217,6 +217,8 @@ impl App {
                 Some(thread_id),
                 error,
             );
+            self.app_event_tx
+                .send(AppEvent::CleanupExternalBtw { thread_id });
         }
     }
 

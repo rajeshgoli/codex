@@ -10,13 +10,22 @@ use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_models_manager::test_support::get_model_offline_for_tests;
 
 pub(super) async fn make_test_app() -> App {
-    let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    let (app, _rx, _op_rx) = make_test_app_with_channels().await;
+    app
+}
+
+pub(super) async fn make_test_app_with_channels() -> (
+    App,
+    tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    tokio::sync::mpsc::UnboundedReceiver<AppCommand>,
+) {
+    let (chat_widget, app_event_tx, rx, op_rx) = make_chatwidget_manual_with_sender().await;
     let config = chat_widget.config_ref().clone();
     let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
     let model = get_model_offline_for_tests(config.model.as_deref());
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
-    App {
+    let app = App {
         model_catalog: chat_widget.model_catalog(),
         session_telemetry,
         app_event_tx,
@@ -72,7 +81,8 @@ pub(super) async fn make_test_app() -> App {
         rate_limit_hard_stop_generation: 0,
         pending_plugin_enabled_writes: HashMap::new(),
         pending_hook_enabled_writes: HashMap::new(),
-    }
+    };
+    (app, rx, op_rx)
 }
 
 fn test_session_telemetry(config: &Config, model: &str) -> SessionTelemetry {
