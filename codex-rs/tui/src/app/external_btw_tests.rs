@@ -33,6 +33,7 @@ async fn hidden_notifications_capture_answer_and_finish_request() {
             text: "current summary".to_string(),
             phase: None,
             memory_citation: None,
+            delivery: None,
         },
     });
     assert!(app.handle_external_btw_notification(child_thread_id, &item_completed));

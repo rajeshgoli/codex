@@ -54,6 +54,15 @@ use supports_color::Stream;
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+fn cli_bin_name() -> &'static str {
+    option_env!("CARGO_BIN_NAME").unwrap_or("codex")
+}
+
+fn cli_usage() -> String {
+    let name = cli_bin_name();
+    format!("{name} [OPTIONS] [PROMPT]\n       {name} [OPTIONS] <COMMAND> [ARGS]")
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app_cmd;
 mod cloud_config;
@@ -121,11 +130,9 @@ use codex_terminal_detection::TerminalName;
     version,
     // If a sub‑command is given, ignore requirements of the default args.
     subcommand_negates_reqs = true,
-    // The executable is sometimes invoked via a platform‑specific name like
-    // `codex-x86_64-unknown-linux-musl`, but the help output should always use
-    // the generic `codex` command name that users run.
-    bin_name = "codex",
-    override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]"
+    name = cli_bin_name(),
+    bin_name = cli_bin_name(),
+    override_usage = cli_usage()
 )]
 struct MultitoolCli {
     #[clap(flatten)]
@@ -2969,6 +2976,9 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         no_alt_screen,
         prompt,
         mut config_overrides,
+        event_stream,
+        event_schema_version,
+        control_socket,
         ..
     } = subcommand_cli;
     let subcommand_auto_review = shared.auto_review;
@@ -2990,6 +3000,15 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     if strict_config {
         interactive.strict_config = true;
     }
+    if event_stream.is_some() {
+        interactive.event_stream = event_stream;
+    }
+    if event_schema_version.is_some() {
+        interactive.event_schema_version = event_schema_version;
+    }
+    if control_socket.is_some() {
+        interactive.control_socket = control_socket;
+    }
     if let Some(prompt) = prompt {
         // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
         interactive.prompt = Some(prompt.replace("\r\n", "\n").replace('\r', "\n"));
@@ -3003,8 +3022,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
 
 fn print_completion(cmd: CompletionCommand) {
     let mut app = MultitoolCli::command();
-    let name = "codex";
-    generate(cmd.shell, &mut app, name, &mut std::io::stdout());
+    generate(cmd.shell, &mut app, cli_bin_name(), &mut std::io::stdout());
 }
 
 #[cfg(test)]
@@ -4341,6 +4359,18 @@ mod tests {
         assert!(!interactive.fork_last);
         assert_eq!(interactive.fork_session_id, None);
         assert!(!interactive.fork_show_all);
+    }
+
+    #[test]
+    fn fork_preserves_subcommand_control_socket() {
+        let interactive = finalize_fork_from_args(
+            ["codex", "fork", "--control-socket", "/tmp/fork.sock"].as_ref(),
+        );
+
+        assert_eq!(
+            interactive.control_socket.as_deref(),
+            Some(std::path::Path::new("/tmp/fork.sock"))
+        );
     }
 
     #[test]
