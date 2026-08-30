@@ -1308,7 +1308,10 @@ async fn run_ratatui_app(
         initial_config
     };
     startup_draft.apply_config(&config);
-    if !(cli.resume_picker || cli.fork_picker || cli.agents_overview)
+    if !(startup_orchestration::defer_startup_composer_for_control_socket(&cli)
+        || cli.resume_picker
+        || cli.fork_picker
+        || cli.agents_overview)
         && let Err(err) = startup_draft.show(&mut tui)
     {
         shutdown_startup_session(app_server.take(), &mut terminal_restore_guard).await;
