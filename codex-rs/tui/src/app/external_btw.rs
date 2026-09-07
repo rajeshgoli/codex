@@ -35,7 +35,7 @@ impl App {
 
         let fork_config = self.side_fork_config();
         let started = match app_server
-            .fork_thread(fork_config.clone(), parent_thread_id)
+            .fork_thread(&self.local_settings, fork_config.clone(), parent_thread_id)
             .await
         {
             Ok(started) => started,
@@ -87,6 +87,7 @@ impl App {
             .filter(|model| !model.trim().is_empty())
             .unwrap_or_else(|| self.chat_widget.current_model().to_string());
         let op = AppCommand::user_turn(
+            uuid::Uuid::new_v4().to_string(),
             vec![UserInput::Text {
                 text: prompt,
                 text_elements: Vec::new(),

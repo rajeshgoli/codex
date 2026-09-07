@@ -4,6 +4,8 @@
 // For both modes, any other output must be written to stderr.
 #![recursion_limit = "256"]
 #![deny(clippy::print_stdout)]
+// The in-process app-server request dispatcher nests futures beyond the default limit.
+#![recursion_limit = "256"]
 
 mod cli;
 mod event_processor;

@@ -34,6 +34,7 @@ async fn hidden_notifications_capture_answer_and_finish_request() {
             phase: None,
             memory_citation: None,
             delivery: None,
+            questions: None,
         },
     });
     assert!(app.handle_external_btw_notification(child_thread_id, &item_completed));
