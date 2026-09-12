@@ -15,10 +15,11 @@ pub(super) struct ScreenSizePolicy {
     pending_recheck_at: Option<Instant>,
     pending_draw_size: Option<Size>,
     deferred_size: Option<Size>,
+    last_backend_check: Option<Instant>,
 }
 
 impl Tui {
-    /// Resolve event geometry while avoiding backend queries on ordinary repaint frames.
+    /// Reuse recent geometry while recovering from missed resize notifications.
     pub(crate) fn screen_size_for_event(&mut self, event: &TuiEvent) -> io::Result<Size> {
         if matches!(event, TuiEvent::Resize(_)) {
             self.schedule_screen_size_recheck(TRANSCRIPT_REFLOW_DEBOUNCE);
@@ -33,6 +34,19 @@ impl Tui {
             }
         }
 
+        // tmux/SSH attach can change geometry without a resize event reaching us.
+        // Bound the lifetime of cached geometry, even when that event was lost.
+        if matches!(event, TuiEvent::FocusGained)
+            || (matches!(event, TuiEvent::Draw)
+                && self.screen_size.pending_recheck_at.is_none()
+                && self
+                    .screen_size
+                    .last_backend_check
+                    .is_none_or(|checked| checked.elapsed() >= Duration::from_secs(1)))
+        {
+            return self.screen_size_for_event(&TuiEvent::Resume);
+        }
+
         let cached = self.terminal.last_known_screen_size;
         let size = match event {
             TuiEvent::Resize(size) => {
@@ -42,7 +56,9 @@ impl Tui {
             TuiEvent::Resume => {
                 self.screen_size.pending_recheck_at = None;
                 self.screen_size.deferred_size = None;
-                self.terminal.size()?
+                let size = self.terminal.size()?;
+                self.screen_size.last_backend_check = Some(Instant::now());
+                size
             }
             TuiEvent::Draw | TuiEvent::FocusGained => {
                 self.screen_size.deferred_size.take().unwrap_or(cached)
@@ -80,6 +96,7 @@ impl Tui {
         if let Some(monitor) = &self.event_broker.size_monitor {
             monitor.observe(size);
         }
+        self.screen_size.last_backend_check = Some(Instant::now());
         self.screen_size.pending_recheck_at = None;
         self.screen_size.deferred_size = None;
         Ok(size)
