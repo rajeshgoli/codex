@@ -13,6 +13,9 @@ use crate::thread_transcript::thread_items_to_transcript_cells;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ThreadItemsListResponse;
 
+#[path = "history_completion.rs"]
+mod completion;
+
 impl App {
     /// Start one bounded page request shared by scrollback refill and the transcript overlay.
     pub(crate) fn request_older_history_page(
@@ -126,7 +129,7 @@ impl App {
                 &cwd,
                 user_items.iter().map(|(_, item)| item.clone()),
                 visibility,
-                Some(self.config.codex_home.as_path()),
+                Some(&self.config),
             );
             let mut persisted_user_cells = user_items
                 .into_iter()
@@ -183,6 +186,23 @@ impl App {
             }
         }
         items.retain(|item| !hidden_item_ids.contains(item.id()));
+        let mut cells = Vec::new();
+        for (items, completed_turn) in completion::group_completed_turn_items(items, &turns) {
+            cells.extend(thread_items_to_transcript_cells(
+                Some(thread_id),
+                &cwd,
+                items,
+                visibility,
+                Some(&self.config),
+            ));
+            if let Some(turn) = completed_turn
+                && let Some(completion) = self
+                    .chat_widget
+                    .completion_cell(turn, Some(ReplayKind::ResumeInitialMessages))
+            {
+                cells.push(Arc::new(completion));
+            }
+        }
         {
             let mut store = store.lock().await;
             turns.retain_mut(|turn| {
@@ -199,13 +219,6 @@ impl App {
             });
             store.turns.splice(0..0, turns);
         }
-        let cells = thread_items_to_transcript_cells(
-            Some(thread_id),
-            &cwd,
-            items,
-            visibility,
-            Some(self.config.codex_home.as_path()),
-        );
         if self.backtrack.overlay_preview_active {
             self.backtrack.nth_user_message = self.backtrack.nth_user_message.saturating_add(
                 cells

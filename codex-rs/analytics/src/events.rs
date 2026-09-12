@@ -1,7 +1,8 @@
 use std::time::Instant;
 
-use crate::facts::AcceptedLineFingerprint;
 use crate::facts::AppInvocation;
+use crate::facts::ArtifactOperation;
+use crate::facts::ArtifactOperationLifecycle;
 use crate::facts::CodexCompactionEvent;
 use crate::facts::CodexErrKind;
 use crate::facts::CodexGoalEvent;
@@ -24,6 +25,7 @@ use crate::facts::TurnStatus;
 use crate::facts::TurnSteerRejectionReason;
 use crate::facts::TurnSteerResult;
 use crate::facts::TurnSubmissionType;
+use crate::guardian_v2::GuardianV2EventRequest;
 use crate::now_unix_millis;
 use codex_app_server_protocol::CodexErrorInfo;
 use codex_app_server_protocol::CommandExecutionSource;
@@ -38,12 +40,15 @@ use codex_protocol::protocol::GuardianCommandSource;
 use codex_protocol::protocol::GuardianRiskLevel;
 use codex_protocol::protocol::GuardianUserAuthorization;
 use codex_protocol::protocol::HookEventName;
+use codex_protocol::protocol::HookExecutionMode;
+use codex_protocol::protocol::HookHandlerType;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,18 +68,24 @@ pub(crate) struct TrackEventsRequest {
 pub(crate) enum TrackEventRequest {
     SkillInvocation(SkillInvocationEventRequest),
     ThreadInitialized(ThreadInitializedEvent),
+    ThreadArchive(ThreadArchiveEvent),
     GuardianReview(Box<GuardianReviewEventRequest>),
+    GuardianV2(Box<GuardianV2EventRequest>),
     AppMentioned(CodexAppMentionedEventRequest),
     AppUsed(CodexAppUsedEventRequest),
     HookRun(CodexHookRunEventRequest),
     Compaction(Box<CodexCompactionEventRequest>),
     Goal(Box<CodexGoalEventRequest>),
+    ThreadHintStatus(Box<crate::thread_hint::ThreadHintStatusEventRequest>),
     TurnEvent(Box<CodexTurnEventRequest>),
     TurnSteer(CodexTurnSteerEventRequest),
+    ArtifactOperation(CodexArtifactOperationEventRequest),
     CommandExecution(CodexCommandExecutionEventRequest),
+    PluginMeasurement(CodexPluginMeasurementEventRequest),
     FileChange(CodexFileChangeEventRequest),
     McpToolCall(CodexMcpToolCallEventRequest),
     DynamicToolCall(CodexDynamicToolCallEventRequest),
+    ControlToolCall(CodexControlToolCallEventRequest),
     CollabAgentToolCall(CodexCollabAgentToolCallEventRequest),
     WebSearch(CodexWebSearchEventRequest),
     ImageGeneration(CodexImageGenerationEventRequest),
@@ -92,6 +103,59 @@ pub(crate) enum TrackEventRequest {
     ExternalAgentConfigImportFailure(CodexOnboardingExternalAgentImportFailureEventRequest),
 }
 
+#[derive(Serialize)]
+pub(crate) struct CodexArtifactOperationEventParams {
+    pub(crate) thread_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) item_id: String,
+    pub(crate) lifecycle: ArtifactOperationLifecycle,
+    pub(crate) occurred_at_ms: u64,
+    pub(crate) product_client_id: String,
+    pub(crate) runtime: CodexRuntimeMetadata,
+    pub(crate) model_slug: String,
+    pub(crate) plugin_id: String,
+    pub(crate) script_path: String,
+    pub(crate) skill: String,
+    pub(crate) artifact_type: String,
+    pub(crate) operation_kind: String,
+    pub(crate) expected_output_count: u32,
+    pub(crate) output_format: String,
+    pub(crate) execution_backend: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexArtifactOperationEventRequest {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_params: CodexArtifactOperationEventParams,
+}
+
+pub(crate) fn codex_artifact_operation_event_request(
+    tracking: TrackEventsContext,
+    operation: ArtifactOperation,
+) -> CodexArtifactOperationEventRequest {
+    CodexArtifactOperationEventRequest {
+        event_type: "codex_artifact_operation",
+        event_params: CodexArtifactOperationEventParams {
+            thread_id: tracking.thread_id,
+            turn_id: tracking.turn_id,
+            item_id: operation.item_id,
+            lifecycle: operation.lifecycle,
+            occurred_at_ms: operation.occurred_at_ms,
+            product_client_id: tracking.product_client_id,
+            runtime: current_runtime_metadata(),
+            model_slug: tracking.model_slug,
+            plugin_id: operation.plugin_id,
+            script_path: operation.script_path,
+            skill: operation.skill,
+            artifact_type: operation.artifact_type,
+            operation_kind: operation.operation_kind,
+            expected_output_count: operation.expected_output_count,
+            output_format: operation.output_format,
+            execution_backend: operation.execution_backend,
+        },
+    }
+}
+
 impl TrackEventRequest {
     pub(crate) fn should_send_in_isolated_request(&self) -> bool {
         matches!(self, Self::AcceptedLineFingerprints(_))
@@ -102,6 +166,8 @@ impl TrackEventRequest {
             Self::PluginUsed(event) => event.event_params.plugin.plugin_id.is_some(),
             Self::SkillInvocation(event) => event.event_params.plugin_id.is_some(),
             Self::McpToolCall(event) => event.event_params.plugin_id.is_some(),
+            Self::ArtifactOperation(event) => !event.event_params.plugin_id.is_empty(),
+            Self::PluginMeasurement(event) => !event.event_params.plugin_id.is_empty(),
             _ => false,
         }
     }
@@ -118,7 +184,9 @@ pub(crate) struct CodexAcceptedLineFingerprintsEventParams {
     pub(crate) repo_hash: Option<String>,
     pub(crate) accepted_added_lines: u64,
     pub(crate) accepted_deleted_lines: u64,
-    pub(crate) line_fingerprints: Vec<AcceptedLineFingerprint>,
+    // Analytics ingestion and warehouse schemas require this field on the wire.
+    // Keep it statically empty; line fingerprints are no longer generated.
+    pub(crate) line_fingerprints: [(); 0],
 }
 
 #[derive(Serialize)]
@@ -141,7 +209,6 @@ pub(crate) struct SkillInvocationEventParams {
     pub(crate) skill_scope: Option<String>,
     pub(crate) plugin_id: Option<String>,
     pub(crate) remote_plugin_id: Option<String>,
-    pub(crate) repo_url: Option<String>,
     pub(crate) thread_id: Option<String>,
     pub(crate) turn_id: Option<String>,
     pub(crate) invoke_type: Option<InvocationType>,
@@ -173,6 +240,8 @@ pub(crate) struct ThreadInitializedEventParams {
     pub(crate) runtime: CodexRuntimeMetadata,
     pub(crate) model: String,
     pub(crate) ephemeral: bool,
+    /// Whether the thread's checkout is a validated linked Git worktree, if known.
+    pub(crate) is_worktree: Option<bool>,
     pub(crate) thread_source: Option<ThreadSource>,
     pub(crate) initialization_mode: ThreadInitializationMode,
     pub(crate) subagent_source: Option<String>,
@@ -185,6 +254,34 @@ pub(crate) struct ThreadInitializedEventParams {
 pub(crate) struct ThreadInitializedEvent {
     pub(crate) event_type: &'static str,
     pub(crate) event_params: ThreadInitializedEventParams,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ThreadArchiveAction {
+    Archived,
+    Unarchived,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ThreadArchiveEventParams {
+    pub(crate) thread_id: String,
+    pub(crate) action: ThreadArchiveAction,
+    pub(crate) occurred_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) app_server_client: Option<CodexAppServerClientMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime: Option<CodexRuntimeMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_source: Option<ThreadSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) parent_thread_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ThreadArchiveEvent {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_params: ThreadArchiveEventParams,
 }
 
 #[derive(Serialize)]
@@ -239,22 +336,48 @@ pub enum GuardianApprovalRequestSource {
     DelegatedSubagent,
 }
 
+/// Path-free permission metadata for a Guardian reviewed action.
+#[derive(Clone, Debug, Serialize)]
+pub struct GuardianAdditionalPermissions {
+    network: Option<GuardianNetworkPermissions>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GuardianNetworkPermissions {
+    enabled: Option<bool>,
+}
+
+impl From<&AdditionalPermissionProfile> for GuardianAdditionalPermissions {
+    fn from(permissions: &AdditionalPermissionProfile) -> Self {
+        Self {
+            network: permissions
+                .network
+                .as_ref()
+                .map(|network| GuardianNetworkPermissions {
+                    enabled: network.enabled,
+                }),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GuardianReviewedAction {
     Shell {
         sandbox_permissions: SandboxPermissions,
-        additional_permissions: Option<AdditionalPermissionProfile>,
+        additional_permissions: Option<GuardianAdditionalPermissions>,
     },
     UnifiedExec {
         sandbox_permissions: SandboxPermissions,
-        additional_permissions: Option<AdditionalPermissionProfile>,
+        additional_permissions: Option<GuardianAdditionalPermissions>,
+        tty: bool,
+    },
+    WriteStdin {
         tty: bool,
     },
     Execve {
         source: GuardianCommandSource,
-        program: String,
-        additional_permissions: Option<AdditionalPermissionProfile>,
+        additional_permissions: Option<GuardianAdditionalPermissions>,
     },
     ApplyPatch {},
     NetworkAccess {
@@ -536,6 +659,7 @@ pub(crate) struct CodexToolItemEventBase {
     pub(crate) thread_id: String,
     pub(crate) session_id: String,
     pub(crate) turn_id: String,
+    pub(crate) root_turn_id: Option<String>,
     /// App-server ThreadItem.id. For tool-originated items this generally
     /// corresponds to the originating core call_id.
     pub(crate) item_id: String,
@@ -570,6 +694,7 @@ pub(crate) struct CodexToolItemEventBase {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReviewSubjectKind {
     CommandExecution,
+    WriteStdin,
     FileChange,
     McpToolCall,
     Permissions,
@@ -673,6 +798,26 @@ pub(crate) struct CodexCommandExecutionEventRequest {
 }
 
 #[derive(Serialize)]
+pub(crate) struct CodexPluginMeasurementEventParams {
+    pub(crate) thread_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) item_id: String,
+    pub(crate) originator: String,
+    pub(crate) plugin_id: String,
+    pub(crate) execution_id: String,
+    pub(crate) operation: String,
+    pub(crate) measurement_name: String,
+    pub(crate) number_value: f64,
+    pub(crate) dimensions: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexPluginMeasurementEventRequest {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_params: CodexPluginMeasurementEventParams,
+}
+
+#[derive(Serialize)]
 pub(crate) struct CodexFileChangeEventParams {
     #[serde(flatten)]
     pub(crate) base: CodexToolItemEventBase,
@@ -725,6 +870,19 @@ pub(crate) struct CodexDynamicToolCallEventRequest {
 }
 
 #[derive(Serialize)]
+pub(crate) struct CodexControlToolCallEventParams {
+    #[serde(flatten)]
+    pub(crate) base: CodexToolItemEventBase,
+    pub(crate) success: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexControlToolCallEventRequest {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_params: CodexControlToolCallEventParams,
+}
+
+#[derive(Serialize)]
 pub(crate) struct CodexCollabAgentToolCallEventParams {
     #[serde(flatten)]
     pub(crate) base: CodexToolItemEventBase,
@@ -765,6 +923,9 @@ pub(crate) struct CodexImageGenerationEventParams {
     pub(crate) base: CodexToolItemEventBase,
     pub(crate) revised_prompt_present: bool,
     pub(crate) saved_path_present: bool,
+    pub(crate) transparent_background: Option<bool>,
+    pub(crate) imagegen_request_id: Option<String>,
+    pub(crate) generation_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -804,6 +965,8 @@ pub(crate) struct CodexHookRunMetadata {
     pub(crate) model_slug: Option<String>,
     pub(crate) hook_name: Option<String>,
     pub(crate) hook_source: Option<&'static str>,
+    pub(crate) handler_type: Option<HookHandlerType>,
+    pub(crate) execution_mode: Option<HookExecutionMode>,
     pub(crate) status: Option<HookRunStatus>,
 }
 
@@ -877,6 +1040,9 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) thread_id: String,
     pub(crate) session_id: String,
     pub(crate) turn_id: String,
+    pub(crate) root_turn_id: Option<String>,
+    pub(crate) turn_trigger: Option<String>,
+    pub(crate) codex_turn_source: Option<String>,
     // TODO(rhan-oai): Populate once queued/default submission type is plumbed from
     // the turn/start callsites instead of always being reported as None.
     pub(crate) submission_type: Option<TurnSubmissionType>,
@@ -895,6 +1061,7 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) service_tier: String,
     pub(crate) approval_policy: String,
     pub(crate) approvals_reviewer: String,
+    pub(crate) guardian_v2_enabled: bool,
     pub(crate) sandbox_network_access: bool,
     pub(crate) collaboration_mode: Option<&'static str>,
     pub(crate) personality: Option<String>,
@@ -1258,6 +1425,8 @@ pub(crate) fn codex_hook_run_metadata(
         model_slug: Some(tracking.model_slug.clone()),
         hook_name: Some(analytics_hook_event_name(hook.event_name).to_owned()),
         hook_source: Some(analytics_hook_source(hook.hook_source)),
+        handler_type: Some(hook.handler_type),
+        execution_mode: Some(hook.execution_mode),
         status: Some(analytics_hook_status(hook.status)),
     }
 }
@@ -1275,6 +1444,7 @@ fn analytics_hook_event_name(event_name: HookEventName) -> &'static str {
         HookEventName::SubagentStart => "SubagentStart",
         HookEventName::SubagentStop => "SubagentStop",
         HookEventName::Stop => "Stop",
+        HookEventName::Interrupt => "Interrupt",
     }
 }
 
@@ -1312,15 +1482,16 @@ pub(crate) fn subagent_thread_started_event_request(
         session_id: input.session_id,
         app_server_client: CodexAppServerClientMetadata {
             product_client_id: input.product_client_id,
-            client_name: Some(input.client_name),
-            client_version: Some(input.client_version),
+            client_name: input.client_name,
+            client_version: input.client_version,
             rpc_transport: AppServerRpcTransport::InProcess,
             experimental_api_enabled: None,
         },
         runtime: current_runtime_metadata(),
         model: input.model,
         ephemeral: input.ephemeral,
-        thread_source: Some(ThreadSource::Subagent),
+        is_worktree: None,
+        thread_source: input.thread_source,
         initialization_mode: ThreadInitializationMode::New,
         subagent_source: Some(subagent_source_name(&input.subagent_source)),
         parent_thread_id: input.parent_thread_id,

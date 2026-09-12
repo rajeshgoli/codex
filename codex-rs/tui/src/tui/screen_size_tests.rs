@@ -91,6 +91,23 @@ async fn redraw_recovers_from_a_missed_resize_notification() {
 }
 
 #[tokio::test]
+async fn focus_gain_refreshes_geometry_even_after_a_recent_check() {
+    let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
+    let actual = tui.terminal.size().expect("backend size");
+    tui.terminal.last_known_screen_size = Size::new(/*width*/ 153, /*height*/ 51);
+    tui.screen_size.last_backend_check = Some(std::time::Instant::now());
+    tui.defer_screen_size(Size::new(/*width*/ 100, /*height*/ 30));
+
+    assert_eq!(
+        tui.screen_size_for_event(&TuiEvent::FocusGained)
+            .expect("size"),
+        actual
+    );
+    assert_eq!(tui.take_event_screen_size().expect("draw size"), actual);
+    assert!(tui.screen_size.deferred_size.is_none());
+}
+
+#[tokio::test]
 async fn recent_cached_draw_schedules_idle_geometry_recovery() {
     let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
     let (requester, mut requests) = crate::tui::FrameRequester::test_channel();

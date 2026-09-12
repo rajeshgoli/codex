@@ -5,6 +5,7 @@ use codex_config::ConfigLayerStack;
 use codex_config::LoaderOverrides;
 use codex_config::ThreadConfigLoader;
 use codex_config::loader::load_config_layers_state;
+use codex_config::loader::load_managed_requirements_state;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -12,6 +13,10 @@ use codex_exec_server::LOCAL_FS;
 use codex_features::feature_for_key;
 use codex_login::AuthManager;
 use codex_login::default_client::set_default_client_residency_requirement;
+use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_RUNTIME_PROVIDER_ID;
+use codex_model_provider_info::built_in_model_providers;
+use codex_model_provider_info::merge_configured_model_providers;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_json_to_toml::json_to_toml;
 use std::collections::BTreeMap;
@@ -25,6 +30,12 @@ use toml::Value as TomlValue;
 use tracing::instrument;
 use tracing::warn;
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Your organization's required model provider settings changed. Restart Codex to apply them; this request was not sent"
+)]
+pub(crate) struct ModelProviderRequirementsChanged;
+
 /// Shared app-server entry point for loading effective Codex configuration.
 #[derive(Clone)]
 pub(crate) struct ConfigManager {
@@ -35,8 +46,7 @@ pub(crate) struct ConfigManager {
     strict_config: bool,
     cloud_config_bundle: Arc<RwLock<CloudConfigBundleLoader>>,
     arg0_paths: Arg0DispatchPaths,
-    thread_config_loader: Arc<RwLock<Arc<dyn ThreadConfigLoader>>>,
-    pub(crate) psp: bool,
+    thread_config_loader: Arc<dyn ThreadConfigLoader>,
 }
 
 impl ConfigManager {
@@ -57,8 +67,7 @@ impl ConfigManager {
             strict_config,
             cloud_config_bundle: Arc::new(RwLock::new(cloud_config_bundle)),
             arg0_paths,
-            thread_config_loader: Arc::new(RwLock::new(thread_config_loader)),
-            psp: false,
+            thread_config_loader,
         }
     }
 
@@ -113,22 +122,12 @@ impl ConfigManager {
         }
     }
 
-    pub(crate) fn replace_thread_config_loader(
-        &self,
-        thread_config_loader: Arc<dyn ThreadConfigLoader>,
-    ) {
-        if let Ok(mut guard) = self.thread_config_loader.write() {
-            *guard = thread_config_loader;
+    pub(crate) fn clear_cloud_config_bundle_loader(&self) {
+        if let Ok(mut guard) = self.cloud_config_bundle.write() {
+            *guard = CloudConfigBundleLoader::default();
         } else {
-            warn!("failed to update thread config loader");
+            warn!("failed to clear cloud config bundle loader");
         }
-    }
-
-    fn current_thread_config_loader(&self) -> Arc<dyn ThreadConfigLoader> {
-        self.thread_config_loader
-            .read()
-            .map(|guard| Arc::clone(&*guard))
-            .unwrap_or_else(|_| Arc::new(codex_config::NoopThreadConfigLoader))
     }
 
     pub(crate) async fn sync_default_client_residency_requirement(&self) {
@@ -156,6 +155,14 @@ impl ConfigManager {
         .await
     }
 
+    /// Loads system, user, and runtime settings without discovering a project
+    /// from the app-server process's working directory.
+    pub(crate) async fn load_non_project_config(&self) -> std::io::Result<Config> {
+        let mut manager = self.clone();
+        manager.loader_overrides.ignore_project_config = true;
+        manager.load_latest_config(/*fallback_cwd*/ None).await
+    }
+
     pub(crate) async fn load_latest_config_for_thread(
         &self,
         thread_config: &Config,
@@ -171,6 +178,62 @@ impl ConfigManager {
         Ok(config)
     }
 
+    /// Checks the retained session route against current managed provider requirements.
+    pub(crate) async fn check_thread_model_provider(
+        &self,
+        current: &Config,
+    ) -> std::io::Result<()> {
+        // Existing threads retain their session route; only managed
+        // requirements can invalidate it.
+        let requirements = load_managed_requirements_state(
+            LOCAL_FS.as_ref(),
+            &self.codex_home,
+            codex_config::ConfigLoadOptions {
+                loader_overrides: self.loader_overrides.clone(),
+                strict_config: self.strict_config,
+                cloud_config_bundle: self.current_cloud_config_bundle(),
+            },
+        )
+        .await?;
+        let selection_changed = requirements
+            .model_provider
+            .as_ref()
+            .is_some_and(|provider_id| provider_id != &current.model_provider_id);
+        let required_provider = requirements
+            .model_providers
+            .as_ref()
+            .and_then(|providers| providers.get(&current.model_provider_id))
+            .cloned();
+        let required_provider = match required_provider {
+            Some(provider)
+                if matches!(
+                    current.model_provider_id.as_str(),
+                    AMAZON_BEDROCK_PROVIDER_ID | AMAZON_BEDROCK_RUNTIME_PROVIDER_ID
+                ) =>
+            {
+                // Bedrock requirements contain overrides of the built-in provider.
+                merge_configured_model_providers(
+                    built_in_model_providers(/*openai_base_url*/ None),
+                    HashMap::from([(current.model_provider_id.clone(), provider)]),
+                )
+                .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?
+                .remove(&current.model_provider_id)
+            }
+            Some(provider) => Some(provider),
+            None => None,
+        };
+        let definition_changed = required_provider
+            .as_ref()
+            .is_some_and(|provider| provider != &current.model_provider);
+        if selection_changed || definition_changed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                ModelProviderRequirementsChanged,
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn load_default_config(&self) -> std::io::Result<Config> {
         let mut loader_overrides = self.loader_overrides.clone();
         loader_overrides.ignore_user_config = true;
@@ -182,7 +245,6 @@ impl ConfigManager {
             .cloud_config_bundle(CloudConfigBundleLoader::default())
             .build()
             .await?;
-        config.psp = self.psp;
         self.apply_runtime_feature_enablement(&mut config);
         self.apply_arg0_paths(&mut config);
         Ok(config)
@@ -243,8 +305,6 @@ impl ConfigManager {
                     .map(|(key, value)| (key, json_to_toml(value))),
             )
             .collect::<Vec<_>>();
-        typesafe_overrides.psp = Some(self.psp);
-
         let mut config = codex_core::config::ConfigBuilder::default()
             .codex_home(self.codex_home.clone())
             .cli_overrides(merged_cli_overrides)
@@ -253,7 +313,7 @@ impl ConfigManager {
             .harness_overrides(typesafe_overrides)
             .fallback_cwd(fallback_cwd)
             .cloud_config_bundle(self.current_cloud_config_bundle())
-            .thread_config_loader(self.current_thread_config_loader())
+            .thread_config_loader(Arc::clone(&self.thread_config_loader))
             .build()
             .await?;
         self.apply_runtime_feature_enablement(&mut config);
@@ -272,7 +332,6 @@ impl ConfigManager {
         &self,
         cwd: Option<AbsolutePathBuf>,
     ) -> std::io::Result<ConfigLayerStack> {
-        let thread_config_loader = self.current_thread_config_loader();
         load_config_layers_state(
             LOCAL_FS.as_ref(),
             &self.codex_home,
@@ -283,7 +342,7 @@ impl ConfigManager {
                 strict_config: self.strict_config,
                 cloud_config_bundle: self.current_cloud_config_bundle(),
             },
-            thread_config_loader.as_ref(),
+            self.thread_config_loader.as_ref(),
         )
         .await
     }
@@ -333,6 +392,10 @@ impl ConfigManager {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "config_manager_provider_tests.rs"]
+mod provider_tests;
 
 pub(crate) fn protected_feature_keys(config_layer_stack: &ConfigLayerStack) -> BTreeSet<String> {
     let mut protected_features = config_layer_stack

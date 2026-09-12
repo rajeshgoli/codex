@@ -18,7 +18,7 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 mod layout;
-mod render;
+pub(super) mod render;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
@@ -655,44 +655,12 @@ impl RequestUserInputOverlay {
     }
 
     fn wrap_footer_tips(&self, width: u16, tips: Vec<FooterTip>) -> Vec<Vec<FooterTip>> {
-        let max_width = width.max(1) as usize;
-        let separator_width = UnicodeWidthStr::width(TIP_SEPARATOR);
-        if tips.is_empty() {
-            return vec![Vec::new()];
-        }
-
-        let mut lines: Vec<Vec<FooterTip>> = Vec::new();
-        let mut current: Vec<FooterTip> = Vec::new();
-        let mut used = 0usize;
-
-        for tip in tips {
-            let tip_width = UnicodeWidthStr::width(tip.text.as_str()).min(max_width);
-            let extra = if current.is_empty() {
-                tip_width
-            } else {
-                separator_width.saturating_add(tip_width)
-            };
-            if !current.is_empty() && used.saturating_add(extra) > max_width {
-                lines.push(current);
-                current = Vec::new();
-                used = 0;
-            }
-            if current.is_empty() {
-                used = tip_width;
-            } else {
-                used = used
-                    .saturating_add(separator_width)
-                    .saturating_add(tip_width);
-            }
-            current.push(tip);
-        }
-
-        if current.is_empty() {
-            lines.push(Vec::new());
-        } else {
-            lines.push(current);
-        }
-        lines
+        crate::footer_hint::wrap_hint_rows(
+            tips,
+            width,
+            UnicodeWidthStr::width(TIP_SEPARATOR),
+            |tip| UnicodeWidthStr::width(tip.text.as_str()),
+        )
     }
 
     pub(super) fn footer_required_height(&self, width: u16) -> u16 {
@@ -1363,7 +1331,15 @@ impl BottomPaneView for RequestUserInputOverlay {
                     (_, KeyCode::Backspace | KeyCode::Delete) => {
                         self.clear_selection();
                     }
-                    (_, KeyCode::Tab) if self.selected_option_index().is_some() => {
+                    (_, KeyCode::Tab) | (Some(ListAction::Accept), _) | (_, KeyCode::Enter)
+                        if self.selected_option_index().is_some()
+                            && (key_event.code == KeyCode::Tab
+                                || self.current_question().is_some_and(|question| {
+                                    Self::other_option_enabled_for_question(question)
+                                        && self.selected_option_index()
+                                            == question.options.as_ref().map(Vec::len)
+                                })) =>
+                    {
                         self.focus = Focus::Notes;
                         self.ensure_selected_for_notes();
                     }
@@ -1515,6 +1491,9 @@ impl BottomPaneView for RequestUserInputOverlay {
 
     fn next_frame_delay(&self) -> Option<Duration> {
         self.auto_resolution_next_frame_delay_at(Instant::now())
+            .into_iter()
+            .chain(self.composer.footer_flash_delay())
+            .min()
     }
 
     fn try_consume_user_input_request(
@@ -1561,7 +1540,7 @@ mod tests {
         let AppEvent::CodexOp(op) = event else {
             panic!("expected CodexOp");
         };
-        assert_eq!(op, Op::interrupt());
+        assert!(matches!(op, Op::Interrupt));
         assert!(
             rx.try_recv().is_err(),
             "unexpected AppEvents before interrupt completion"
@@ -3232,6 +3211,35 @@ mod tests {
         let answer = overlay.answers.first().expect("answer missing");
         assert_eq!(answer.options_state.selected_idx, Some(1));
         assert!(answer.answer_committed);
+    }
+
+    #[test]
+    fn tab_and_enter_open_notes_for_other_option() {
+        for key in [KeyCode::Tab, KeyCode::Enter] {
+            let (tx, mut rx) = test_sender();
+            let mut overlay = RequestUserInputOverlay::new(
+                request_event(
+                    "turn-1",
+                    vec![question_with_options_and_other("q1", "Pick one")],
+                ),
+                tx,
+                /*has_input_focus*/ true,
+                /*enhanced_keys_supported*/ false,
+                /*disable_paste_burst*/ false,
+            );
+            let other_idx = overlay.options_len().saturating_sub(1);
+            overlay
+                .current_answer_mut()
+                .expect("answer missing")
+                .options_state
+                .selected_idx = Some(other_idx);
+
+            overlay.handle_key_event(KeyEvent::from(key));
+
+            assert!(matches!(overlay.focus, Focus::Notes));
+            assert!(overlay.notes_ui_visible());
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[test]

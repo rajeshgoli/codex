@@ -1,8 +1,8 @@
 #![allow(warnings, clippy::all)]
 
 use super::*;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
+use crate::RolloutItem;
+use crate::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
@@ -38,9 +38,11 @@ fn write_rollout_with_source_and_provider(
                 session_id: thread_id.into(),
                 id: thread_id,
                 forked_from_id: None,
+                forked_from_ordinal_exclusive: None,
                 parent_thread_id: None,
                 timestamp,
                 cwd: ".".into(),
+                runtime_workspace_roots: None,
                 originator: "test_originator".into(),
                 cli_version: "test_version".into(),
                 source,

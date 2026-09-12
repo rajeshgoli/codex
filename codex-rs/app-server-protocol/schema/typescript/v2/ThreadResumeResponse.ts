@@ -9,7 +9,10 @@ import type { AskForApproval } from "./AskForApproval";
 import type { SandboxPolicy } from "./SandboxPolicy";
 import type { Thread } from "./Thread";
 
-export type ThreadResumeResponse = {thread: Thread, model: string, modelProvider: string, serviceTier: string | null, cwd: AbsolutePathBuf, /**
+export type ThreadResumeResponse = {thread: Thread, model: string, modelProvider: string, serviceTier: string | null, /**
+ * Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.
+ */
+disabledPluginIds: Array<string>, cwd: AbsolutePathBuf, /**
  * Environment-native paths to instruction source files currently loaded for this thread.
  */
 instructionSources: Array<LegacyAppPathString>, approvalPolicy: AskForApproval, /**
@@ -19,4 +22,16 @@ approvalsReviewer: ApprovalsReviewer, /**
  * Legacy sandbox policy retained for compatibility. Experimental clients
  * should prefer `activePermissionProfile` for profile provenance.
  */
-sandbox: SandboxPolicy, reasoningEffort: ReasoningEffort | null};
+sandbox: SandboxPolicy, reasoningEffort: ReasoningEffort | null, /**
+ * Opaque cursor for hydrating paginated turns backwards.
+ *
+ * Pass this as `cursor` to `thread/turns/list` with
+ * `sortDirection: "desc"`. The first page includes the turn identified by the cursor.
+ */
+turnsBackwardsCursor: string | null, /**
+ * Opaque cursor for hydrating paginated items backwards.
+ *
+ * Pass this as `cursor` to `thread/items/list` with
+ * `sortDirection: "desc"`. The first page includes the item identified by the cursor.
+ */
+itemsBackwardsCursor: string | null};

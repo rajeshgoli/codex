@@ -6,6 +6,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use chrono::DateTime;
+use chrono::Utc;
 use schemars::JsonSchema;
 use schemars::r#gen::SchemaGenerator;
 use schemars::schema::InstanceType;
@@ -31,7 +33,24 @@ use crate::config_types::ServiceTier;
 use crate::config_types::Verbosity;
 use crate::protocol::MultiAgentVersion;
 
-const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
+mod access_programs;
+#[path = "openai_models/guardian.rs"]
+mod guardian;
+pub use guardian::GuardianModelPolicy;
+pub use guardian::GuardianReviewMode;
+pub use guardian::GuardianScope;
+
+#[path = "openai_models/guardian_v2.rs"]
+mod guardian_v2;
+#[path = "openai_models/reasoning_effort.rs"]
+mod reasoning_effort;
+
+pub use access_programs::ModelAccessPrograms;
+pub use guardian_v2::GuardianV2ModelConfig;
+pub use guardian_v2::GuardianV2TranscriptModelConfig;
+
+/// Backend model-catalog specialty identifying cybersecurity-focused models.
+pub const MODEL_SPECIALTY_CYBER: &str = "cyber";
 pub const SPEED_TIER_FAST: &str = "fast";
 
 /// See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning
@@ -47,6 +66,7 @@ pub enum ReasoningEffort {
     XHigh,
     Max,
     Ultra,
+    Persistent,
     /// A model-defined effort value that this client does not know yet.
     Custom(String),
 }
@@ -63,6 +83,7 @@ impl ReasoningEffort {
             Self::XHigh => "xhigh",
             Self::Max => "max",
             Self::Ultra => "ultra",
+            Self::Persistent => "persistent",
             Self::Custom(effort) => effort,
         }
     }
@@ -129,6 +150,7 @@ impl FromStr for ReasoningEffort {
             "xhigh" => Ok(Self::XHigh),
             "max" => Ok(Self::Max),
             "ultra" => Ok(Self::Ultra),
+            "persistent" => Ok(Self::Persistent),
             "" => Err("reasoning_effort must not be empty".to_string()),
             effort => Ok(Self::Custom(effort.to_string())),
         }
@@ -185,6 +207,15 @@ pub struct ModelUpgrade {
     pub model_link: Option<String>,
     pub upgrade_copy: Option<String>,
     pub migration_markdown: Option<String>,
+    /// Informational time when the model associated with this upgrade is scheduled to retire.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_rfc3339_timestamp"
+    )]
+    #[schemars(with = "Option<String>")]
+    #[ts(type = "string", optional)]
+    pub retirement_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
@@ -216,7 +247,7 @@ pub struct ModelPreset {
     pub default_reasoning_effort: ReasoningEffort,
     /// Supported reasoning effort options.
     pub supported_reasoning_efforts: Vec<ReasoningEffortPreset>,
-    /// Whether this model supports personality-specific instructions.
+    /// Deprecated catalog field, always false for new model presets.
     #[serde(default)]
     pub supports_personality: bool,
     /// Deprecated: use `service_tiers` instead.
@@ -228,6 +259,9 @@ pub struct ModelPreset {
     /// Catalog default service tier id for this model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_service_tier: Option<String>,
+    /// Caller-specific explicit access programs, when discovery resolved them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_access_programs: Option<ModelAccessPrograms>,
     /// Whether this is the default model for new users.
     pub is_default: bool,
     /// recommended upgrade model
@@ -278,11 +312,9 @@ pub enum ModelVisibility {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum ConfigShellToolType {
-    Default,
-    Local,
+    #[serde(alias = "default", alias = "local", alias = "shell_command")]
     UnifiedExec,
     Disabled,
-    ShellCommand,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, TS, JsonSchema)]
@@ -370,6 +402,11 @@ const fn is_true(value: &bool) -> bool {
 /// Model metadata returned by the Codex backend `/models` endpoint.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelInfo {
+    /// Model-owned approval coverage. Absent preserves legacy settings; an empty map disables
+    /// ordinary Guardian review. Keys are computer_use, shell, code_mode, file_changes, mcp, network,
+    /// and permissions. This does not override mandatory safety or administrator requirements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian: Option<GuardianModelPolicy>,
     pub slug: String,
     pub display_name: String,
     pub description: Option<String>,
@@ -386,6 +423,8 @@ pub struct ModelInfo {
     pub service_tiers: Vec<ModelServiceTier>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_access_programs: Option<ModelAccessPrograms>,
     pub availability_nux: Option<ModelAvailabilityNux>,
     pub upgrade: Option<ModelInfoUpgrade>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -407,7 +446,6 @@ pub struct ModelInfo {
     #[serde(default)]
     pub web_search_tool_type: WebSearchToolType,
     pub truncation_policy: TruncationPolicyConfig,
-    pub supports_parallel_tool_calls: bool,
     #[serde(default)]
     pub supports_image_detail_original: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -438,8 +476,15 @@ pub struct ModelInfo {
     pub used_fallback_model_metadata: bool,
     #[serde(default)]
     pub supports_search_tool: bool,
+    /// Whether experimental context management may be activated at session startup.
+    #[serde(default)]
+    pub supports_experimental_context: bool,
     #[serde(default)]
     pub use_responses_lite: bool,
+    #[serde(default)]
+    pub node_repl_auto_review_required: bool,
+    #[serde(default)]
+    pub node_repl_disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_review_model_override: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -456,11 +501,21 @@ pub struct ModelInfo {
         deserialize_with = "deserialize_optional_model_selector"
     )]
     pub multi_agent_version: Option<MultiAgentVersion>,
+    /// Reasoning effort used for multi-agent work when the user selects Ultra.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_agent_reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl ModelInfo {
     pub fn resolved_context_window(&self) -> Option<i64> {
         self.context_window.or(self.max_context_window)
+    }
+
+    /// Context available to inference after reserving this model's configured headroom.
+    pub fn usable_context_window(&self) -> Option<i64> {
+        self.resolved_context_window().map(|context_window| {
+            context_window.saturating_mul(self.effective_context_window_percent) / 100
+        })
     }
 
     pub fn auto_compact_token_limit(&self) -> Option<i64> {
@@ -476,23 +531,13 @@ impl ModelInfo {
         config_limit
     }
 
-    pub fn supports_personality(&self) -> bool {
-        self.model_messages
-            .as_ref()
-            .is_some_and(ModelMessages::supports_personality)
-    }
-
-    pub fn get_model_instructions(&self, personality: Option<Personality>) -> String {
+    /// Returns the literal instruction template. The personality argument remains for older
+    /// callers; the `None` opt-out is applied separately by models-manager.
+    pub fn get_model_instructions(&self, _personality: Option<Personality>) -> String {
         if let Some(model_messages) = &self.model_messages
             && let Some(template) = &model_messages.instructions_template
         {
-            if model_messages.instructions_variables.is_none() {
-                return template.clone();
-            }
-            let personality_message = model_messages
-                .get_personality_message(personality)
-                .unwrap_or_default();
-            template.replace(PERSONALITY_PLACEHOLDER, personality_message.as_str())
+            template.clone()
         } else {
             warn!(
                 model = %self.slug,
@@ -505,23 +550,66 @@ impl ModelInfo {
 
 /// A strongly-typed template for assembling model instructions and developer messages.
 ///
-/// When `instructions_variables` is absent, `instructions_template` is treated as literal text.
-/// When variables are present but incomplete, missing values render as empty strings.
+/// `instructions_template` is literal text. The deprecated `instructions_variables` field is
+/// retained to decode catalogs produced before personality selection was removed.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelMessages {
+    /// Additional developer instructions for persistent mode. Missing or null uses the built-in
+    /// instructions; an empty string disables them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolMessages>,
     pub instructions_template: Option<String>,
     pub instructions_variables: Option<ModelInstructionsVariables>,
     pub approvals: Option<ApprovalMessages>,
     pub collaboration_modes: Option<CollaborationModeMessages>,
     pub auto_review: Option<AutoReviewMessages>,
     pub permissions: Option<PermissionMessages>,
+    pub multi_agent: Option<MultiAgentMessages>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<ModelTokenBudgetConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_v2: Option<GuardianV2ModelConfig>,
+    /// Replacement confirmation-policy documents forwarded in actor MCP request metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation_policies: Option<ConfirmationPolicies>,
+}
+
+/// Model-owned confirmation-policy Markdown, forwarded unchanged to actor tools.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+pub struct ConfirmationPolicies {
+    /// Replacement Markdown for the Browser Use confirmation-policy document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_use: Option<String>,
+    /// Replacement Markdown for the native Computer Use confirmation policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_use: Option<String>,
+}
+
+/// Model-owned messages for built-in tools.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+pub struct ToolMessages {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_user_message_async: Option<ToolMessage>,
+}
+
+/// Model-owned messages for a built-in tool.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+pub struct ToolMessage {
+    /// Missing or null uses the built-in description; an empty string leaves the description
+    /// empty without disabling the tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Model-owned defaults for the context-window token-budget feature.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelTokenBudgetConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub use_history_notes_extension: bool,
     pub reminder_threshold_tokens: i64,
     pub reminder_message_template: String,
     pub guidance_message: String,
@@ -547,6 +635,11 @@ pub struct CollaborationModeMessages {
 pub struct AutoReviewMessages {
     pub policy: Option<String>,
     pub policy_template: Option<String>,
+    /// Extra developer policy for `node_repl` and `cua_repl` reviews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_repl_policy: Option<String>,
+    pub rejection_instructions: Option<String>,
+    pub timeout_instructions: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
@@ -556,27 +649,25 @@ pub struct PermissionMessages {
     pub read_only: Option<String>,
 }
 
-impl ModelMessages {
-    fn has_personality_placeholder(&self) -> bool {
-        self.instructions_template
-            .as_ref()
-            .map(|spec| spec.contains(PERSONALITY_PLACEHOLDER))
-            .unwrap_or(false)
-    }
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+pub struct MultiAgentMessages {
+    pub role: Option<MultiAgentRoleMessages>,
+    pub mode: Option<MultiAgentModeMessages>,
+}
 
-    fn supports_personality(&self) -> bool {
-        self.has_personality_placeholder()
-            && self
-                .instructions_variables
-                .as_ref()
-                .is_some_and(ModelInstructionsVariables::is_complete)
-    }
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+pub struct MultiAgentRoleMessages {
+    pub root: Option<String>,
+    pub subagent: Option<String>,
+}
 
-    pub fn get_personality_message(&self, personality: Option<Personality>) -> Option<String> {
-        self.instructions_variables
-            .as_ref()
-            .and_then(|variables| variables.get_personality_message(personality))
-    }
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+pub struct MultiAgentModeMessages {
+    pub explicit: Option<String>,
+    /// Ultra-only mode instructions. Missing or null uses the built-in proactive hint;
+    /// an empty string suppresses the mode message. `hint_text` takes precedence.
+    pub proactive: Option<String>,
+    pub hint_text: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
@@ -586,30 +677,33 @@ pub struct ModelInstructionsVariables {
     pub personality_pragmatic: Option<String>,
 }
 
-impl ModelInstructionsVariables {
-    pub fn is_complete(&self) -> bool {
-        self.personality_default.is_some()
-            && self.personality_friendly.is_some()
-            && self.personality_pragmatic.is_some()
-    }
-
-    pub fn get_personality_message(&self, personality: Option<Personality>) -> Option<String> {
-        if let Some(personality) = personality {
-            match personality {
-                Personality::None => Some(String::new()),
-                Personality::Friendly => self.personality_friendly.clone(),
-                Personality::Pragmatic => self.personality_pragmatic.clone(),
-            }
-        } else {
-            self.personality_default.clone()
-        }
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelInfoUpgrade {
     pub model: String,
     pub migration_markdown: String,
+    /// Informational time when the model associated with this upgrade is scheduled to retire.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_rfc3339_timestamp"
+    )]
+    #[schemars(with = "Option<String>")]
+    #[ts(type = "string", optional)]
+    pub retirement_at: Option<DateTime<Utc>>,
+}
+
+fn deserialize_optional_rfc3339_timestamp<'de, D>(
+    deserializer: D,
+) -> Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc)))
 }
 
 impl From<&ModelUpgrade> for ModelInfoUpgrade {
@@ -617,6 +711,7 @@ impl From<&ModelUpgrade> for ModelInfoUpgrade {
         ModelInfoUpgrade {
             model: upgrade.id.clone(),
             migration_markdown: upgrade.migration_markdown.clone().unwrap_or_default(),
+            retirement_at: upgrade.retirement_at,
         }
     }
 }
@@ -691,13 +786,18 @@ where
                     .is_none()
             {
                 let messages = model.model_messages.get_or_insert(ModelMessages {
+                    persistent_instructions: None,
+                    tools: None,
                     instructions_template: None,
                     instructions_variables: None,
                     approvals: None,
                     collaboration_modes: None,
                     auto_review: None,
                     permissions: None,
+                    multi_agent: None,
                     token_budget: None,
+                    confirmation_policies: None,
+                    guardian_v2: None,
                 });
                 messages.instructions_template = Some(base_instructions);
             }
@@ -721,7 +821,6 @@ where
 // convert ModelInfo to ModelPreset
 impl From<ModelInfo> for ModelPreset {
     fn from(info: ModelInfo) -> Self {
-        let supports_personality = info.supports_personality();
         ModelPreset {
             id: info.slug.clone(),
             model: info.slug.clone(),
@@ -732,10 +831,11 @@ impl From<ModelInfo> for ModelPreset {
                 .default_reasoning_level
                 .unwrap_or(ReasoningEffort::None),
             supported_reasoning_efforts: info.supported_reasoning_levels.clone(),
-            supports_personality,
+            supports_personality: false,
             additional_speed_tiers: info.additional_speed_tiers,
             service_tiers: info.service_tiers,
             default_service_tier: info.default_service_tier,
+            available_access_programs: info.available_access_programs,
             is_default: false, // default is the highest priority available model
             upgrade: info.upgrade.as_ref().map(|upgrade| ModelUpgrade {
                 id: upgrade.model.clone(),
@@ -744,6 +844,7 @@ impl From<ModelInfo> for ModelPreset {
                 model_link: None,
                 upgrade_copy: None,
                 migration_markdown: Some(upgrade.migration_markdown.clone()),
+                retirement_at: upgrade.retirement_at,
             }),
             show_in_picker: info.visibility == ModelVisibility::List,
             multi_agent_version: info.multi_agent_version,
@@ -814,20 +915,36 @@ mod tests {
     use serde_json::from_str;
     use serde_json::to_string;
 
-    fn test_model(spec: Option<ModelMessages>) -> ModelInfo {
+    #[test]
+    fn legacy_shell_model_metadata_deserializes_as_unified_exec() {
+        for legacy_shell_type in ["default", "local", "shell_command"] {
+            assert_eq!(
+                from_str::<ConfigShellToolType>(&format!("\"{legacy_shell_type}\""))
+                    .expect("legacy shell type"),
+                ConfigShellToolType::UnifiedExec
+            );
+        }
+        assert_eq!(
+            to_string(&ConfigShellToolType::UnifiedExec).expect("serialize unified shell type"),
+            "\"unified_exec\""
+        );
+    }
+
+    pub(super) fn test_model(spec: Option<ModelMessages>) -> ModelInfo {
         ModelInfo {
             slug: "test-model".to_string(),
             display_name: "Test Model".to_string(),
             description: None,
             default_reasoning_level: None,
             supported_reasoning_levels: vec![],
-            shell_type: ConfigShellToolType::ShellCommand,
+            shell_type: ConfigShellToolType::UnifiedExec,
             visibility: ModelVisibility::List,
             supported_in_api: true,
             priority: 1,
             additional_speed_tiers: Vec::new(),
             service_tiers: Vec::new(),
             default_service_tier: None,
+            available_access_programs: None,
             availability_nux: None,
             upgrade: None,
             model_messages: spec,
@@ -841,7 +958,6 @@ mod tests {
             apply_patch_tool_type: None,
             web_search_tool_type: WebSearchToolType::Text,
             truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
-            supports_parallel_tool_calls: false,
             supports_image_detail_original: false,
             context_window: None,
             max_context_window: None,
@@ -852,40 +968,97 @@ mod tests {
             input_modalities: default_input_modalities(),
             used_fallback_model_metadata: false,
             supports_search_tool: false,
+            supports_experimental_context: false,
             use_responses_lite: false,
+            guardian: None,
+            node_repl_auto_review_required: false,
+            node_repl_disabled: false,
             auto_review_model_override: None,
             model_specialty: None,
             tool_mode: None,
             multi_agent_version: None,
+            multi_agent_reasoning_effort: None,
         }
     }
-
-    fn personality_variables() -> ModelInstructionsVariables {
-        ModelInstructionsVariables {
-            personality_default: Some("default".to_string()),
-            personality_friendly: Some("friendly".to_string()),
-            personality_pragmatic: Some("pragmatic".to_string()),
-        }
-    }
-
     #[test]
     fn model_messages_deserialize_without_optional_sections() {
-        let messages: ModelMessages =
-            from_str(r#"{"instructions_template":null,"instructions_variables":null}"#)
-                .expect("model messages should deserialize");
+        let messages: ModelMessages = from_str(
+            r#"{"instructions_template":null,"instructions_variables":null,"persistent_instructions":null}"#,
+        )
+        .expect("model messages should deserialize");
 
         assert_eq!(
             messages,
             ModelMessages {
+                persistent_instructions: None,
+                tools: None,
                 instructions_template: None,
                 instructions_variables: None,
                 approvals: None,
                 collaboration_modes: None,
                 auto_review: None,
                 permissions: None,
+                multi_agent: None,
                 token_budget: None,
+                confirmation_policies: None,
+                guardian_v2: None,
             }
         );
+    }
+
+    #[test]
+    fn send_user_message_async_description_preserves_missing_null_and_empty_values() {
+        for (value, expected) in [
+            (serde_json::json!({}), None),
+            (serde_json::json!({"tools": null}), None),
+            (serde_json::json!({"tools": {}}), Some(None)),
+            (
+                serde_json::json!({"tools": {"send_user_message_async": null}}),
+                Some(None),
+            ),
+            (
+                serde_json::json!({"tools": {"send_user_message_async": {}}}),
+                Some(Some(ToolMessage::default())),
+            ),
+            (
+                serde_json::json!({"tools": {"send_user_message_async": {"description": null}}}),
+                Some(Some(ToolMessage::default())),
+            ),
+            (
+                serde_json::json!({"tools": {"send_user_message_async": {"description": ""}}}),
+                Some(Some(ToolMessage {
+                    description: Some(String::new()),
+                })),
+            ),
+            (
+                serde_json::json!({"tools": {"send_user_message_async": {"description": "Catalog description"}}}),
+                Some(Some(ToolMessage {
+                    description: Some("Catalog description".to_string()),
+                })),
+            ),
+        ] {
+            let messages: ModelMessages =
+                serde_json::from_value(value).expect("model messages should deserialize");
+            let serialized =
+                serde_json::to_value(&messages).expect("model messages should serialize");
+            assert_eq!(
+                (
+                    messages.tools,
+                    serialized
+                        .get("tools")
+                        .map(|tools| tools.get("send_user_message_async").cloned()),
+                ),
+                (
+                    expected.as_ref().map(|tool| ToolMessages {
+                        send_user_message_async: tool.clone(),
+                    }),
+                    expected.map(|tool| tool.map(|tool| match tool.description {
+                        Some(description) => serde_json::json!({"description": description}),
+                        None => serde_json::json!({}),
+                    })),
+                )
+            );
+        }
     }
 
     #[test]
@@ -914,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_review_messages_preserve_missing_and_empty_template_values() {
+    fn auto_review_messages_preserve_missing_and_empty_values() {
         let missing_template: ModelMessages = from_str(
             r#"{
                 "instructions_template": null,
@@ -931,7 +1104,10 @@ mod tests {
                 "instructions_variables": null,
                 "auto_review": {
                     "policy": "policy",
-                    "policy_template": ""
+                    "policy_template": "",
+                    "node_repl_policy": "",
+                    "rejection_instructions": "",
+                    "timeout_instructions": ""
                 }
             }"#,
         )
@@ -942,6 +1118,9 @@ mod tests {
             Some(AutoReviewMessages {
                 policy: Some("policy".to_string()),
                 policy_template: None,
+                node_repl_policy: None,
+                rejection_instructions: None,
+                timeout_instructions: None,
             })
         );
         assert_eq!(
@@ -949,6 +1128,9 @@ mod tests {
             Some(AutoReviewMessages {
                 policy: Some("policy".to_string()),
                 policy_template: Some(String::new()),
+                node_repl_policy: Some(String::new()),
+                rejection_instructions: Some(String::new()),
+                timeout_instructions: Some(String::new()),
             })
         );
     }
@@ -977,6 +1159,29 @@ mod tests {
     }
 
     #[test]
+    fn multi_agent_messages_preserve_missing_and_empty_values() {
+        let messages: ModelMessages = from_str(
+            r#"{"instructions_template":null,"instructions_variables":null,"multi_agent":{"role":{"root":"","subagent":"subagent base"},"mode":{"explicit":"explicit mode","proactive":"","hint_text":""}}}"#,
+        )
+        .expect("multi-agent messages should deserialize");
+
+        assert_eq!(
+            messages.multi_agent,
+            Some(MultiAgentMessages {
+                role: Some(MultiAgentRoleMessages {
+                    root: Some(String::new()),
+                    subagent: Some("subagent base".to_string()),
+                }),
+                mode: Some(MultiAgentModeMessages {
+                    explicit: Some("explicit mode".to_string()),
+                    proactive: Some(String::new()),
+                    hint_text: Some(String::new()),
+                }),
+            })
+        );
+    }
+
+    #[test]
     fn collaboration_mode_messages_preserve_missing_and_empty_values() {
         let messages: ModelMessages = from_str(
             r#"{
@@ -992,6 +1197,8 @@ mod tests {
         assert_eq!(
             messages,
             ModelMessages {
+                persistent_instructions: None,
+                tools: None,
                 instructions_template: None,
                 instructions_variables: None,
                 approvals: None,
@@ -1001,7 +1208,10 @@ mod tests {
                 }),
                 auto_review: None,
                 permissions: None,
+                multi_agent: None,
                 token_budget: None,
+                confirmation_policies: None,
+                guardian_v2: None,
             }
         );
     }
@@ -1014,28 +1224,34 @@ mod tests {
         let serialized = to_string(&custom).expect("custom reasoning effort should serialize");
         let serialized_max = to_string(&ReasoningEffort::Max).expect("Max should serialize");
         let serialized_ultra = to_string(&ReasoningEffort::Ultra).expect("Ultra should serialize");
+        let serialized_persistent =
+            to_string(&ReasoningEffort::Persistent).expect("Persistent should serialize");
 
         assert_eq!(
             (
                 "high".parse(),
                 "max".parse(),
                 "ultra".parse(),
+                "persistent".parse(),
                 "future".parse(),
                 deserialized,
                 serialized,
                 serialized_max,
                 serialized_ultra,
+                serialized_persistent,
                 custom.to_string(),
             ),
             (
                 Ok(ReasoningEffort::High),
                 Ok(ReasoningEffort::Max),
                 Ok(ReasoningEffort::Ultra),
+                Ok(ReasoningEffort::Persistent),
                 Ok(custom.clone()),
                 custom,
                 r#""future""#.to_string(),
                 r#""max""#.to_string(),
                 r#""ultra""#.to_string(),
+                r#""persistent""#.to_string(),
                 "future".to_string(),
             )
         );
@@ -1073,80 +1289,42 @@ mod tests {
     }
 
     #[test]
-    fn get_model_instructions_uses_template_when_placeholder_present() {
+    fn get_model_instructions_ignores_legacy_personality_variables() {
         let model = test_model(Some(ModelMessages {
+            persistent_instructions: None,
+            tools: None,
             instructions_template: Some("Hello {{ personality }}".to_string()),
-            instructions_variables: Some(personality_variables()),
-            approvals: None,
-            collaboration_modes: None,
-            auto_review: None,
-            permissions: None,
-            token_budget: None,
-        }));
-
-        let instructions = model.get_model_instructions(Some(Personality::Friendly));
-
-        assert_eq!(instructions, "Hello friendly");
-    }
-
-    #[test]
-    fn get_model_instructions_strips_placeholder_with_incomplete_variables() {
-        let model = test_model(Some(ModelMessages {
-            instructions_template: Some("Hello\n{{ personality }}".to_string()),
             instructions_variables: Some(ModelInstructionsVariables {
-                personality_default: None,
+                personality_default: Some("default".to_string()),
                 personality_friendly: Some("friendly".to_string()),
-                personality_pragmatic: None,
+                personality_pragmatic: Some("pragmatic".to_string()),
             }),
             approvals: None,
             collaboration_modes: None,
             auto_review: None,
             permissions: None,
+            multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
+            guardian_v2: None,
         }));
-        assert_eq!(
-            model.get_model_instructions(Some(Personality::Pragmatic)),
-            "Hello\n"
-        );
-        assert_eq!(
-            model.get_model_instructions(/*personality*/ None),
-            "Hello\n"
-        );
 
-        let model_no_personality = test_model(Some(ModelMessages {
-            instructions_template: Some("Hello\n{{ personality }}".to_string()),
-            instructions_variables: Some(ModelInstructionsVariables {
-                personality_default: None,
-                personality_friendly: None,
-                personality_pragmatic: None,
-            }),
-            approvals: None,
-            collaboration_modes: None,
-            auto_review: None,
-            permissions: None,
-            token_budget: None,
-        }));
-        assert_eq!(
-            model_no_personality.get_model_instructions(Some(Personality::Friendly)),
-            "Hello\n"
-        );
-        assert_eq!(
-            model_no_personality.get_model_instructions(Some(Personality::Pragmatic)),
-            "Hello\n"
-        );
-        assert_eq!(
-            model_no_personality.get_model_instructions(Some(Personality::None)),
-            "Hello\n"
-        );
-        assert_eq!(
-            model_no_personality.get_model_instructions(/*personality*/ None),
-            "Hello\n"
-        );
+        let instructions = "Hello {{ personality }}";
+        for personality in [
+            Some(Personality::Friendly),
+            Some(Personality::Pragmatic),
+            Some(Personality::None),
+            None,
+        ] {
+            assert_eq!(model.get_model_instructions(personality), instructions);
+        }
     }
 
     #[test]
     fn get_model_instructions_is_empty_when_template_is_missing() {
         let model = test_model(Some(ModelMessages {
+            persistent_instructions: None,
+            tools: None,
             instructions_template: None,
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: None,
@@ -1157,7 +1335,10 @@ mod tests {
             collaboration_modes: None,
             auto_review: None,
             permissions: None,
+            multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
+            guardian_v2: None,
         }));
 
         let instructions = model.get_model_instructions(Some(Personality::Friendly));
@@ -1190,13 +1371,18 @@ mod tests {
         assert_eq!(
             model.model_messages,
             Some(ModelMessages {
+                persistent_instructions: None,
+                tools: None,
                 instructions_template: Some("legacy instructions".to_string()),
                 instructions_variables: None,
                 approvals: None,
                 collaboration_modes: None,
                 auto_review: None,
                 permissions: None,
+                multi_agent: None,
                 token_budget: None,
+                confirmation_policies: None,
+                guardian_v2: None,
             })
         );
         assert_eq!(
@@ -1233,9 +1419,11 @@ mod tests {
     }
 
     #[test]
-    fn models_response_serializes_rendered_legacy_base_instructions() {
+    fn models_response_serializes_literal_legacy_base_instructions() {
         let response = ModelsResponse {
             models: vec![test_model(Some(ModelMessages {
+                persistent_instructions: None,
+                tools: None,
                 instructions_template: Some("before {{ personality }} after".to_string()),
                 instructions_variables: Some(ModelInstructionsVariables {
                     personality_default: Some("default".to_string()),
@@ -1246,7 +1434,10 @@ mod tests {
                 collaboration_modes: None,
                 auto_review: None,
                 permissions: None,
+                multi_agent: None,
                 token_budget: None,
+                confirmation_policies: None,
+                guardian_v2: None,
             }))],
         };
 
@@ -1254,13 +1445,19 @@ mod tests {
 
         assert_eq!(
             serialized["models"][0]["base_instructions"],
-            "before default after"
+            "before {{ personality }} after"
         );
     }
 
     #[test]
     fn models_response_prefers_template_and_preserves_message_siblings() {
         let messages = ModelMessages {
+            persistent_instructions: Some("Persistent catalog instructions".to_string()),
+            tools: Some(ToolMessages {
+                send_user_message_async: Some(ToolMessage {
+                    description: Some("Catalog description".to_string()),
+                }),
+            }),
             instructions_template: None,
             instructions_variables: None,
             approvals: Some(ApprovalMessages {
@@ -1276,18 +1473,48 @@ mod tests {
             auto_review: Some(AutoReviewMessages {
                 policy: Some("policy".to_string()),
                 policy_template: None,
+                node_repl_policy: None,
+                rejection_instructions: Some("rejection instructions".to_string()),
+                timeout_instructions: Some("timeout instructions".to_string()),
             }),
             permissions: Some(PermissionMessages {
                 danger_full_access: None,
                 workspace_write: Some("workspace".to_string()),
                 read_only: None,
             }),
+            multi_agent: None,
             token_budget: None,
+            confirmation_policies: Some(ConfirmationPolicies {
+                browser_use: Some(
+                    "# Browser confirmations\n\nKeep {{literal_markdown}}.\n".to_string(),
+                ),
+                computer_use: Some(
+                    "  # Native confirmations\r\n\nKeep ${native_markdown}.\n".to_string(),
+                ),
+            }),
+            guardian_v2: Some(GuardianV2ModelConfig {
+                classifier_instructions: Some("Guardian classification".to_string()),
+                review_threshold_basis_points: Some(7_500),
+                reasoning_effort: Some(ReasoningEffort::Minimal),
+                transcript: Some(GuardianV2TranscriptModelConfig {
+                    sources: Some(vec!["reasoning".to_string()]),
+                    max_tool_entry_tokens: Some(500),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
         };
         let mut value = serde_json::to_value(ModelsResponse {
             models: vec![test_model(Some(messages.clone()))],
         })
         .expect("serialize models response");
+        assert_eq!(
+            value["models"][0]["model_messages"]["confirmation_policies"],
+            serde_json::json!({
+                "browser_use": "# Browser confirmations\n\nKeep {{literal_markdown}}.\n",
+                "computer_use": "  # Native confirmations\r\n\nKeep ${native_markdown}.\n",
+            })
+        );
         value["models"][0]["base_instructions"] = serde_json::json!("legacy instructions");
 
         let response: ModelsResponse =
@@ -1297,13 +1524,22 @@ mod tests {
         assert_eq!(response.models[0].model_messages, Some(expected_messages));
 
         let canonical_messages = ModelMessages {
+            persistent_instructions: Some(String::new()),
+            tools: Some(ToolMessages {
+                send_user_message_async: Some(ToolMessage {
+                    description: Some(String::new()),
+                }),
+            }),
             instructions_template: Some("canonical instructions".to_string()),
             instructions_variables: None,
             approvals: None,
             collaboration_modes: None,
             auto_review: None,
             permissions: None,
+            multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
+            guardian_v2: None,
         };
         let mut value = serde_json::to_value(ModelsResponse {
             models: vec![test_model(Some(canonical_messages.clone()))],
@@ -1317,87 +1553,13 @@ mod tests {
     }
 
     #[test]
-    fn get_personality_message_returns_default_when_personality_is_none() {
-        let personality_template = personality_variables();
-        assert_eq!(
-            personality_template.get_personality_message(/*personality*/ None),
-            Some("default".to_string())
-        );
-    }
-
-    #[test]
-    fn get_personality_message() {
-        let personality_variables = personality_variables();
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::Friendly)),
-            Some("friendly".to_string())
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::Pragmatic)),
-            Some("pragmatic".to_string())
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::None)),
-            Some(String::new())
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(/*personality*/ None),
-            Some("default".to_string())
-        );
-
-        let personality_variables = ModelInstructionsVariables {
-            personality_default: Some("default".to_string()),
-            personality_friendly: None,
-            personality_pragmatic: None,
-        };
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::Friendly)),
-            None
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::Pragmatic)),
-            None
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::None)),
-            Some(String::new())
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(/*personality*/ None),
-            Some("default".to_string())
-        );
-
-        let personality_variables = ModelInstructionsVariables {
-            personality_default: None,
-            personality_friendly: Some("friendly".to_string()),
-            personality_pragmatic: Some("pragmatic".to_string()),
-        };
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::Friendly)),
-            Some("friendly".to_string())
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::Pragmatic)),
-            Some("pragmatic".to_string())
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::None)),
-            Some(String::new())
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(/*personality*/ None),
-            None
-        );
-    }
-
-    #[test]
     fn model_info_defaults_availability_nux_to_none_when_omitted() {
         let model: ModelInfo = serde_json::from_value(serde_json::json!({
             "slug": "test-model",
             "display_name": "Test Model",
             "description": null,
             "supported_reasoning_levels": [],
-            "shell_type": "shell_command",
+            "shell_type": "unified_exec",
             "visibility": "list",
             "supported_in_api": true,
             "priority": 1,
@@ -1411,7 +1573,6 @@ mod tests {
                 "mode": "bytes",
                 "limit": 10000
             },
-            "supports_parallel_tool_calls": false,
             "supports_image_detail_original": false,
             "context_window": null,
             "auto_compact_token_limit": null,
@@ -1432,10 +1593,131 @@ mod tests {
         assert!(!model.supports_image_detail_original);
         assert_eq!(model.web_search_tool_type, WebSearchToolType::Text);
         assert!(!model.supports_search_tool);
+        assert!(!model.supports_experimental_context);
         assert!(!model.use_responses_lite);
+        assert!(!model.node_repl_auto_review_required);
+        assert!(!model.node_repl_disabled);
         assert_eq!(model.comp_hash, None);
         assert_eq!(model.auto_review_model_override, None);
         assert_eq!(model.tool_mode, None);
+        assert_eq!(model.multi_agent_reasoning_effort, None);
+    }
+
+    #[test]
+    fn model_info_deserializes_multi_agent_reasoning_effort() {
+        let mut value =
+            serde_json::to_value(test_model(/*spec*/ None)).expect("serialize test model");
+        value
+            .as_object_mut()
+            .expect("model info should be an object")
+            .insert(
+                "multi_agent_reasoning_effort".to_string(),
+                serde_json::Value::String("high".to_string()),
+            );
+
+        let model = serde_json::from_value::<ModelInfo>(value)
+            .expect("deserialize multi-agent reasoning effort");
+
+        assert_eq!(
+            model.multi_agent_reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn model_info_deserializes_optional_upgrade_retirement_at() {
+        let base = serde_json::to_value(test_model(/*spec*/ None))
+            .expect("serialize test model without retirement time");
+
+        let mut absent = base.clone();
+        absent
+            .as_object_mut()
+            .expect("model info should be an object")
+            .insert(
+                "upgrade".to_string(),
+                serde_json::json!({
+                    "model": "replacement-model",
+                    "migration_markdown": "Use the replacement model."
+                }),
+            );
+        let absent = serde_json::from_value::<ModelInfo>(absent)
+            .expect("deserialize model info without upgrade retirement time");
+        assert_eq!(
+            absent
+                .upgrade
+                .as_ref()
+                .and_then(|upgrade| upgrade.retirement_at.as_ref())
+                .map(DateTime::timestamp),
+            None
+        );
+
+        let mut null = base.clone();
+        null.as_object_mut()
+            .expect("model info should be an object")
+            .insert(
+                "upgrade".to_string(),
+                serde_json::json!({
+                    "model": "replacement-model",
+                    "migration_markdown": "Use the replacement model.",
+                    "retirement_at": null
+                }),
+            );
+        let null = serde_json::from_value::<ModelInfo>(null)
+            .expect("deserialize model info with null upgrade retirement time");
+        assert_eq!(
+            null.upgrade
+                .as_ref()
+                .and_then(|upgrade| upgrade.retirement_at.as_ref())
+                .map(DateTime::timestamp),
+            None
+        );
+
+        let mut populated = base;
+        populated
+            .as_object_mut()
+            .expect("model info should be an object")
+            .insert(
+                "upgrade".to_string(),
+                serde_json::json!({
+                    "model": "replacement-model",
+                    "migration_markdown": "Use the replacement model.",
+                    "retirement_at": "2030-01-01T00:00:00Z"
+                }),
+            );
+        let populated = serde_json::from_value::<ModelInfo>(populated)
+            .expect("deserialize model info with upgrade retirement time");
+        assert_eq!(
+            populated
+                .upgrade
+                .as_ref()
+                .and_then(|upgrade| upgrade.retirement_at.as_ref())
+                .map(DateTime::timestamp),
+            Some(1_893_456_000)
+        );
+
+        let mut malformed = serde_json::to_value(test_model(/*spec*/ None))
+            .expect("serialize test model for malformed retirement time");
+        malformed
+            .as_object_mut()
+            .expect("model info should be an object")
+            .insert(
+                "upgrade".to_string(),
+                serde_json::json!({
+                    "model": "replacement-model",
+                    "migration_markdown": "Use the replacement model.",
+                    "retirement_at": "not-a-timestamp"
+                }),
+            );
+        let malformed = serde_json::from_value::<ModelInfo>(malformed)
+            .expect("tolerate malformed upgrade retirement time");
+        assert_eq!(
+            malformed
+                .upgrade
+                .as_ref()
+                .and_then(|upgrade| upgrade.retirement_at.as_ref())
+                .map(DateTime::timestamp),
+            None
+        );
     }
 
     #[test]
@@ -1521,7 +1803,28 @@ mod tests {
         };
 
         assert_eq!(model.resolved_context_window(), Some(400_000));
+        assert_eq!(model.usable_context_window(), Some(380_000));
         assert_eq!(model.auto_compact_token_limit(), Some(360_000));
+    }
+
+    #[test]
+    fn model_context_window_limits_preserve_their_distinct_meanings() {
+        let model = ModelInfo {
+            context_window: Some(272_000),
+            max_context_window: Some(400_000),
+            auto_compact_token_limit: Some(250_000),
+            effective_context_window_percent: 95,
+            ..test_model(/*spec*/ None)
+        };
+
+        assert_eq!(
+            (
+                model.resolved_context_window(),
+                model.usable_context_window(),
+                model.auto_compact_token_limit(),
+            ),
+            (Some(272_000), Some(258_400), Some(244_800))
+        );
     }
 
     #[test]
@@ -1547,6 +1850,40 @@ mod tests {
             preset.default_service_tier,
             Some(ServiceTier::Fast.request_value().to_string())
         );
+    }
+
+    #[test]
+    fn model_access_programs_preserve_explicit_selection_availability() {
+        use crate::turn_input::CyberAccessProgram;
+
+        for (metadata, expected) in [
+            (None, None),
+            (Some(serde_json::Value::Null), None),
+            (
+                Some(serde_json::json!({ "cyber": [] })),
+                Some(ModelAccessPrograms { cyber: vec![] }),
+            ),
+            (
+                Some(serde_json::json!({
+                    "cyber": ["standard", "daybreak_blue", "future_program", "daybreak_red"]
+                })),
+                Some(ModelAccessPrograms {
+                    cyber: vec![
+                        CyberAccessProgram::Standard,
+                        CyberAccessProgram::DaybreakBlue,
+                        CyberAccessProgram::DaybreakRed,
+                    ],
+                }),
+            ),
+        ] {
+            let mut value = serde_json::to_value(test_model(/*spec*/ None)).unwrap();
+            if let Some(metadata) = metadata {
+                value["available_access_programs"] = metadata;
+            }
+            let model: ModelInfo = serde_json::from_value(value).unwrap();
+            assert_eq!(model.available_access_programs, expected);
+            assert_eq!(ModelPreset::from(model).available_access_programs, expected);
+        }
     }
 
     #[test]
@@ -1601,21 +1938,6 @@ mod tests {
             model.service_tier_for_request(Some("unsupported".to_string())),
             None
         );
-        assert_eq!(model.service_tier_for_request(/*service_tier*/ None), None);
-    }
-
-    #[test]
-    fn service_tier_for_request_does_not_apply_catalog_default() {
-        let model = ModelInfo {
-            default_service_tier: Some(ServiceTier::Fast.request_value().to_string()),
-            service_tiers: vec![ModelServiceTier {
-                id: ServiceTier::Fast.request_value().to_string(),
-                name: "Fast".to_string(),
-                description: "Priority processing.".to_string(),
-            }],
-            ..test_model(/*spec*/ None)
-        };
-
         assert_eq!(model.service_tier_for_request(/*service_tier*/ None), None);
     }
 }

@@ -23,7 +23,7 @@ impl Tui {
     pub(crate) fn screen_size_for_event(&mut self, event: &TuiEvent) -> io::Result<Size> {
         if matches!(event, TuiEvent::Resize(_)) {
             self.schedule_screen_size_recheck(TRANSCRIPT_REFLOW_DEBOUNCE);
-        } else if matches!(event, TuiEvent::Draw)
+        } else if matches!(event, TuiEvent::Draw | TuiEvent::FocusGained)
             && let Some(deadline) = self.screen_size.pending_recheck_at
         {
             let now = Instant::now();
@@ -36,6 +36,9 @@ impl Tui {
 
         // tmux/SSH attach can change geometry without a resize event reaching us.
         // Bound cached geometry even if the app goes idle after an early draw.
+        if matches!(event, TuiEvent::FocusGained) {
+            return self.screen_size_for_event(&TuiEvent::Resume);
+        }
         if matches!(event, TuiEvent::Draw) && self.screen_size.pending_recheck_at.is_none() {
             let remaining = self
                 .screen_size
@@ -60,11 +63,21 @@ impl Tui {
                 self.screen_size.last_backend_check = Some(Instant::now());
                 size
             }
-            TuiEvent::Draw => self.screen_size.deferred_size.take().unwrap_or(cached),
-            TuiEvent::Key(_) | TuiEvent::Paste(_) => cached,
+            TuiEvent::Draw | TuiEvent::FocusGained => {
+                self.screen_size.deferred_size.take().unwrap_or(cached)
+            }
+            TuiEvent::Key(_) | TuiEvent::Paste(_) | TuiEvent::FocusLost => cached,
         };
-        self.screen_size.pending_draw_size =
-            (!matches!(event, TuiEvent::Key(_) | TuiEvent::Paste(_))).then_some(size);
+        if matches!(event, TuiEvent::Resize(_) | TuiEvent::Resume)
+            && let Some(monitor) = &self.event_broker.size_monitor
+        {
+            monitor.observe(size);
+        }
+        self.screen_size.pending_draw_size = (!matches!(
+            event,
+            TuiEvent::Key(_) | TuiEvent::Paste(_) | TuiEvent::FocusLost
+        ))
+        .then_some(size);
         Ok(size)
     }
 
@@ -83,6 +96,9 @@ impl Tui {
             return Ok(size);
         }
         let size = self.terminal.size()?;
+        if let Some(monitor) = &self.event_broker.size_monitor {
+            monitor.observe(size);
+        }
         self.screen_size.last_backend_check = Some(Instant::now());
         self.screen_size.pending_recheck_at = None;
         self.screen_size.deferred_size = None;

@@ -378,6 +378,19 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
     }
 }
 
+/// Keep the session-log format even though ticks no longer use the app-event queue.
+pub(crate) fn log_commit_tick() {
+    if !matches!(LOGGER.mode(), Some(LogMode::Legacy)) {
+        return;
+    }
+    LOGGER.write_json_line(&json!({
+        "ts": now_ts(),
+        "dir": "to_tui",
+        "kind": "app_event",
+        "variant": "CommitTick",
+    }));
+}
+
 pub(crate) fn log_server_notification(notification: &ServerNotification) {
     if !LOGGER.is_enabled() {
         return;
