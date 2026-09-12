@@ -6,10 +6,11 @@ use ratatui::layout::Size;
 use crate::tui::TuiEvent;
 
 #[tokio::test]
-async fn draw_size_policy_refreshes_only_after_resume() {
+async fn draw_size_policy_reuses_recent_geometry_between_checks() {
     let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
     let cached = Size::new(/*width*/ 120, /*height*/ 40);
     let resumed = tui.terminal.size().expect("backend size");
+    tui.screen_size.last_backend_check = Some(std::time::Instant::now());
     tui.terminal.last_known_screen_size = cached;
     let resized = Size::new(/*width*/ 100, /*height*/ 30);
     for (event, expected) in [
@@ -62,4 +63,29 @@ async fn entering_alternate_screen_updates_cached_screen_size() {
 
     assert_eq!(tui.terminal.last_known_screen_size, screen_size);
     tui.leave_alt_screen().expect("leave alternate screen");
+}
+
+#[tokio::test]
+async fn redraw_recovers_from_a_missed_resize_notification() {
+    let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
+    let actual = tui.terminal.size().expect("backend size");
+    let stale = Size::new(/*width*/ 153, /*height*/ 51);
+    tui.terminal.last_known_screen_size = stale;
+    tui.screen_size.last_backend_check = Some(std::time::Instant::now() - Duration::from_secs(2));
+
+    assert_eq!(
+        tui.screen_size_for_event(&TuiEvent::Draw).expect("size"),
+        actual
+    );
+    assert_eq!(tui.take_event_screen_size().expect("draw size"), actual);
+    assert!(tui.screen_size.last_backend_check.is_some());
+
+    // Once the draw has applied the sampled size, the next frame can reuse it.
+    tui.terminal.resize(actual).expect("apply size");
+    let checked_at = tui.screen_size.last_backend_check;
+    assert_eq!(
+        tui.screen_size_for_event(&TuiEvent::Draw).expect("size"),
+        actual
+    );
+    assert_eq!(tui.screen_size.last_backend_check, checked_at);
 }
