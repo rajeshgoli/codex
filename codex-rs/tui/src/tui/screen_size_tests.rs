@@ -106,3 +106,35 @@ async fn focus_gain_refreshes_geometry_even_after_a_recent_check() {
     assert_eq!(tui.take_event_screen_size().expect("draw size"), actual);
     assert!(tui.screen_size.deferred_size.is_none());
 }
+
+#[tokio::test]
+async fn recent_cached_draw_schedules_idle_geometry_recovery() {
+    let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
+    let (requester, mut requests) = crate::tui::FrameRequester::test_channel();
+    tui.frame_requester = requester;
+    let actual = tui.terminal.size().expect("backend size");
+    let stale = Size::new(/*width*/ 153, /*height*/ 51);
+    tui.terminal.last_known_screen_size = stale;
+    let checked = std::time::Instant::now();
+    tui.screen_size.last_backend_check = Some(checked);
+
+    assert_eq!(
+        tui.screen_size_for_event(&TuiEvent::Draw)
+            .expect("early draw"),
+        stale
+    );
+    let deadline = requests
+        .try_recv()
+        .expect("cached draw must schedule a refresh");
+    assert!(deadline >= checked + Duration::from_secs(1));
+    assert!(deadline <= std::time::Instant::now() + Duration::from_secs(1));
+
+    // Simulate the scheduled draw after expiry, with no intervening input or resize.
+    tui.screen_size.last_backend_check = Some(checked - Duration::from_secs(2));
+    assert_eq!(
+        tui.screen_size_for_event(&TuiEvent::Draw)
+            .expect("scheduled draw"),
+        actual
+    );
+    assert_eq!(tui.take_event_screen_size().expect("draw size"), actual);
+}

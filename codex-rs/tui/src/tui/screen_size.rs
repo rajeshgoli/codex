@@ -35,16 +35,19 @@ impl Tui {
         }
 
         // tmux/SSH attach can change geometry without a resize event reaching us.
-        // Bound the lifetime of cached geometry, even when that event was lost.
-        if matches!(event, TuiEvent::FocusGained)
-            || (matches!(event, TuiEvent::Draw)
-                && self.screen_size.pending_recheck_at.is_none()
-                && self
-                    .screen_size
-                    .last_backend_check
-                    .is_none_or(|checked| checked.elapsed() >= Duration::from_secs(1)))
-        {
+        // Bound cached geometry even if the app goes idle after an early draw.
+        if matches!(event, TuiEvent::FocusGained) {
             return self.screen_size_for_event(&TuiEvent::Resume);
+        }
+        if matches!(event, TuiEvent::Draw) && self.screen_size.pending_recheck_at.is_none() {
+            let remaining = self
+                .screen_size
+                .last_backend_check
+                .and_then(|checked| Duration::from_secs(1).checked_sub(checked.elapsed()));
+            match remaining {
+                Some(delay) if !delay.is_zero() => self.frame_requester.schedule_frame_in(delay),
+                _ => return self.screen_size_for_event(&TuiEvent::Resume),
+            }
         }
 
         let cached = self.terminal.last_known_screen_size;
