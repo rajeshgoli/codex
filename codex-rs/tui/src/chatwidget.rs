@@ -1865,7 +1865,7 @@ impl ChatWidget {
         }
         match &self.codex_op_target {
             CodexOpTarget::Direct(codex_op_tx) => {
-                crate::session_log::log_outbound_op(&op);
+                crate::session_log::log_outbound_op(&op, /*thread_id_override*/ None);
                 let is_review = op.is_review();
                 if let Err(e) = codex_op_tx.send(op) {
                     tracing::error!("failed to submit op: {e}");

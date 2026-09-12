@@ -35,7 +35,7 @@ impl App {
 
         let fork_config = self.side_fork_config();
         let started = match app_server
-            .fork_thread(&self.local_settings, fork_config.clone(), parent_thread_id)
+            .fork_side_thread(&self.local_settings, fork_config.clone(), parent_thread_id)
             .await
         {
             Ok(started) => started,
