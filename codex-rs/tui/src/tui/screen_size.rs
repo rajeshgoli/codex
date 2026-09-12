@@ -15,10 +15,11 @@ pub(super) struct ScreenSizePolicy {
     pending_recheck_at: Option<Instant>,
     pending_draw_size: Option<Size>,
     deferred_size: Option<Size>,
+    last_backend_check: Option<Instant>,
 }
 
 impl Tui {
-    /// Resolve event geometry while avoiding backend queries on ordinary repaint frames.
+    /// Reuse recent geometry while recovering from missed resize notifications.
     pub(crate) fn screen_size_for_event(&mut self, event: &TuiEvent) -> io::Result<Size> {
         if matches!(event, TuiEvent::Resize(_)) {
             self.schedule_screen_size_recheck(TRANSCRIPT_REFLOW_DEBOUNCE);
@@ -33,6 +34,19 @@ impl Tui {
             }
         }
 
+        // tmux/SSH attach can change geometry without a resize event reaching us.
+        // Bound cached geometry even if the app goes idle after an early draw.
+        if matches!(event, TuiEvent::Draw) && self.screen_size.pending_recheck_at.is_none() {
+            let remaining = self
+                .screen_size
+                .last_backend_check
+                .and_then(|checked| Duration::from_secs(1).checked_sub(checked.elapsed()));
+            match remaining {
+                Some(delay) if !delay.is_zero() => self.frame_requester.schedule_frame_in(delay),
+                _ => return self.screen_size_for_event(&TuiEvent::Resume),
+            }
+        }
+
         let cached = self.terminal.last_known_screen_size;
         let size = match event {
             TuiEvent::Resize(size) => {
@@ -42,7 +56,9 @@ impl Tui {
             TuiEvent::Resume => {
                 self.screen_size.pending_recheck_at = None;
                 self.screen_size.deferred_size = None;
-                self.terminal.size()?
+                let size = self.terminal.size()?;
+                self.screen_size.last_backend_check = Some(Instant::now());
+                size
             }
             TuiEvent::Draw => self.screen_size.deferred_size.take().unwrap_or(cached),
             TuiEvent::Key(_) | TuiEvent::Paste(_) => cached,
@@ -67,6 +83,7 @@ impl Tui {
             return Ok(size);
         }
         let size = self.terminal.size()?;
+        self.screen_size.last_backend_check = Some(Instant::now());
         self.screen_size.pending_recheck_at = None;
         self.screen_size.deferred_size = None;
         Ok(size)
