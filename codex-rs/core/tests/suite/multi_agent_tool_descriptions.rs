@@ -71,6 +71,13 @@ fn all_tool_messages(message: Value) -> Value {
     })
 }
 
+#[test_case(all_tool_messages(json!({"description": "x".repeat(1_001)})), Exposure::Namespaced, None; "oversized_descriptions_fall_back")]
+#[test_case(all_tool_messages(json!({"description": "界".repeat(334)})), Exposure::Plain, None; "oversized_multibyte_descriptions_fall_back")]
+#[test_case(all_tool_messages(json!({"description": "x".repeat(1_001)})), Exposure::CodeMode, None; "oversized_code_mode_descriptions_fall_back")]
+#[test_case(all_tool_messages(json!({"parameters": format!("{CATALOG_PARAMETERS}{}", " ".repeat(1_001))})), Exposure::Namespaced, None; "oversized_parameters_fall_back")]
+#[test_case(all_tool_messages(json!({"description": "x".repeat(1_000), "parameters": format!("{CATALOG_PARAMETERS:<1000}")})), Exposure::Namespaced, Some(EXPECTED_CATALOG_PARAMETERS); "bounded_descriptions_and_parameters")]
+#[test_case(all_tool_messages(json!({"description": "x".repeat(1_000), "parameters": format!("{CATALOG_PARAMETERS:<1000}")})), Exposure::Plain, Some(EXPECTED_CATALOG_PARAMETERS); "bounded_plain_descriptions_and_parameters")]
+#[test_case(all_tool_messages(json!({"description": "x".repeat(1_000), "parameters": format!("{CATALOG_PARAMETERS:<1000}")})), Exposure::CodeMode, Some(EXPECTED_CATALOG_PARAMETERS); "bounded_code_mode_descriptions_and_parameters")]
 #[test_case(json!(null), Exposure::Namespaced, None; "missing_tools")]
 #[test_case(json!({}), Exposure::Namespaced, None; "missing_multi_agent")]
 #[test_case(json!({"multi_agent": null}), Exposure::Namespaced, None; "null_multi_agent")]
@@ -209,7 +216,14 @@ async fn multi_agent_catalog_messages_change_only_selected_tool_fields(
                 .iter()
                 .find(|tool| tool["name"] == name)
                 .expect(name);
-            if let Some(description) = tool_messages["multi_agent"][name]["description"].as_str() {
+            assert!(
+                serde_json::to_vec(actual_tool)?.len() <= 10_000,
+                "assembled tool {name} exceeds the conservative byte budget"
+            );
+            if let Some(description) = tool_messages["multi_agent"][name]["description"]
+                .as_str()
+                .filter(|description| description.len() <= 1_000)
+            {
                 let bundled = expected_tool["description"]
                     .as_str()
                     .expect("bundled description");

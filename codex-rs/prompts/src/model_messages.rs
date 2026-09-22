@@ -11,9 +11,9 @@ use codex_protocol::openai_models::ToolMessage;
 use permissions::ResolvedApprovalMessages;
 use permissions::ResolvedPermissionMessages;
 
-// UTF-8 bytes conservatively bound byte-level tokenizer tokens, including non-ASCII text.
-// Oversized catalog descriptions fall back intact to the bundled tool description.
-const MAX_TOOL_DESCRIPTION_BYTES: usize = 10_000;
+// Reserve the rest of the tool budget for its name, schema, and runtime guidance.
+// UTF-8 bytes conservatively bound byte-level tokens, including non-ASCII text.
+const MAX_CATALOG_TOOL_MESSAGE_BYTES: usize = 1_000;
 
 mod collaboration;
 mod guardian;
@@ -163,12 +163,15 @@ impl<'a> ResolvedModelMessages<'a> {
         self.multi_agent_tool(tool_name)?
             .description
             .as_deref()
-            .filter(|description| description.len() <= MAX_TOOL_DESCRIPTION_BYTES)
+            .filter(|description| description.len() <= MAX_CATALOG_TOOL_MESSAGE_BYTES)
     }
 
-    /// Selects a V2 tool's complete parameter schema; parsing belongs to the tool consumer.
+    /// Selects a bounded V2 parameter schema; parsing belongs to the tool consumer.
     pub fn multi_agent_tool_parameters_override(&self, tool_name: &str) -> Option<&'a str> {
-        self.multi_agent_tool(tool_name)?.parameters.as_deref()
+        self.multi_agent_tool(tool_name)?
+            .parameters
+            .as_deref()
+            .filter(|parameters| parameters.len() <= MAX_CATALOG_TOOL_MESSAGE_BYTES)
     }
 
     fn multi_agent_tool(self, tool_name: &str) -> Option<&'a ToolMessage> {

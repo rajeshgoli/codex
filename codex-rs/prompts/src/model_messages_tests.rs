@@ -4,16 +4,16 @@ use codex_protocol::openai_models::ToolMessages;
 use pretty_assertions::assert_eq;
 
 #[test]
-fn catalog_tool_descriptions_fall_back_when_the_byte_limit_is_exceeded() {
+fn catalog_tool_messages_fall_back_when_the_byte_limit_is_exceeded() {
     for (description, accepted) in [
         (String::new(), true),
-        ("a".repeat(MAX_TOOL_DESCRIPTION_BYTES), true),
-        ("a".repeat(MAX_TOOL_DESCRIPTION_BYTES + 1), false),
-        ("界".repeat(MAX_TOOL_DESCRIPTION_BYTES / 3 + 1), false),
+        ("a".repeat(MAX_CATALOG_TOOL_MESSAGE_BYTES), true),
+        ("a".repeat(MAX_CATALOG_TOOL_MESSAGE_BYTES + 1), false),
+        ("界".repeat(MAX_CATALOG_TOOL_MESSAGE_BYTES / 3 + 1), false),
     ] {
         let tool = Some(ToolMessage {
             description: Some(description.clone()),
-            ..Default::default()
+            parameters: Some(description.clone()),
         });
         let catalog = ModelMessages {
             tools: Some(ToolMessages {
@@ -40,7 +40,13 @@ fn catalog_tool_descriptions_fall_back_when_the_byte_limit_is_exceeded() {
             "interrupt_agent",
             "list_agents",
         ]
-        .map(|name| resolved.multi_agent_tool_description_override(name));
-        assert_eq!(actual, [accepted.then_some(description.as_str()); 6]);
+        .map(|name| {
+            (
+                resolved.multi_agent_tool_description_override(name),
+                resolved.multi_agent_tool_parameters_override(name),
+            )
+        });
+        let expected = accepted.then_some(description.as_str());
+        assert_eq!(actual, [(expected, expected); 6]);
     }
 }
