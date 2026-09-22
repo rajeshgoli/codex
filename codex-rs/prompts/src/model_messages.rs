@@ -154,6 +154,7 @@ impl<'a> ResolvedModelMessages<'a> {
             .and_then(|messages| messages.tools.as_ref())
             .and_then(|tools| tools.send_user_message_async.as_ref())
             .and_then(|tool| tool.description.as_deref())
+            .filter(|description| description.len() <= MAX_CATALOG_TOOL_MESSAGE_BYTES)
             .unwrap_or(REQUEST_USER_INPUT_ASYNC_DESCRIPTION)
     }
 

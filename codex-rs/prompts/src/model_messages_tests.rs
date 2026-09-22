@@ -17,6 +17,7 @@ fn catalog_tool_messages_fall_back_when_the_byte_limit_is_exceeded() {
         });
         let catalog = ModelMessages {
             tools: Some(ToolMessages {
+                send_user_message_async: tool.clone(),
                 multi_agent: Some(MultiAgentToolMessages {
                     spawn_agent: tool.clone(),
                     send_message: tool.clone(),
@@ -48,6 +49,10 @@ fn catalog_tool_messages_fall_back_when_the_byte_limit_is_exceeded() {
         });
         let expected = accepted.then_some(description.as_str());
         assert_eq!(actual, [(expected, expected); 6]);
+        assert_eq!(
+            resolved.request_user_input_async_description(),
+            expected.unwrap_or(REQUEST_USER_INPUT_ASYNC_DESCRIPTION)
+        );
     }
 }
 

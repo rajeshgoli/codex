@@ -3,7 +3,6 @@
 
 use crate::ContextualUserFragment;
 use codex_protocol::models::ContentItemKind;
-use codex_utils_string::approx_bytes_for_tokens;
 
 const PROMPT_PREFIX: &str = r#"Write a brief catch-up for a user returning to this task. Return JSON with summary and nullable next_action.
 
@@ -24,11 +23,9 @@ pub struct RecapPrompt<'a> {
 }
 
 impl<'a> RecapPrompt<'a> {
-    /// Complete prompt budget using the shared four-bytes-per-token estimate.
-    pub const MAX_ESTIMATED_TOKENS: usize = 8_192;
     /// Total UTF-8 bytes, including instructions and conversation labels.
-    /// This is a byte ceiling, not an exact model-token count.
-    pub const MAX_BYTES: usize = approx_bytes_for_tokens(Self::MAX_ESTIMATED_TOKENS);
+    /// Bytes conservatively bound byte-level tokens even for tokenizer-unfriendly text.
+    pub const MAX_BYTES: usize = 8_192;
     /// Space available after the fixed instructions; callers must count their labels.
     pub const HISTORY_MAX_BYTES: usize = Self::MAX_BYTES - PROMPT_PREFIX.len();
 

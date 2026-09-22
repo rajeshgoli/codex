@@ -348,6 +348,9 @@ async fn freeform_async_message_emits_an_item_without_ending_the_turn(
 #[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage::default()), ..Default::default() }), "send_user_message_async"; "missing_description")]
 #[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { description: Some("Catalog async message description.".to_string()), ..Default::default() }), ..Default::default() }), "send_user_message_async"; "catalog_description")]
 #[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { description: Some(String::new()), ..Default::default() }), ..Default::default() }), "send_user_message_async"; "empty_description")]
+#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { description: Some("x".repeat(1_000)), ..Default::default() }), ..Default::default() }), "request_user_input_async"; "bounded_description")]
+#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { description: Some("x".repeat(1_001)), ..Default::default() }), ..Default::default() }), "request_user_input_async"; "oversized_description")]
+#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { description: Some("界".repeat(334)), ..Default::default() }), ..Default::default() }), "request_user_input_async"; "oversized_multibyte_description")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_user_input_async_emits_item_and_does_not_end_the_turn(
     tool_messages: Option<ToolMessages>,
@@ -400,6 +403,7 @@ async fn request_user_input_async_emits_item_and_does_not_end_the_turn(
         .as_ref()
         .and_then(|tools| tools.send_user_message_async.as_ref())
         .and_then(|tool| tool.description.as_deref())
+        .filter(|description| description.len() <= 1_000)
         .unwrap_or(
             "Ask the user one or more questions during ongoing work. Use this tool only to request missing information, preferences, constraints, clarification, or approval. The tool returns immediately without ending the turn or waiting for a reply; any reply arrives asynchronously as a new user message. Keep questions concise, self-contained, and easy to understand, using a level of detail appropriate to the user and task. The UI always allows a free-text answer, including when suggested options are provided. A preselected option is not submitted automatically.",
         )
@@ -489,6 +493,7 @@ async fn request_user_input_async_emits_item_and_does_not_end_the_turn(
             .find(|tool| tool["type"] == "function" && tool["name"] == "request_user_input_async")
             .expect("the async message tool should be directly visible to the model");
         assert_eq!(tool["description"], expected_description);
+        assert!(serde_json::to_vec(tool)?.len() <= 10_000);
         assert_eq!(tool["strict"], false);
         assert_eq!(tool["parameters"]["required"], json!(["questions"]));
         assert_eq!(tool["parameters"]["additionalProperties"], false);
