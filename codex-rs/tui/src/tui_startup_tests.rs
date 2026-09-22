@@ -9,10 +9,32 @@ use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 
+use clap::Parser as _;
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
+use pretty_assertions::assert_eq;
 
 const STARTUP_INPUT_CHILD_TEST: &str = "tui::startup_tests::startup_typeahead_pty_child";
+
+#[test]
+fn control_socket_defers_only_the_noninteractive_startup_composer() {
+    let managed =
+        crate::cli::Cli::try_parse_from(["codex", "--control-socket", "/tmp/codex-control.sock"])
+            .expect("parse managed TUI CLI");
+    let interactive =
+        crate::cli::Cli::try_parse_from(["codex"]).expect("parse interactive TUI CLI");
+    let mut picker = managed.clone();
+    picker.resume_picker = true;
+
+    assert_eq!(
+        [
+            crate::startup_orchestration::defer_startup_composer_for_control_socket(&managed),
+            crate::startup_orchestration::defer_startup_composer_for_control_socket(&interactive),
+            crate::startup_orchestration::defer_startup_composer_for_control_socket(&picker),
+        ],
+        [true, false, false]
+    );
+}
 
 #[test]
 fn startup_preserves_typeahead_and_discards_buffered_action_key_after_first_draw() {

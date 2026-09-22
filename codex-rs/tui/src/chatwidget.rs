@@ -244,7 +244,7 @@ fn queued_message_edit_hint_binding(
         .or(configured)
 }
 
-fn normalize_thread_name(name: &str) -> Option<String> {
+pub(crate) fn normalize_thread_name(name: &str) -> Option<String> {
     let trimmed = name.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
@@ -1783,6 +1783,14 @@ impl ChatWidget {
         self.add_info_message(message.to_string(), /*hint*/ None);
     }
 
+    pub(crate) fn submit_external_literal_user_message(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+
+        self.submit_user_message_with_shell_escape_policy(text.into(), ShellEscapePolicy::Disallow);
+    }
+
     /// True when the UI is in the regular composer state with no running task,
     /// no modal overlay (e.g. approvals or status indicator), and no composer popups.
     /// In this state Esc-Esc backtracking is enabled.
@@ -1889,7 +1897,7 @@ impl ChatWidget {
         }
         match &self.codex_op_target {
             CodexOpTarget::Direct(codex_op_tx) => {
-                crate::session_log::log_outbound_op(&op);
+                crate::session_log::log_outbound_op(&op, /*thread_id_override*/ None);
                 let is_review = op.is_review();
                 if let Err(e) = codex_op_tx.send(op) {
                     tracing::error!("failed to submit op: {e}");

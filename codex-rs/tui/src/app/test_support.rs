@@ -23,13 +23,22 @@ pub(super) fn select_catalog_tip(app: &mut App, width: u16, expected: &str) {
 }
 
 pub(crate) async fn make_test_app() -> App {
-    let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    let (app, _rx, _op_rx) = make_test_app_with_channels().await;
+    app
+}
+
+pub(super) async fn make_test_app_with_channels() -> (
+    App,
+    tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    tokio::sync::mpsc::UnboundedReceiver<AppCommand>,
+) {
+    let (chat_widget, app_event_tx, rx, op_rx) = make_chatwidget_manual_with_sender().await;
     let config = chat_widget.config_ref().clone();
     let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
     let model = get_model_offline_for_tests(config.model.as_deref());
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
-    App {
+    let app = App {
         feature_write_lock: Arc::default(),
         model_catalog: chat_widget.model_catalog(),
         session_telemetry,
@@ -93,6 +102,7 @@ pub(crate) async fn make_test_app() -> App {
         agents_overview: Default::default(),
         side_threads: HashMap::new(),
         abandoned_side_threads: HashSet::new(),
+        external_btw_requests: HashMap::new(),
         active_thread_id: None,
         active_thread_rx: None,
         primary_thread_id: None,
@@ -118,7 +128,8 @@ pub(crate) async fn make_test_app() -> App {
         pending_plugin_enabled_writes: HashMap::new(),
         pending_hook_enabled_writes: HashMap::new(),
         recap: recap::RecapState::default(),
-    }
+    };
+    (app, rx, op_rx)
 }
 
 fn test_session_telemetry(config: &Config, model: &str) -> SessionTelemetry {

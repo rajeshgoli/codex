@@ -223,6 +223,7 @@ mod empty_state_policy;
 mod event_dispatch;
 mod exit_summary;
 mod experimental_features;
+mod external_btw;
 mod file_change_approvals;
 mod history_pagination;
 mod history_ui;
@@ -648,6 +649,7 @@ pub(crate) struct App {
     agents_overview: agents_overview::AgentsOverviewState,
     side_threads: HashMap<ThreadId, SideThreadState>,
     abandoned_side_threads: HashSet<ThreadId>,
+    external_btw_requests: HashMap<ThreadId, external_btw::ExternalBtwState>,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<ThreadBufferedEvent>>,
     primary_thread_id: Option<ThreadId>,

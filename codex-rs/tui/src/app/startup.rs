@@ -167,6 +167,7 @@ impl App {
         initial_prompt: Option<String>,
         initial_images: Vec<PathBuf>,
         session_selection: SessionSelection,
+        control_socket: Option<PathBuf>,
         feedback: codex_feedback::CodexFeedback,
         is_first_run: bool,
         should_prompt_windows_sandbox_nux_at_startup: bool,
@@ -740,6 +741,7 @@ See the Codex keymap documentation for supported actions and examples."
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
+        let control_socket_event_tx = app_event_tx.clone();
         let mut app = Self {
             feature_write_lock: Arc::default(),
             model_catalog,
@@ -812,6 +814,7 @@ See the Codex keymap documentation for supported actions and examples."
             agents_overview: Default::default(),
             side_threads: HashMap::new(),
             abandoned_side_threads: HashSet::new(),
+            external_btw_requests: HashMap::new(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
@@ -955,6 +958,16 @@ See the Codex keymap documentation for supported actions and examples."
             tui.probe_default_colors_after_protected_startup();
             terminal_color_probe_pending = false;
         }
+
+        let mut control_socket_handle = control_socket
+            .map(|socket_path| {
+                crate::control_socket::ControlSocketHandle::start(
+                    socket_path,
+                    control_socket_event_tx.clone(),
+                )
+            })
+            .transpose()
+            .wrap_err("failed to initialize control socket")?;
 
         let event_stream_started_at = Instant::now();
         tui.schedule_screen_size_recheck(Duration::ZERO);
@@ -1283,6 +1296,10 @@ See the Codex keymap documentation for supported actions and examples."
                 }
             }
         };
+        if let Some(mut handle) = control_socket_handle.take() {
+            handle.shutdown();
+        }
+
         if let Err(err) = app_server.shutdown().await {
             tracing::warn!(error = %err, "failed to shut down embedded app server");
         }

@@ -125,6 +125,7 @@ mod clock_format;
 mod collaboration_modes;
 mod color;
 mod config_update;
+mod control_socket;
 pub(crate) mod custom_terminal;
 mod daybreak;
 mod experimental_features;
@@ -1139,8 +1140,14 @@ async fn run_ratatui_app(
         }
     }
 
-    // Initialize high-fidelity session event logging if enabled.
-    session_log::maybe_init(&initial_config);
+    // Initialize session event logging if enabled.
+    if let Err(err) = session_log::maybe_init(&initial_config, &cli) {
+        restore();
+        let _ = tui.terminal.clear();
+        return Ok(AppExitInfo::fatal(format!(
+            "Failed to initialize session event logging: {err}"
+        )));
+    }
 
     let startup_app_server = startup_draft
         .run_until(
@@ -1344,7 +1351,10 @@ async fn run_ratatui_app(
         initial_config
     };
     startup_draft.apply_config(&config);
-    if !(cli.resume_picker || cli.fork_picker || cli.agents_overview)
+    if !(startup_orchestration::defer_startup_composer_for_control_socket(&cli)
+        || cli.resume_picker
+        || cli.fork_picker
+        || cli.agents_overview)
         && let Err(err) = startup_draft.show(&mut tui)
     {
         shutdown_startup_session(app_server.take(), &mut terminal_restore_guard).await;
@@ -1892,6 +1902,7 @@ async fn run_ratatui_app(
         prompt,
         shared,
         daemon_cli_executable,
+        control_socket,
         ..
     } = cli;
     let images = shared.into_inner().images;
@@ -1970,6 +1981,7 @@ async fn run_ratatui_app(
         prompt,
         images,
         session_selection,
+        control_socket,
         feedback,
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
         should_prompt_windows_sandbox_nux_at_startup,

@@ -1,6 +1,9 @@
+use std::path::PathBuf;
+
 use clap::Args;
 use clap::FromArgMatches;
 use clap::Parser;
+use clap::ValueHint;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::ApprovalModeCliArg;
 use codex_utils_cli::CliConfigOverrides;
@@ -83,6 +86,22 @@ pub struct Cli {
     /// Run without the shared background server, even if it is already running.
     #[arg(long)]
     pub no_daemon: bool,
+
+    /// Emit structured JSONL lifecycle events to a file path, or `-` for stdout.
+    #[arg(long = "event-stream", value_name = "PATH_OR_STDOUT")]
+    pub event_stream: Option<String>,
+
+    /// Pin the event stream schema version for compatibility.
+    #[arg(
+        long = "event-schema-version",
+        value_name = "INT",
+        requires = "event_stream"
+    )]
+    pub event_schema_version: Option<u32>,
+
+    /// Bind a local control socket for programmatic request/response control.
+    #[arg(long = "control-socket", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub control_socket: Option<PathBuf>,
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,

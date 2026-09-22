@@ -174,6 +174,7 @@ impl App {
                 }
             }
         }
+        crate::session_log::log_server_notification(&notification);
 
         if let ServerNotification::ThreadStatusChanged(status) = &notification {
             let _ = self.dynamic_tool_status_updates.send(status.clone());
@@ -375,7 +376,14 @@ impl App {
             _ => {}
         }
 
-        match server_notification_thread_target(&notification) {
+        let thread_target = server_notification_thread_target(&notification);
+        if let ServerNotificationThreadTarget::Thread(thread_id) = thread_target
+            && self.handle_external_btw_notification(thread_id, &notification)
+        {
+            return;
+        }
+
+        match thread_target {
             ServerNotificationThreadTarget::Thread(thread_id) => {
                 if self.current_displayed_thread_id() != Some(thread_id)
                     && let ServerNotification::ItemCompleted(item) = &notification
@@ -696,6 +704,22 @@ impl App {
                 }
                 return;
             }
+        }
+
+        if let Some(thread_id) = thread_id
+            && self.fail_external_btw(thread_id, "interactive_request_not_supported")
+        {
+            if let Err(err) = self
+                .reject_app_server_request(
+                    app_server_client,
+                    request.id().clone(),
+                    "Interactive requests are not supported in external /btw turns.".to_string(),
+                )
+                .await
+            {
+                tracing::warn!("{err}");
+            }
+            return;
         }
 
         if let Some(unsupported) = self

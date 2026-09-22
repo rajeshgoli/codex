@@ -7,6 +7,10 @@ use super::*;
 use codex_terminal_detection::Multiplexer;
 use codex_terminal_detection::TerminalName;
 
+pub(super) fn defer_startup_composer_for_control_socket(cli: &Cli) -> bool {
+    cli.control_socket.is_some() && !(cli.resume_picker || cli.fork_picker || cli.agents_overview)
+}
+
 pub(super) async fn run_main_inner(
     mut cli: Cli,
     arg0_paths: Arg0DispatchPaths,
@@ -186,6 +190,11 @@ pub(super) async fn run_main_inner(
         && !cli.bypass_hook_trust;
     let initial_screen = if cli.resume_picker || cli.fork_picker || cli.agents_overview {
         startup_draft::StartupDraftInitialScreen::SessionPicker
+    } else if defer_startup_composer_for_control_socket(&cli) {
+        // Control-socket clients use the visible composer as their readiness signal. Keep the
+        // non-submitting startup draft hidden so they wait for the interactive composer instead
+        // of sending an Enter key that startup intentionally ignores.
+        startup_draft::StartupDraftInitialScreen::Onboarding
     } else if !cli.oss
         && explicit_remote_endpoint.is_none()
         && (reuse_implicit_local_daemon || search_only_config_override)
