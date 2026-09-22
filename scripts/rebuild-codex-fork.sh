@@ -39,6 +39,14 @@ os.environ["CODEX_REPO_ROOT"] = str(repo_root)
 sys.path.insert(0, str(repo_root / "scripts"))
 from codex_package.targets import TARGET_SPECS
 from codex_package.v8 import resolve_codex_v8_cargo_env
+from codex_package.version import read_workspace_version
+
+version = read_workspace_version()
+if version.split("-", 1)[0].split("+", 1)[0] == "0.0.0":
+    raise SystemExit(
+        "Set an upstream-compatible workspace.package.version before building codex-fork; "
+        "the 0.0.0 development version hides version-gated models."
+    )
 
 rustc_version = subprocess.check_output(["rustc", "-vV"], text=True)
 host = next(line.removeprefix("host: ") for line in rustc_version.splitlines() if line.startswith("host: "))
