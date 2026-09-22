@@ -246,13 +246,12 @@ async fn multi_agent_catalog_messages_change_only_selected_tool_fields(
                         !actual_description
                             .contains("Spawns an agent to work on the specified task.")
                     );
-                    assert!(
-                        actual_description
-                            .strip_suffix(declaration)
-                            .expect("unchanged declaration")
-                            .ends_with("Local delegation hint.")
-                    );
-                    actual_description.to_string()
+                    let actual_prefix = actual_description
+                        .split_once("\n\nexec tool declaration:")
+                        .map_or(actual_description, |(prefix, _)| prefix);
+                    assert!(actual_prefix.ends_with("Local delegation hint."));
+                    // Build the expected declaration below from the selected parameter schema.
+                    format!("{actual_prefix}{declaration}")
                 } else {
                     format!("{description}{declaration}")
                 };
