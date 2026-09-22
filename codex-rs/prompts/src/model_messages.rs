@@ -11,6 +11,10 @@ use codex_protocol::openai_models::ToolMessage;
 use permissions::ResolvedApprovalMessages;
 use permissions::ResolvedPermissionMessages;
 
+// UTF-8 bytes conservatively bound byte-level tokenizer tokens, including non-ASCII text.
+// Oversized catalog descriptions fall back intact to the bundled tool description.
+const MAX_TOOL_DESCRIPTION_BYTES: usize = 10_000;
+
 mod collaboration;
 mod guardian;
 mod multi_agent;
@@ -154,9 +158,12 @@ impl<'a> ResolvedModelMessages<'a> {
     }
 
     /// Selects a V2 tool's static description by its name, independently of its runtime namespace.
-    /// Missing text retains the tool's bundled description; an empty string replaces it.
+    /// Missing or oversized text retains the bundled description; an empty string replaces it.
     pub fn multi_agent_tool_description_override(&self, tool_name: &str) -> Option<&'a str> {
-        self.multi_agent_tool(tool_name)?.description.as_deref()
+        self.multi_agent_tool(tool_name)?
+            .description
+            .as_deref()
+            .filter(|description| description.len() <= MAX_TOOL_DESCRIPTION_BYTES)
     }
 
     /// Selects a V2 tool's complete parameter schema; parsing belongs to the tool consumer.
@@ -203,3 +210,7 @@ impl<'a> ResolvedModelMessages<'a> {
             .unwrap_or(PERSISTENT_INSTRUCTIONS)
     }
 }
+
+#[cfg(test)]
+#[path = "model_messages_tests.rs"]
+mod tests;

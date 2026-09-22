@@ -27,6 +27,19 @@ cd "$repo_root/codex-rs"
 # Own a unique child directory: never clean a caller's shared Cargo cache.
 mkdir -p "$target_parent"
 target_dir="$(mktemp -d "$target_parent/codex-fork-build.XXXXXX")"
+stage_dir=""
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [[ -n "$stage_dir" ]]; then
+    rm -rf -- "$stage_dir" || status=$?
+  fi
+  if [[ "$keep_build" == false ]]; then
+    cargo clean --target-dir "$target_dir" || status=$?
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
 printf 'Build artifacts: %s\n' "$target_dir"
 
 export CARGO_INCREMENTAL=0
@@ -69,7 +82,6 @@ PY
 
 mkdir -p "$runtime_dir"
 stage_dir="$(mktemp -d "$runtime_dir/.install.XXXXXX")"
-trap 'rm -rf -- "$stage_dir"' EXIT
 for binary in codex-fork codex-code-mode-host; do
   install -m 755 "$target_dir/release/$binary" "$stage_dir/$binary"
 done
@@ -82,7 +94,4 @@ mv -f "$stage_dir/codex-fork" "$runtime_dir/codex-fork"
 "$repo_root/bin/codex-fork" --version
 "$repo_root/bin/codex-code-mode-host" --help >/dev/null
 
-if [[ "$keep_build" == false ]]; then
-  cargo clean --target-dir "$target_dir"
-fi
 du -sh "$runtime_dir"

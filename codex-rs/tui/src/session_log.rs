@@ -292,31 +292,35 @@ pub(crate) fn maybe_init(config: &Config, cli: &Cli) -> std::io::Result<()> {
 }
 
 pub(crate) fn log_inbound_app_event(event: &AppEvent) {
-    if !LOGGER.is_enabled() {
+    log_inbound_app_event_with(&LOGGER, event);
+}
+
+fn log_inbound_app_event_with(logger: &SessionLogger, event: &AppEvent) {
+    if !logger.is_enabled() {
         return;
     }
 
-    match LOGGER.mode() {
+    match logger.mode() {
         // Event-stream mode records outbound commands and server notifications
         // at their submit/receive points to avoid duplicate queued-event records.
         Some(LogMode::EventStream) => {}
         Some(LogMode::Legacy) => match event {
             AppEvent::NewSession { .. } => {
-                LOGGER.write_json_line(&json!({
+                logger.write_json_line(&json!({
                     "ts": now_ts(),
                     "dir": "to_tui",
                     "kind": "new_session",
                 }));
             }
             AppEvent::ClearUi { .. } => {
-                LOGGER.write_json_line(&json!({
+                logger.write_json_line(&json!({
                     "ts": now_ts(),
                     "dir": "to_tui",
                     "kind": "clear_ui",
                 }));
             }
             AppEvent::InsertHistoryCell(cell) => {
-                LOGGER.write_json_line(&json!({
+                logger.write_json_line(&json!({
                     "ts": now_ts(),
                     "dir": "to_tui",
                     "kind": "insert_history_cell",
@@ -324,7 +328,7 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
                 }));
             }
             AppEvent::StartFileSearch(query) => {
-                LOGGER.write_json_line(&json!({
+                logger.write_json_line(&json!({
                     "ts": now_ts(),
                     "dir": "to_tui",
                     "kind": "file_search_start",
@@ -332,7 +336,7 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
                 }));
             }
             AppEvent::FileSearchResult { query, matches } => {
-                LOGGER.write_json_line(&json!({
+                logger.write_json_line(&json!({
                     "ts": now_ts(),
                     "dir": "to_tui",
                     "kind": "file_search_result",
@@ -341,7 +345,7 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
                 }));
             }
             AppEvent::PetPreviewLoaded { request_id, result } => {
-                LOGGER.write_json_line(&json!({
+                logger.write_json_line(&json!({
                     "ts": now_ts(),
                     "dir": "to_tui",
                     "kind": "app_event",
@@ -355,7 +359,7 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
                 pet_id,
                 result,
             } => {
-                LOGGER.write_json_line(&json!({
+                logger.write_json_line(&json!({
                     "ts": now_ts(),
                     "dir": "to_tui",
                     "kind": "app_event",
@@ -366,11 +370,12 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
                 }));
             }
             other => {
-                LOGGER.write_json_line(&json!({
+                let variant: &'static str = other.into();
+                logger.write_json_line(&json!({
                     "ts": now_ts(),
                     "dir": "to_tui",
                     "kind": "app_event",
-                    "variant": format!("{other:?}").split('(').next().unwrap_or("app_event"),
+                    "variant": variant,
                 }));
             }
         },
@@ -744,3 +749,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "session_log_tests.rs"]
+mod privacy_tests;
