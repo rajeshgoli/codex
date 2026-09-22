@@ -8,7 +8,7 @@ case "${1:-}" in
   --help|-h)
     echo "Usage: scripts/rebuild-codex-fork.sh [--keep-build]"
     echo "Build and install codex-fork and its code-mode host, then clean build artifacts."
-    echo "Use --keep-build to retain the release cache for faster subsequent builds."
+    echo "Use --keep-build to retain this build directory for inspection."
     exit 0
     ;;
   "") ;;
@@ -20,9 +20,14 @@ if (( $# > 1 )); then
 fi
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-target_dir="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/codex-fork-target}"
+target_parent="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}}"
 runtime_dir="$repo_root/.codex-fork-runtime"
 cd "$repo_root/codex-rs"
+
+# Own a unique child directory: never clean a caller's shared Cargo cache.
+mkdir -p "$target_parent"
+target_dir="$(mktemp -d "$target_parent/codex-fork-build.XXXXXX")"
+printf 'Build artifacts: %s\n' "$target_dir"
 
 export CARGO_INCREMENTAL=0
 export CARGO_PROFILE_RELEASE_DEBUG=0
