@@ -80,16 +80,16 @@ enum CheckpointReuse {
 enum ReviewCheckpoint {
     Valid,
     EmptyContent,
-    IncompatibleReviewer,
+    DifferentReviewerHash,
     UnknownReviewer,
     EmptyReviewerHash,
 }
 
 #[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::EmptyContent; "empty checkpoint fails closed")]
-#[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::IncompatibleReviewer; "incompatible sync reviewer fails closed")]
-#[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::UnknownReviewer; "unknown sync compatibility fails closed")]
-#[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::EmptyReviewerHash; "empty sync compatibility fails closed")]
-#[test_case(ContextPath::Legacy, CheckpointReuse::Enabled, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::IncompatibleReviewer; "legacy sync compatibility is unchanged")]
+#[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::DifferentReviewerHash; "different sync hash preserves retained evidence")]
+#[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::UnknownReviewer; "unknown sync hash preserves retained evidence")]
+#[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::EmptyReviewerHash; "empty sync hash preserves retained evidence")]
+#[test_case(ContextPath::Legacy, CheckpointReuse::Enabled, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::DifferentReviewerHash; "legacy sync compatibility is unchanged")]
 #[test_case(ContextPath::ThreadOwned, CheckpointReuse::Disabled, Some("matching"), Some("matching"), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "disabled Luna reuse requires sync")]
 #[test_case(ContextPath::Legacy, CheckpointReuse::Disabled, Some("matching"), Some("matching"), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "legacy disabled Luna reuse still samples")]
 #[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some("matching"), 0, EvidenceSize::OversizedInstruction, ReviewCheckpoint::Valid; "instruction budget preserves fresh low score")]
@@ -97,7 +97,8 @@ enum ReviewCheckpoint {
 #[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "incompatible checkpoint")]
 #[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), None, 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "unknown Luna compatibility")]
 #[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some(""), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "empty Luna compatibility")]
-#[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, None, Some("matching"), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "unknown producer remains unknown after model switch")]
+#[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, None, Some("matching"), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "unknown producer preserves retained evidence")]
+#[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some(""), Some("matching"), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "empty producer preserves retained evidence")]
 #[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some("matching"), 140, EvidenceSize::Normal, ReviewCheckpoint::Valid; "source call evicted")]
 #[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some("matching"), 0, EvidenceSize::OversizedAnswer, ReviewCheckpoint::Valid; "incomplete answers reject fresh low score")]
 #[test_case(ContextPath::Legacy, CheckpointReuse::Enabled, Some("matching"), Some("matching"), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "legacy answers remain runtime only")]
@@ -126,14 +127,14 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
     let requires_sync = matches!(context_path, ContextPath::ThreadOwned) && !compatible;
     let oversized_instruction = matches!(evidence_size, EvidenceSize::OversizedInstruction);
     let reviewer_hash = match review_checkpoint {
-        ReviewCheckpoint::IncompatibleReviewer => Some("different-reviewer"),
+        ReviewCheckpoint::DifferentReviewerHash => Some("different-reviewer"),
         ReviewCheckpoint::UnknownReviewer => None,
         ReviewCheckpoint::EmptyReviewerHash => Some(""),
         ReviewCheckpoint::Valid | ReviewCheckpoint::EmptyContent => Some("matching"),
     };
+    // Sync review accepts any hash metadata; only the checkpoint payload must be usable.
     let reject_sync_checkpoint = matches!(context_path, ContextPath::ThreadOwned)
-        && (!matches!(review_checkpoint, ReviewCheckpoint::Valid)
-            || parent_hash != Some("matching"));
+        && matches!(review_checkpoint, ReviewCheckpoint::EmptyContent);
     let answer = match evidence_size {
         EvidenceSize::Normal | EvidenceSize::OversizedInstruction => {
             USER_INPUT_RESTRICTION.to_owned()
@@ -157,7 +158,7 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
     match review_checkpoint {
         ReviewCheckpoint::EmptyContent => checkpoint["encrypted_content"] = json!(""),
         ReviewCheckpoint::Valid
-        | ReviewCheckpoint::IncompatibleReviewer
+        | ReviewCheckpoint::DifferentReviewerHash
         | ReviewCheckpoint::UnknownReviewer
         | ReviewCheckpoint::EmptyReviewerHash => {}
     }
@@ -279,7 +280,6 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
         .with_root_config("approvals_reviewer = \"auto_review\"\nmodel_auto_compact_token_limit = 1000000")
         .enable_feature(Feature::DefaultModeRequestUserInput)
         .enable_feature(Feature::GuardianApproval)
-        .enable_feature(Feature::GuardianReuseParentCompaction)
         .disable_feature(Feature::EnableRequestCompression)
         .disable_feature(Feature::TokenBudget)
         .with_extra_config(&format!(
@@ -398,7 +398,7 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
             .await?;
             classifier.allow_luna.notify_one();
         }
-        if reject_sync_checkpoint && (1..=2).contains(&index) {
+        if reject_sync_checkpoint && index > 0 {
             let notification = timeout(
                 TIMEOUT,
                 app_server.read_stream_until_matching_notification(
@@ -415,31 +415,23 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
             .await??;
             let assessment: ItemGuardianApprovalReviewCompletedNotification =
                 serde_json::from_value(notification.params.expect("review completion"))?;
-            let reason = match review_checkpoint {
-                ReviewCheckpoint::EmptyContent => {
-                    "parent compaction checkpoint is unusable for Guardian review"
-                }
-                ReviewCheckpoint::Valid
-                | ReviewCheckpoint::IncompatibleReviewer
-                | ReviewCheckpoint::UnknownReviewer
-                | ReviewCheckpoint::EmptyReviewerHash => {
-                    "parent compaction checkpoint is incompatible with the Guardian review model or its compatibility is unknown"
-                }
-            };
             assert_eq!(
                 assessment.review,
                 GuardianApprovalReview {
                     status: GuardianApprovalReviewStatus::Denied,
                     risk_level: None,
                     user_authorization: None,
-                    rationale: Some(format!("Automatic approval review failed: {reason}")),
+                    rationale: Some(
+                        "Automatic approval review failed: parent compaction checkpoint is unusable for Guardian review"
+                            .to_owned(),
+                    ),
                 }
             );
         }
         let completed: TurnCompletedNotification =
             timeout(TIMEOUT, app_server.read_notification("turn/completed")).await??;
         assert_eq!(completed.turn.status, TurnStatus::Completed);
-        if reject_sync_checkpoint && (1..=2).contains(&index) {
+        if reject_sync_checkpoint && index > 0 {
             // The first review established a cached session before compaction. Neither
             // that session nor a new one may review unusable evidence, including after resume.
             let reviews = review_requests.lock().expect("request log lock");
@@ -778,10 +770,8 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
                             .metadata
                             .as_ref()
                             .and_then(|metadata| metadata.compaction_model_hash.as_deref()),
-                        matches!(context_path, ContextPath::ThreadOwned)
-                            .then_some(parent_hash)
-                            .flatten(),
-                        "only the enabled path records checkpoint producer provenance",
+                        parent_hash,
+                        "every compaction records its producer provenance",
                     );
                 }
             }

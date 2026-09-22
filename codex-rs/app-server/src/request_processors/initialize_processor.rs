@@ -20,6 +20,8 @@ const NON_ORIGINATING_CLIENT_NAMES: &[&str] = &["codex_app_server_daemon", "code
 
 #[derive(Clone)]
 pub(crate) struct InitializeRequestProcessor {
+    gateway_login_control: Arc<codex_login::GatewayLoginControl>,
+    gateway_login_initialized: Arc<std::sync::OnceLock<()>>,
     outgoing: Arc<OutgoingMessageSender>,
     analytics_events_client: AnalyticsEventsClient,
     config: Arc<Config>,
@@ -30,6 +32,7 @@ pub(crate) struct InitializeRequestProcessor {
 
 impl InitializeRequestProcessor {
     pub(crate) fn new(
+        gateway_login_control: Arc<codex_login::GatewayLoginControl>,
         outgoing: Arc<OutgoingMessageSender>,
         analytics_events_client: AnalyticsEventsClient,
         config: Arc<Config>,
@@ -38,6 +41,8 @@ impl InitializeRequestProcessor {
         user_verification: Arc<crate::user_verification::Service>,
     ) -> Self {
         Self {
+            gateway_login_control,
+            gateway_login_initialized: Arc::new(std::sync::OnceLock::new()),
             outgoing,
             analytics_events_client,
             config,
@@ -144,6 +149,19 @@ impl InitializeRequestProcessor {
                 .await;
         }
 
+        if capabilities.explicit_gateway_oauth || mutates_global_identity {
+            // Only the first originating client may restore legacy automatic login.
+            // Any explicit opt-in is sticky across subsequent connections.
+            self.gateway_login_initialized.get_or_init(|| {
+                if !capabilities.explicit_gateway_oauth {
+                    self.gateway_login_control.allow_automatic_login();
+                }
+            });
+            if capabilities.explicit_gateway_oauth {
+                self.gateway_login_control.require_explicit_login();
+            }
+        }
+
         if mutates_global_identity {
             // Only real client initialization may mutate process-global client metadata.
             if let Err(error) = set_default_originator(originator.clone()) {
@@ -172,6 +190,22 @@ impl InitializeRequestProcessor {
         set_default_client_residency_requirement(self.config.enforce_residency.value());
         if mutates_global_identity && let Ok(mut suffix) = USER_AGENT_SUFFIX.lock() {
             *suffix = Some(user_agent_suffix);
+        }
+
+        #[cfg(windows)]
+        if matches!(session.origin, ConnectionOrigin::Stdio) && name == "Codex Desktop" {
+            // Uninstall ownership must not depend on account sign-in or sandbox setup.
+            // Keep this bounded attempt ahead of the response; background registration can race uninstall.
+            let home = codex_home.clone();
+            if !matches!(
+                tokio::task::spawn_blocking(move || {
+                    codex_windows_sandbox::register_desktop_installation(&home)
+                })
+                .await,
+                Ok(Ok(()))
+            ) {
+                tracing::warn!("could not register desktop uninstall ownership");
+            }
         }
 
         let user_agent = get_codex_user_agent();

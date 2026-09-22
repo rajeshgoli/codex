@@ -1,12 +1,11 @@
 //! Dashboard for inspecting and managing the TUI's retained daemon tasks.
-//! The shared view state retains the new-task editor across metadata refreshes.
+//! Search, rename, status filters and selection survive metadata refreshes.
+
+#[path = "agent_center/mod.rs"]
+pub(super) mod command_center;
 
 #[path = "agents_overview_grouping.rs"]
 mod grouping;
-#[path = "agents_overview_input.rs"]
-mod input;
-#[path = "agents_overview_render.rs"]
-mod render;
 
 pub(super) use grouping::AgentsOverviewGrouping;
 use grouping::model_name;
@@ -18,7 +17,6 @@ use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::BottomPaneView;
 use crate::bottom_pane::CancellationEvent;
-use crate::bottom_pane::ChatComposer;
 use crate::bottom_pane::ViewCompletion;
 use crate::key_hint::KeyBindingListExt;
 use crate::key_hint::ShortcutHint;
@@ -36,6 +34,7 @@ use codex_app_server_protocol::ThreadStatus;
 use codex_protocol::ThreadId;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
+use crossterm::event::KeyModifiers;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
@@ -53,7 +52,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
-use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -85,7 +83,7 @@ impl AgentsOverviewGroup {
             Self::NeedsYou => "Needs input",
             Self::Working => "Working",
             Self::Ready => "Ready",
-            Self::Finished => "Finished",
+            Self::Finished => "Inactive",
         }
     }
 }
@@ -133,53 +131,28 @@ impl AgentsOverviewProjectGroup {
 
 #[derive(Default)]
 pub(super) struct AgentsOverviewViewState {
-    // Search and rename never borrow the new-task draft.
+    scroll: usize,
+    page_height: usize,
+    status_filter: usize,
+    help: bool,
     pub(super) input: String,
-    pub(super) composer: Option<ChatComposer>,
     pub(super) key_chord_hint: Option<Vec<(String, String)>>,
-    pub(super) focus: AgentsOverviewFocus,
+    pub(super) creating_worktree: bool,
     pub(super) refresh_failed: bool,
+    pub(super) loading: bool,
     pub(super) connection_notice: Option<&'static str>,
     pub(super) server_version_notice: Option<String>,
     search: String,
     searching: bool,
     pub(super) grouping: AgentsOverviewGrouping,
-    pub(super) renaming: bool,
+    pub(super) rename_target: Option<ThreadId>,
     // The picker can finish this retained view when it selects the already active session.
     pub(super) completion: Option<ViewCompletion>,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(super) enum AgentsOverviewFocus {
-    #[default]
-    Composer,
-    List,
-}
-
 impl AgentsOverviewViewState {
-    pub(super) fn focus_composer(&mut self) {
-        self.focus = AgentsOverviewFocus::Composer;
-        if let Some(composer) = self.composer.as_mut() {
-            composer.resume_text_entry();
-        }
-    }
-
-    fn editing_metadata(&self) -> bool {
-        self.searching || self.renaming
-    }
-
-    fn composing(&self) -> bool {
-        self.focus == AgentsOverviewFocus::Composer && !self.searching && !self.renaming
-    }
-
-    fn composer_owns_escape(&self) -> bool {
-        self.composer.as_ref().is_some_and(|composer| {
-            composer.popup_active()
-                || (composer.is_vim_enabled()
-                    && !composer
-                        .keymap_contexts()
-                        .contains(KeymapContext::VimNormal))
-        })
+    pub(super) fn editing_metadata(&self) -> bool {
+        self.searching || self.rename_target.is_some()
     }
 }
 
@@ -192,8 +165,8 @@ pub(super) struct AgentsOverviewView {
     app_event_tx: AppEventSender,
     keymap: ListKeymap,
     agents_keymap: AgentsKeymap,
-    composer_hints: Vec<(String, String)>,
-    composer_keymap: crate::keymap::ComposerKeymap,
+    center_shortcut_keys: Vec<crate::key_hint::KeyBinding>,
+    worktrees_enabled: bool,
 }
 
 impl AgentsOverviewView {
@@ -206,25 +179,37 @@ impl AgentsOverviewView {
         keymap: RuntimeKeymap,
         state: Arc<Mutex<AgentsOverviewViewState>>,
     ) -> Self {
-        let selected = selected_thread_id
+        let selected = state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .rename_target
+            .or(selected_thread_id)
             .and_then(|thread_id| rows.iter().position(|row| row.thread_id == thread_id))
             .or_else(|| rows.iter().position(|row| row.is_current))
             .unwrap_or(0);
-        let composer_hints = [
-            (KeymapContext::Composer, "submit", "create task"),
-            (KeymapContext::Editor, "insert_newline", "newline"),
-        ]
-        .into_iter()
-        .filter_map(|(context, action, label)| {
-            keymap
-                .primary_hint(context, action)
-                .map(|hint| (hint.display_label().replace(" + ", "+"), label.to_string()))
-        })
-        .chain([("esc".to_string(), "tasks".to_string())])
-        .collect();
         let project_groups = rows
             .iter()
             .map(|row| AgentsOverviewProjectGroup::for_thread(&row.thread, worktrees_enabled))
+            .collect();
+        let center_shortcut_keys = crate::keymap::keymap_action_ids()
+            .filter(|action| matches!(action.context, KeymapContext::List | KeymapContext::Agents))
+            .flat_map(|action| {
+                crate::keymap::bindings_for_action(
+                    &keymap,
+                    action.context.config_name(),
+                    action.action,
+                )
+                .unwrap_or_default()
+                .iter()
+                .copied()
+            })
+            .chain(keymap.chords.bindings.iter().filter_map(|binding| {
+                matches!(
+                    binding.action.context,
+                    KeymapContext::List | KeymapContext::Agents
+                )
+                .then_some(binding.chord.prefix)
+            }))
             .collect();
         let mut view = Self {
             use_theme_colors,
@@ -235,14 +220,11 @@ impl AgentsOverviewView {
             app_event_tx,
             keymap: keymap.list,
             agents_keymap: keymap.agents,
-            composer_hints,
-            composer_keymap: keymap.composer,
+            center_shortcut_keys,
+            worktrees_enabled,
         };
         view.state().completion = None;
-        let visible = view.visible_indices();
-        if !visible.contains(&view.selected) {
-            view.selected = visible.first().copied().unwrap_or(usize::MAX);
-        }
+        view.reconcile_command_center_selection();
         view
     }
 
@@ -271,6 +253,7 @@ impl AgentsOverviewView {
     fn visible_indices(&self) -> Vec<usize> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let search = state.search.to_lowercase();
+        let (_, status_group) = command_center::TASK_FILTERS[state.status_filter];
         let mut visible = self
             .rows
             .iter()
@@ -283,7 +266,10 @@ impl AgentsOverviewView {
                     row.thread.cwd.display(),
                 )
                 .to_lowercase();
-                (search.is_empty() || searchable.contains(&search)).then_some(index)
+                ((search.is_empty() || searchable.contains(&search))
+                    && (state.rename_target == Some(row.thread_id)
+                        || status_group.is_none_or(|group| group == row.group)))
+                .then_some(index)
             })
             .collect::<Vec<_>>();
         match state.grouping {
@@ -305,7 +291,7 @@ impl AgentsOverviewView {
     }
 
     fn move_selection(&mut self, forward: bool) {
-        if self.state().renaming {
+        if self.state().rename_target.is_some() {
             return;
         }
         let visible = self.visible_indices();
@@ -325,7 +311,7 @@ impl AgentsOverviewView {
 
     fn activate(&mut self) {
         let input = self.state().input.clone();
-        if self.state().renaming && !input.trim().is_empty() {
+        if self.state().rename_target.is_some() && !input.trim().is_empty() {
             if let Some(row) = self.selected_row() {
                 self.app_event_tx
                     .send(AppEvent::RenameAgentsOverviewThread {
@@ -333,9 +319,13 @@ impl AgentsOverviewView {
                         name: input.trim().to_string(),
                     });
             }
-            self.state().renaming = false;
+            self.state().rename_target = None;
             self.state().input.clear();
-        } else if let Some(row) = self.selected_row().filter(|_| !self.state().renaming) {
+            self.reconcile_command_center_selection();
+        } else if let Some(row) = self
+            .selected_row()
+            .filter(|_| self.state().rename_target.is_none())
+        {
             self.app_event_tx
                 .send(AppEvent::SelectAgentsOverviewThread {
                     thread_id: row.thread_id,
@@ -369,89 +359,13 @@ impl AgentsOverviewView {
 
     fn status(row: &AgentsOverviewRow) -> (&'static str, Span<'static>) {
         match row.group {
+            AgentsOverviewGroup::NeedsYou if row.thread.status == ThreadStatus::SystemError => {
+                ("Error", "!".red())
+            }
             AgentsOverviewGroup::NeedsYou => ("Needs input", "●".red()),
             AgentsOverviewGroup::Working => ("Working", "●".green()),
             AgentsOverviewGroup::Ready => ("Ready", "○".cyan()),
-            AgentsOverviewGroup::Finished => ("Finished", "✓".dim()),
-        }
-    }
-
-    fn render_rows(&self, area: Rect, buf: &mut Buffer) {
-        let mut offset = 0;
-        let mut previous_group_index: Option<usize> = None;
-        let grouping = self.state().grouping;
-        let visible = self.visible_indices();
-        let mut first = visible
-            .iter()
-            .position(|index| *index == self.selected)
-            .unwrap_or_default();
-        let mut height = 2;
-        while first > 0 {
-            let previous_index = visible[first - 1];
-            let current_index = visible[first];
-            let group_changed = !self.same_group(grouping, previous_index, current_index);
-            let added_height = 1 + 2 * u16::from(group_changed);
-            if height + added_height > area.height {
-                break;
-            }
-            height += added_height;
-            first -= 1;
-        }
-        for index in visible.into_iter().skip(first) {
-            if offset >= area.height {
-                break;
-            }
-            let row = &self.rows[index];
-            let group = match grouping {
-                AgentsOverviewGrouping::Project => {
-                    self.project_groups[index].heading.display().to_string()
-                }
-                AgentsOverviewGrouping::Status => row.group.label().to_string(),
-                AgentsOverviewGrouping::Model => model_name(&row.thread).to_string(),
-            };
-            let group_changed = previous_group_index
-                .is_none_or(|previous_index| !self.same_group(grouping, previous_index, index));
-            if group_changed {
-                offset += u16::from(previous_group_index.is_some());
-                if offset >= area.height {
-                    break;
-                }
-                let count = self
-                    .rows
-                    .iter()
-                    .enumerate()
-                    .filter(|(candidate_index, _)| {
-                        self.same_group(grouping, *candidate_index, index)
-                    })
-                    .count();
-                Line::from(vec![group.clone().bold(), format!("  {count}").dim()])
-                    .render(Rect::new(area.x, area.y + offset, area.width, 1), buf);
-                offset += 1;
-                previous_group_index = Some(index);
-            }
-            if offset >= area.height {
-                break;
-            }
-            let marker = if self.selected == index {
-                "›".cyan().bold()
-            } else {
-                " ".into()
-            };
-            let (status, dot) = Self::status(row);
-            let current = if row.is_current { "  current" } else { "" };
-            let mut spans = vec![
-                marker,
-                " ".into(),
-                dot,
-                " ".into(),
-                Span::styled(display_title(&row.thread), self.title_style(row.thread_id)),
-                current.dim(),
-            ];
-            if grouping != AgentsOverviewGrouping::Status {
-                spans.extend(["  ".into(), status.dim()]);
-            }
-            Line::from(spans).render(Rect::new(area.x, area.y + offset, area.width, 1), buf);
-            offset += 1;
+            AgentsOverviewGroup::Finished => ("Inactive", "○".dim()),
         }
     }
 
@@ -516,7 +430,7 @@ impl AgentsOverviewView {
             if let Some((message, cwd)) = &row.details.last_message {
                 details.extend([Line::default(), "Last message".dim().into()]);
                 crate::markdown::append_markdown(
-                    &crate::markdown::unwrap_markdown_fences(message),
+                    &crate::markdown::normalize_markdown_for_rendering(message),
                     Some(width),
                     Some(cwd.as_path()),
                     &mut details,
@@ -543,10 +457,6 @@ impl AgentsOverviewView {
 }
 
 impl BottomPaneView for AgentsOverviewView {
-    fn next_frame_delay(&self) -> Option<std::time::Duration> {
-        self.state().composer.as_ref()?.footer_flash_delay()
-    }
-
     fn view_id(&self) -> Option<&'static str> {
         Some(AGENTS_OVERVIEW_VIEW_ID)
     }
@@ -556,15 +466,7 @@ impl BottomPaneView for AgentsOverviewView {
     }
 
     fn keymap_contexts(&self) -> KeymapContextSet {
-        let state = self.state();
-        if state.composing() {
-            state
-                .composer
-                .as_ref()
-                .map_or_else(KeymapContextSet::default, ChatComposer::keymap_contexts)
-        } else {
-            KeymapContextSet::new(KeymapContext::List).with(KeymapContext::Agents)
-        }
+        KeymapContextSet::new(KeymapContext::List).with(KeymapContext::Agents)
     }
 
     fn completion(&self) -> Option<ViewCompletion> {
@@ -583,16 +485,11 @@ impl BottomPaneView for AgentsOverviewView {
         let mut state = self.state();
         if state.editing_metadata() {
             state.searching = false;
-            state.renaming = false;
+            state.rename_target = None;
             state.search.clear();
             state.input.clear();
-            return CancellationEvent::Handled;
-        }
-        if let Some(composer) = state.composer.as_mut()
-            && (composer.cancel_vim_search()
-                || composer.cancel_history_search()
-                || composer.clear_for_ctrl_c().is_some())
-        {
+            drop(state);
+            self.reconcile_command_center_selection();
             return CancellationEvent::Handled;
         }
         CancellationEvent::NotHandled
@@ -604,39 +501,23 @@ impl BottomPaneView for AgentsOverviewView {
                 input.push_str(&crate::history_cell::sanitize_user_text(pasted.into()))
             });
         }
-        let mut state = self.state();
-        if state.focus == AgentsOverviewFocus::List {
-            state.focus_composer();
+        false
+    }
+
+    fn handle_key_event(&mut self, mut key: KeyEvent) {
+        // Terminals encode Shift-Tab as either BackTab or Tab with the shift modifier.
+        if key.code == KeyCode::BackTab {
+            key.code = KeyCode::Tab;
+            key.modifiers.insert(KeyModifiers::SHIFT);
         }
-        state
-            .composer
-            .as_mut()
-            .is_some_and(|composer| composer.handle_paste(pasted))
-    }
-
-    fn flush_paste_burst_if_due(&mut self) -> bool {
-        self.state()
-            .composer
-            .as_mut()
-            .is_some_and(ChatComposer::flush_paste_burst_if_due)
-    }
-
-    fn is_in_paste_burst(&self) -> bool {
-        self.state()
-            .composer
-            .as_ref()
-            .is_some_and(ChatComposer::is_in_paste_burst)
-    }
-
-    fn handle_key_event(&mut self, key: KeyEvent) {
         if key.kind == crossterm::event::KeyEventKind::Release {
             return;
         }
-        if self.state().composing() {
-            self.handle_composer_key(key);
+        if self.command_center_key(key) {
             return;
         }
         if key.code == KeyCode::Backspace
+            && self.state().editing_metadata()
             && key.modifiers.is_empty()
             && self.keymap.action_for(key).is_none()
         {
@@ -647,31 +528,15 @@ impl BottomPaneView for AgentsOverviewView {
         }
         if is_plain_text_key_event(key)
             && let KeyCode::Char(character) = key.code
+            && self.state().editing_metadata()
         {
-            if self.state().editing_metadata() {
-                self.edit_input(|input| input.push(character));
-                return;
-            }
-            if !self
-                .state()
-                .composer
-                .as_ref()
-                .is_some_and(ChatComposer::is_vim_enabled)
-            {
-                self.state().focus_composer();
-                self.handle_composer_key(key);
-                return;
-            }
+            self.edit_input(|input| input.push(character));
+            return;
         }
 
-        if self.agents_keymap.search.is_pressed(key) || {
-            let state = self.state();
-            state.connection_notice.is_some()
-                && state.searching
-                && self.keymap.action_for(key) == Some(ListAction::Cancel)
-        } {
+        if self.agents_keymap.search.is_pressed(key) {
             let mut state = self.state();
-            if !state.renaming {
+            if state.rename_target.is_none() {
                 state.searching = !state.searching;
                 if !state.searching {
                     state.search.clear();
@@ -680,13 +545,15 @@ impl BottomPaneView for AgentsOverviewView {
             return;
         }
 
-        if self.state().connection_notice.is_some()
-            && !self.agents_keymap.new_task.is_pressed(key)
+        if (self.state().connection_notice.is_some() || self.state().creating_worktree)
             && self.keymap.action_for(key) != Some(ListAction::Cancel)
         {
             match self.keymap.action_for(key) {
                 Some(ListAction::MoveUp) => self.move_selection(/*forward*/ false),
                 Some(ListAction::MoveDown) => self.move_selection(/*forward*/ true),
+                Some(action @ (ListAction::PageUp | ListAction::PageDown)) => {
+                    self.page_selection(action)
+                }
                 _ => {}
             }
             return;
@@ -706,12 +573,17 @@ impl BottomPaneView for AgentsOverviewView {
             return;
         }
         if self.agents_keymap.new_task.is_pressed(key) {
-            let mut state = self.state();
-            state.search.clear();
-            state.searching = false;
-            state.renaming = false;
-            state.input.clear();
-            state.focus_composer();
+            self.app_event_tx.send(AppEvent::NewAgentsOverviewSession {
+                cwd: self.selected_row().map(|row| row.thread.cwd.clone()),
+            });
+            return;
+        }
+        if self.agents_keymap.new_worktree.is_pressed(key) {
+            if self.worktrees_enabled {
+                self.app_event_tx.send(AppEvent::NewAgentsOverviewWorktree {
+                    cwd: self.selected_row().map(|row| row.thread.cwd.clone()),
+                });
+            }
             return;
         }
         if self.agents_keymap.rename.is_pressed(key) {
@@ -721,7 +593,7 @@ impl BottomPaneView for AgentsOverviewView {
                     state.input = row.thread.name.clone().unwrap_or_default();
                     state.search.clear();
                     state.searching = false;
-                    state.renaming = true;
+                    state.rename_target = Some(row.thread_id);
                 }
             }
             return;
@@ -743,9 +615,12 @@ impl BottomPaneView for AgentsOverviewView {
         }
         if self.agents_keymap.hide.is_pressed(key) {
             if let Some(row) = self.selected_row() {
-                self.app_event_tx.send(AppEvent::HideAgentsOverviewThread {
-                    thread_id: row.thread_id,
-                });
+                let thread_id = row.thread_id;
+                // Keep an adjacent task selected when hiding rebuilds the view.
+                let forward = self.visible_indices().last() != Some(&self.selected);
+                self.move_selection(forward);
+                self.app_event_tx
+                    .send(AppEvent::HideAgentsOverviewThread { thread_id });
             }
             return;
         }
@@ -761,7 +636,7 @@ impl BottomPaneView for AgentsOverviewView {
         }
 
         if let Some(action) = self.keymap.action_for(key) {
-            if self.state().renaming
+            if self.state().rename_target.is_some()
                 && matches!(action, ListAction::JumpTop | ListAction::JumpBottom)
             {
                 return;
@@ -777,22 +652,12 @@ impl BottomPaneView for AgentsOverviewView {
                 }
                 ListAction::Accept => self.activate(),
                 ListAction::Cancel => {
-                    let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-                    if state.searching {
-                        state.search.clear();
-                        state.searching = false;
-                        self.selected = 0;
-                    } else if !state.input.is_empty() || state.renaming {
-                        state.input.clear();
-                        state.renaming = false;
-                    } else {
-                        state.focus_composer();
+                    if matches!(self.on_ctrl_c(), CancellationEvent::NotHandled) {
+                        self.state().completion = Some(ViewCompletion::Cancelled);
                     }
                 }
                 ListAction::PageUp | ListAction::PageDown => {
-                    for _ in 0..5 {
-                        self.move_selection(action == ListAction::PageDown);
-                    }
+                    self.page_selection(action);
                 }
                 ListAction::MoveRight if !self.state().editing_metadata() => self.activate(),
                 ListAction::MoveLeft | ListAction::MoveRight => {}

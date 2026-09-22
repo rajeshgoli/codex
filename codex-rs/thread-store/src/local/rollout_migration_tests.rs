@@ -20,6 +20,8 @@ use codex_protocol::mcp::McpResourceOrigin;
 use codex_protocol::mcp::McpResourceOriginCheckpoint;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
@@ -39,6 +41,8 @@ use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::protocol::UserMessageImageKind;
+use codex_protocol::user_input::UserInput;
 use codex_rollout::CompactedItem;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutItem;
@@ -244,6 +248,7 @@ fn compacted(replacement_history: Vec<ResponseItem>) -> RolloutItem {
         window_id: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     })
 }
 
@@ -318,12 +323,21 @@ async fn list_active_summary_turns(store: &LocalThreadStore, thread_id: ThreadId
 async fn migration_publishes_canonical_projected_history_and_is_idempotent() {
     let home = TempDir::new().expect("create Codex home");
     let thread_id = ThreadId::new();
+    let user_event = UserMessageEvent {
+        message: "first question".to_string(),
+        images: Some(vec!["https://example.com/image.png".to_string()]),
+        image_details: vec![Some(ImageDetail::Original)],
+        file_ids: Some(vec!["file_123".to_string()]),
+        file_id_details: vec![Some(ImageDetail::High)],
+        image_order: vec![UserMessageImageKind::File, UserMessageImageKind::Inline],
+        ..Default::default()
+    };
     let path = write_rollout(
         home.path(),
         thread_id,
         SessionSource::Cli,
         vec![
-            user_message("first question"),
+            RolloutItem::EventMsg(EventMsg::UserMessage(user_event)),
             agent_message("first answer"),
         ],
     );
@@ -355,6 +369,32 @@ async fn migration_publishes_canonical_projected_history_and_is_idempotent() {
             .count(),
         2
     );
+    let user_item = lines.iter().find_map(|line| match &line.item {
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+            item: TurnItem::UserMessage(item),
+            ..
+        })) => Some(item),
+        _ => None,
+    });
+    let expected_content = vec![
+        UserInput::Text {
+            text: "first question".to_string(),
+            text_elements: Vec::new(),
+        },
+        UserInput::Image {
+            image: ImageReference::File {
+                file_id: "file_123".to_string(),
+            },
+            detail: Some(ImageDetail::High),
+        },
+        UserInput::Image {
+            image: ImageReference::Inline {
+                image_url: "https://example.com/image.png".to_string(),
+            },
+            detail: Some(ImageDetail::Original),
+        },
+    ];
+    assert_eq!(user_item.map(|item| &item.content), Some(&expected_content));
 
     let turns = list_active_summary_turns(&store, thread_id).await;
     assert_eq!(turns.turns.len(), 1);
@@ -847,13 +887,36 @@ async fn migration_drops_trailing_context_when_rollback_arrives_before_next_turn
 async fn migration_coalesces_response_first_user_message_rollback_boundary() {
     let home = TempDir::new().expect("create Codex home");
     let thread_id = ThreadId::new();
+    let file_id = "file_123".to_string();
+    let response = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "remove question".to_string(),
+            },
+            ContentItem::InputImage {
+                image: ImageReference::File {
+                    file_id: file_id.clone(),
+                },
+                detail: None,
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let event = UserMessageEvent {
+        message: "remove question".to_string(),
+        file_ids: Some(vec![file_id]),
+        ..Default::default()
+    };
     let path = write_rollout(
         home.path(),
         thread_id,
         SessionSource::Cli,
         vec![
-            rollout_response_item(input_response_message("user", "remove question")),
-            user_message("remove question"),
+            rollout_response_item(response),
+            RolloutItem::EventMsg(EventMsg::UserMessage(event)),
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
                 num_turns: 1,
             })),
@@ -1721,6 +1784,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                 window_id: None,
                 compaction_response_id: None,
                 latest_token_usage_record: None,
+                resume_metadata: None,
             }),
             RolloutItem::Compacted(CompactedItem {
                 message: "latest checkpoint".to_string(),
@@ -1745,6 +1809,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                 window_id: None,
                 compaction_response_id: None,
                 latest_token_usage_record: None,
+                resume_metadata: None,
             }),
             started("child-turn"),
             RolloutItem::TurnContext(TurnContextItem {
@@ -2144,7 +2209,7 @@ async fn migration_preserves_legacy_displayed_thread_names() {
     write_rollout(
         home.path(),
         title_thread_id,
-        SessionSource::Cli,
+        SessionSource::SubAgent(SubAgentSource::Other("guardian".to_string())),
         vec![user_message("title question")],
     );
     let index_thread_id = ThreadId::new();
@@ -2154,6 +2219,16 @@ async fn migration_preserves_legacy_displayed_thread_names() {
         SessionSource::Cli,
         vec![user_message("index question")],
     );
+    let guardian_thread_id = ThreadId::new();
+    let unnamed_guardian_thread_id = ThreadId::new();
+    for thread_id in [guardian_thread_id, unnamed_guardian_thread_id] {
+        write_rollout(
+            home.path(),
+            thread_id,
+            SessionSource::SubAgent(SubAgentSource::Other("guardian".to_string())),
+            vec![user_message("large synthetic Guardian prompt")],
+        );
+    }
     let store = indexed_store(home.path()).await;
     store
         .update_thread_metadata(UpdateThreadMetadataParams {
@@ -2173,42 +2248,77 @@ async fn migration_preserves_legacy_displayed_thread_names() {
         .await
         .expect("write legacy index name");
 
-    store
-        .migrate_rollouts(apply_options())
+    // Older metadata cleanup also seeded the default name on legacy threads.
+    let state_db = store.state_db().await.expect("state runtime");
+    let mut guardian_metadata = state_db
+        .get_thread(guardian_thread_id)
         .await
-        .expect("migrate named rollouts");
-
-    let page = store
-        .list_threads(ListThreadsParams {
-            page_size: 10,
-            cursor: None,
-            sort_key: ThreadSortKey::CreatedAt,
-            sort_direction: SortDirection::Desc,
-            allowed_sources: Vec::new(),
-            model_providers: None,
-            cwd_filters: None,
-            section: None,
-            project_id: None,
-            archived: false,
-            search_term: None,
-            relation_filter: None,
-            use_state_db_only: true,
-        })
+        .expect("read Guardian metadata")
+        .expect("Guardian metadata");
+    guardian_metadata.name = Some(codex_state::GUARDIAN_THREAD_TITLE.to_string());
+    state_db
+        .upsert_thread(&guardian_metadata)
         .await
-        .expect("list migrated threads");
-    let title_thread = page
-        .items
-        .iter()
-        .find(|thread| thread.thread_id == title_thread_id)
-        .expect("renamed title thread");
-    let index_thread = page
-        .items
-        .iter()
-        .find(|thread| thread.thread_id == index_thread_id)
-        .expect("indexed title thread");
+        .expect("seed legacy Guardian name");
+    codex_rollout::append_thread_name(home.path(), guardian_thread_id, "indexed Guardian name")
+        .await
+        .expect("write legacy Guardian name");
 
-    assert_eq!(title_thread.name.as_deref(), Some("renamed title"));
-    assert_eq!(index_thread.name.as_deref(), Some("indexed title"));
+    for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+        if history_mode == ThreadHistoryMode::Paginated {
+            store
+                .migrate_rollouts(apply_options())
+                .await
+                .expect("migrate named rollouts");
+        }
+        let page = store
+            .list_threads(ListThreadsParams {
+                page_size: 10,
+                cursor: None,
+                sort_key: ThreadSortKey::CreatedAt,
+                sort_direction: SortDirection::Desc,
+                allowed_sources: Vec::new(),
+                model_providers: None,
+                cwd_filters: None,
+                section: None,
+                project_id: None,
+                archived: false,
+                search_term: None,
+                relation_filter: None,
+                use_state_db_only: true,
+            })
+            .await
+            .expect("list threads");
+        for (thread_id, name) in [
+            (title_thread_id, "renamed title"),
+            (index_thread_id, "indexed title"),
+            (guardian_thread_id, "indexed Guardian name"),
+            (unnamed_guardian_thread_id, "Guardian review"),
+        ] {
+            let listed = page
+                .items
+                .iter()
+                .find(|thread| thread.thread_id == thread_id)
+                .expect("listed thread");
+            let read = store
+                .read_thread(crate::ReadThreadParams {
+                    thread_id,
+                    include_archived: false,
+                    include_history: false,
+                })
+                .await
+                .expect("read thread");
+            assert_eq!(
+                (
+                    listed.name.as_deref(),
+                    read.name.as_deref(),
+                    listed.history_mode,
+                    read.history_mode
+                ),
+                (Some(name), Some(name), history_mode, history_mode),
+            );
+        }
+    }
 }
 
 #[tokio::test]

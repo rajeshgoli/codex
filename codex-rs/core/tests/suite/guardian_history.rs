@@ -13,6 +13,7 @@ use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::models::ImageReference;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -311,8 +312,7 @@ async fn guardian_history_uses_deltas_between_eviction_batches() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_history_survives_compaction_and_eviction_but_not_legacy_rollback_replay()
--> Result<()> {
+async fn guardian_answers_survive_compaction_and_eviction_but_not_rollback() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(
         Ok(()),
@@ -441,7 +441,9 @@ async fn guardian_history_survives_compaction_and_eviction_but_not_legacy_rollba
                     text_elements: Vec::new(),
                 },
                 UserInput::Image {
-                    image_url: image_url.clone(),
+                    image: ImageReference::Inline {
+                        image_url: image_url.clone(),
+                    },
                     detail: None,
                 },
             ]))
@@ -480,8 +482,6 @@ async fn guardian_history_survives_compaction_and_eviction_but_not_legacy_rollba
             assert!(trusted_answers.contains("user: Do not publish anything."));
             let positions = [
                 "Only publish to a private repository.",
-                "tool update_plan call",
-                "tool update_plan result",
                 "Do not publish the attached image.",
             ]
             .map(|text| {
@@ -489,6 +489,8 @@ async fn guardian_history_survives_compaction_and_eviction_but_not_legacy_rollba
                     .find(text)
                     .unwrap_or_else(|| panic!("missing {text}: {transcript}"))
             });
+            assert!(!transcript.contains("tool update_plan call"));
+            assert!(!transcript.contains("tool update_plan result"));
             let mut ordered = positions;
             ordered.sort();
             assert_eq!(positions, ordered);

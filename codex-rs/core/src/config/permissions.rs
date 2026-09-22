@@ -120,7 +120,7 @@ pub(crate) fn validate_user_permission_profile_names(
     Ok(())
 }
 
-pub(crate) fn network_proxy_config_from_profile_network(
+pub fn network_proxy_config_from_profile_network(
     network: Option<&NetworkToml>,
 ) -> NetworkProxyConfig {
     let mut config = network.map_or_else(
@@ -372,7 +372,7 @@ pub struct CompiledPermissionProfile {
 
 /// Resolves a selected profile and its roots using only supplied execution-host facts.
 /// Configured roots are materialized before return; symbolic roots remain available
-/// for runtime workspace selection. Local callers only convert the returned URI types.
+/// for runtime workspace selection. Callers retain URI roots until a native executor boundary.
 pub fn compile_permission_profile(
     permissions: Option<&PermissionsToml>,
     profile_name: &str,

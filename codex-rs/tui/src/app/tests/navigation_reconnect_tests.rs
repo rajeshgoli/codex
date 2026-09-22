@@ -143,20 +143,14 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
         );
         app.agents_overview.visible_thread_ids = view.thread_ids();
         app.chat_widget.show_bottom_pane_view(Box::new(view));
-        if previous_thread.is_some() {
-            app.agents_overview.view_state.lock().unwrap().input = "Keep this task draft".into();
-        } else {
-            app.chat_widget.handle_paste("Keep this task draft".into());
-        }
-        app.agents_overview.view_state.lock().unwrap().renaming = previous_thread.is_some();
-        let draft = |app: &App| {
-            let state = app.agents_overview.view_state.lock().unwrap();
-            if previous_thread.is_some() {
-                state.input.clone()
+        app.agents_overview.view_state.lock().unwrap().input = "Keep this task draft".into();
+        app.agents_overview.view_state.lock().unwrap().rename_target =
+            Some(if previous_thread.is_some() {
+                vanished
             } else {
-                state.composer.as_ref().unwrap().current_text_with_pending()
-            }
-        };
+                selected
+            });
+        let draft = |app: &App| app.agents_overview.view_state.lock().unwrap().input.clone();
         let stale_request = Uuid::new_v4();
         app.agents_overview.request_id = Some(stale_request);
         app.agents_overview.refresh_pending = true;
@@ -169,6 +163,7 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
             socket_path: codex_utils_absolute_path::AbsolutePathBuf::try_from(socket_path.clone())?,
         };
         app.app_server_target = AppServerTarget::LocalDaemon {
+            allow_embedded_fallback: true,
             endpoint: endpoint.clone(),
         };
         let interrupted_setup = previous_thread.is_none() && !overview_initialized;
@@ -413,7 +408,7 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
             .await?;
             assert!(
                 !std::iter::from_fn(|| events.try_recv().ok())
-                    .any(|event| matches!(event, AppEvent::DispatchAgentsOverviewTask { .. }))
+                    .any(|event| matches!(event, AppEvent::NewAgentsOverviewSession { .. }))
             );
         }
         assert!(
@@ -443,20 +438,6 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
             )
             .await?;
 
-            assert!(app.chat_widget.has_active_view());
-            app.handle_tui_event(
-                &mut tui,
-                &mut session,
-                TuiEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            )
-            .await?;
-
-            assert!(app.chat_widget.has_active_view());
-            // Esc returns to the overview composer. Dismiss the retained view explicitly
-            // to inspect the unavailable conversation and its cached draft below.
-            app.agents_overview.view_state.lock().unwrap().completion =
-                Some(crate::bottom_pane::ViewCompletion::Accepted);
-            app.chat_widget.handle_key_event(KeyCode::Null.into());
             assert!(!app.chat_widget.has_active_view());
             assert_eq!(app.current_displayed_thread_id(), Some(id));
             let history = drain_history(&mut app, &mut tui, &mut session, &mut events).await?;

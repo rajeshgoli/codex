@@ -7,8 +7,8 @@ case "${1:-}" in
   --keep-build) keep_build=true ;;
   --help|-h)
     echo "Usage: scripts/rebuild-codex-fork.sh [--keep-build]"
-    echo "Build and install codex-fork and its code-mode host, then clean release artifacts."
-    echo "Use --keep-build to retain the release cache for faster subsequent builds."
+    echo "Build and install codex-fork and its code-mode host, then clean build artifacts."
+    echo "Use --keep-build to retain this build directory for inspection."
     exit 0
     ;;
   "") ;;
@@ -20,9 +20,27 @@ if (( $# > 1 )); then
 fi
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-target_dir="$repo_root/codex-rs/target"
+target_parent="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}}"
 runtime_dir="$repo_root/.codex-fork-runtime"
 cd "$repo_root/codex-rs"
+
+# Own a unique child directory: never clean a caller's shared Cargo cache.
+mkdir -p "$target_parent"
+target_dir="$(mktemp -d "$target_parent/codex-fork-build.XXXXXX")"
+stage_dir=""
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [[ -n "$stage_dir" ]]; then
+    rm -rf -- "$stage_dir" || status=$?
+  fi
+  if [[ "$keep_build" == false ]]; then
+    cargo clean --target-dir "$target_dir" || status=$?
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+printf 'Build artifacts: %s\n' "$target_dir"
 
 export CARGO_INCREMENTAL=0
 export CARGO_PROFILE_RELEASE_DEBUG=0
@@ -39,6 +57,14 @@ os.environ["CODEX_REPO_ROOT"] = str(repo_root)
 sys.path.insert(0, str(repo_root / "scripts"))
 from codex_package.targets import TARGET_SPECS
 from codex_package.v8 import resolve_codex_v8_cargo_env
+from codex_package.version import read_workspace_version
+
+version = read_workspace_version()
+if version.split("-", 1)[0].split("+", 1)[0] == "0.0.0":
+    raise SystemExit(
+        "Set an upstream-compatible workspace.package.version before building codex-fork; "
+        "the 0.0.0 development version hides version-gated models."
+    )
 
 rustc_version = subprocess.check_output(["rustc", "-vV"], text=True)
 host = next(line.removeprefix("host: ") for line in rustc_version.splitlines() if line.startswith("host: "))
@@ -56,7 +82,6 @@ PY
 
 mkdir -p "$runtime_dir"
 stage_dir="$(mktemp -d "$runtime_dir/.install.XXXXXX")"
-trap 'rm -rf -- "$stage_dir"' EXIT
 for binary in codex-fork codex-code-mode-host; do
   install -m 755 "$target_dir/release/$binary" "$stage_dir/$binary"
 done
@@ -69,7 +94,4 @@ mv -f "$stage_dir/codex-fork" "$runtime_dir/codex-fork"
 "$repo_root/bin/codex-fork" --version
 "$repo_root/bin/codex-code-mode-host" --help >/dev/null
 
-if [[ "$keep_build" == false ]]; then
-  cargo clean --release --target-dir "$target_dir"
-fi
 du -sh "$runtime_dir"

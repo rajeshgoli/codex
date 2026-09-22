@@ -6,68 +6,44 @@ use codex_config::types::SessionPickerViewMode;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
-async fn system_reduced_motion_renders_astra_composer_without_sparkles() -> anyhow::Result<()> {
-    use crate::app_event_sender::AppEventSender;
-    use crate::bottom_pane::BottomPane;
-    use crate::bottom_pane::BottomPaneParams;
-    use crate::motion::MotionMode;
-    use crate::render::renderable::Renderable;
-    use crate::tui::FrameRequester;
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
+async fn launch_screen_mode_survives_configuration_reload() -> anyhow::Result<()> {
+    use crate::transcript_mode::TranscriptMode;
+    use codex_config::types::AltScreenMode;
 
     let home = tempfile::tempdir()?;
-    let config = ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(home.path().to_path_buf())
-        .loader_overrides(LoaderOverrides {
-            ignore_project_config: true,
-            ..LoaderOverrides::without_managed_config_for_tests()
-        })
+        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
         .build()
         .await?;
-    let settings = LocalSettings::with_system_motion(&config, MotionMode::Reduced);
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut pane = BottomPane::new(BottomPaneParams {
-        app_event_tx: AppEventSender::new(tx),
-        frame_requester: FrameRequester::test_dummy(),
-        has_input_focus: true,
-        enhanced_keys_supported: false,
-        placeholder_text: "Ask Codex to do anything".into(),
-        disable_paste_burst: true,
-        animations_enabled: settings.tui.animations,
-        skills: None,
-    });
-    pane.set_astra_sparkle("astra", &settings.tui);
-    pane.set_composer_text("Explore the night sky".into(), Vec::new(), Vec::new());
-    crate::terminal_palette::with_test_default_colors(
-        crate::terminal_probe::DefaultColors {
-            fg: (230, 216, 255),
-            bg: (36, 27, 53),
-        },
-        || {
-            for width in [40, 80] {
-                let area = Rect::new(
-                    /*x*/ 0,
-                    /*y*/ 0,
-                    width,
-                    pane.desired_height(width),
-                );
-                let mut buffer = Buffer::empty(area);
-                pane.render(area, &mut buffer);
-                let rows = buffer
-                    .content
-                    .chunks(usize::from(width))
-                    .map(|row| {
-                        row.iter()
-                            .map(ratatui::buffer::Cell::symbol)
-                            .collect::<String>()
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                insta::assert_snapshot!(format!("system_reduced_motion_astra_{width}"), rows);
-            }
-        },
-    );
+    config.tui_fullscreen_transcript = true;
+    config.tui_alternate_screen = AltScreenMode::Auto;
+
+    for (alternate_screen, owned, expected_mode, expected_alt) in [
+        (true, true, TranscriptMode::Owned, AltScreenMode::Auto),
+        (true, false, TranscriptMode::Terminal, AltScreenMode::Auto),
+        (false, true, TranscriptMode::Terminal, AltScreenMode::Never),
+    ] {
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        tui.set_alt_screen_enabled(alternate_screen);
+        tui.set_owned_screen(owned)?;
+        let local = LocalSettings::for_tui(&config, &tui);
+        assert_eq!(
+            (local.transcript_mode, local.tui.alternate_screen),
+            (expected_mode, expected_alt),
+        );
+
+        let mut reloaded_config = config.clone();
+        reloaded_config.tui_fullscreen_transcript = false;
+        reloaded_config.tui_alternate_screen = AltScreenMode::Never;
+        reloaded_config.tui_theme = Some("nord".into());
+        let mut expected = LocalSettings::from(&reloaded_config);
+        expected.transcript_mode = expected_mode;
+        expected.tui.alternate_screen = expected_alt;
+        assert_eq!(local.reloaded(&reloaded_config), expected);
+        assert_eq!(LocalSettings::for_tui(&reloaded_config, &tui), expected);
+        tui.set_owned_screen(/*owned*/ false)?;
+    }
     Ok(())
 }
 
@@ -78,7 +54,7 @@ async fn system_motion_suppresses_animations_without_changing_saved_preferences(
 
     for configured in [true, false] {
         let home = tempfile::tempdir()?;
-        let config_text = format!("[tui]\nanimations = {configured}\nwhimsy = true\n");
+        let config_text = format!("[tui]\nanimations = {configured}\n");
         std::fs::write(home.path().join("config.toml"), &config_text)?;
         let config = ConfigBuilder::default()
             .codex_home(home.path().to_path_buf())
@@ -88,8 +64,16 @@ async fn system_motion_suppresses_animations_without_changing_saved_preferences(
             })
             .build()
             .await?;
-        let animated = LocalSettings::with_system_motion(&config, MotionMode::Animated);
-        let reduced = LocalSettings::with_system_motion(&config, MotionMode::Reduced);
+        let animated = LocalSettings::with_accessibility_preferences(
+            &config,
+            MotionMode::Animated,
+            MotionMode::Animated,
+        );
+        let reduced = LocalSettings::with_accessibility_preferences(
+            &config,
+            MotionMode::Reduced,
+            MotionMode::Animated,
+        );
         let mut expected = animated.clone();
         expected.tui.animations = false;
         assert_eq!(reduced, expected);
@@ -110,13 +94,21 @@ async fn local_load_preserves_defaults_and_resolved_overrides() -> anyhow::Resul
         r#"
 [tui]
 animations = false
-whimsy = false
+whimsy = false # Retired: must not override effects or prevent strict loading.
 show_tooltips = false
 show_server_version_notice = false
 auto_recap = false
+fullscreen_transcript = true
 vim_mode_default = true
 terminal_resize_reflow_max_rows = 0
 session_picker_view = "comfortable"
+[tui.effects]
+shimmer = false
+[tui.rendering]
+mermaid = false
+math = false
+tables = false
+lists = false
 [history]
 persistence = "none"
 max_bytes = 4096
@@ -128,28 +120,56 @@ fast_default_opt_out = true
         std::fs::write(home.path().join("config.toml"), config_text)?;
         let config = ConfigBuilder::default()
             .codex_home(home.path().to_path_buf())
+            .strict_config(true)
             .loader_overrides(LoaderOverrides {
                 ignore_project_config: true,
                 ..LoaderOverrides::without_managed_config_for_tests()
             })
-            .cli_overrides(vec![("tui.disable_paste_burst".into(), true.into())])
+            .cli_overrides(vec![
+                ("tui.disable_paste_burst".into(), true.into()),
+                // The deprecated flag must not override or migrate into the TUI preference.
+                (
+                    "features.transcript_v2".into(),
+                    config_text.is_empty().into(),
+                ),
+            ])
             .build()
             .await?;
+        assert_eq!(config.startup_warnings, Vec::<String>::new());
         let local = LocalSettings::from(&config);
         let mut expected: Tui = toml::from_str("")?;
         expected.disable_paste_burst = Some(true);
         expected.session_picker_view = Some(SessionPickerViewMode::Dense);
         if !config_text.is_empty() {
             expected.animations = false;
-            expected.whimsy = false;
+            expected.effects.shimmer = false;
+            expected.rendering = codex_config::types::TuiRendering {
+                mermaid: false,
+                math: false,
+                tables: false,
+                lists: false,
+            };
             expected.show_tooltips = false;
             expected.show_server_version_notice = false;
             expected.auto_recap = false;
+            expected.fullscreen_transcript = true;
             expected.vim_mode_default = true;
             expected.terminal_resize_reflow_max_rows = Some(0);
             expected.session_picker_view = Some(SessionPickerViewMode::Comfortable);
         }
+        assert_eq!(
+            local.transcript_mode.is_owned(),
+            expected.fullscreen_transcript
+        );
         assert_eq!(local.tui, expected);
+        assert_eq!(
+            config
+                .features
+                .legacy_feature_usages()
+                .map(|usage| usage.alias.as_str())
+                .collect::<Vec<_>>(),
+            vec!["features.transcript_v2"],
+        );
         assert_eq!(
             local.terminal_resize_reflow(),
             config.terminal_resize_reflow
@@ -204,5 +224,34 @@ async fn local_writes_preserve_selected_user_file_and_home_destinations() -> any
         Some("comfortable")
     );
     assert_eq!(home_config["tui"].get("theme"), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn screen_reader_default_yields_to_preferences_on_reload() -> anyhow::Result<()> {
+    use crate::motion::MotionMode;
+
+    let home = tempfile::tempdir()?;
+    for (config_text, expected) in [
+        ("", false),
+        ("[tui]\nanimations = true\n", true),
+        ("[tui]\nanimations = false\n", false),
+    ] {
+        std::fs::write(home.path().join("config.toml"), config_text)?;
+        let config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .loader_overrides(LoaderOverrides {
+                ignore_project_config: true,
+                ..LoaderOverrides::without_managed_config_for_tests()
+            })
+            .build()
+            .await?;
+        let local = LocalSettings::with_accessibility_preferences(
+            &config,
+            MotionMode::Animated,
+            MotionMode::Reduced,
+        );
+        assert_eq!(local.tui.animations, expected);
+    }
     Ok(())
 }

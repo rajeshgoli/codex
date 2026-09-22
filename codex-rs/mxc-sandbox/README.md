@@ -7,9 +7,8 @@ dispatcher, edits host ACLs, creates sandbox users, runs setup, or requests
 elevation. The existing Codex Windows sandboxes remain separate backends.
 
 Windows executors record `codex.windows_mxc.available` once per process with an
-`available=true|false` tag. This measures capability independently of selection.
-The exec-server handshake also exposes `windows_mxc_available`; older or
-unsupported Windows executors reject MXC requests before execution.
+`available=true|false` tag. This measures runtime availability independently of
+selection. Unsupported Windows executors reject MXC requests before execution.
 
 `is_available()` uses MXC's cached create/close probe, rather than an OS build
 number or the SDK's broad `platform_support()` result. The latter also reports
@@ -47,10 +46,14 @@ to 4096 bytes; the helper removes them before native process creation. Use
   semantics and scan limits as the existing Windows sandbox.
 - Native deny paths depend on the host's capability probe. An installed Windows
   update alone is not treated as evidence that every policy feature is enabled.
-- This adapter rejects managed networking with `allow_local_binding=false`:
-  its host-loopback permission is bidirectional. MXC's proxy-peer identity mode
-  is not integrated here. With local binding enabled, direct DNS remains denied,
-  matching the existing Windows sandbox.
+- When MXC is the executor's selected backend, managed networking defaults
+  `allow_local_binding` to `true`. An effective `false` after applying managed
+  requirements is a configuration error: native host-loopback access
+  is bidirectional, and MXC's proxy-peer identity mode is not integrated here.
+  `true` permits local servers and direct host-loopback connections and removes
+  the proxy's additional private-network destination checks. Proxy domain rules
+  still apply to proxied traffic; direct DNS remains denied. This default also
+  applies to remote Windows executors and does not enable disabled networking.
 - Windows volume-root grants do not recurse. The adapter grants the root and
   its immediate children; directories added or newly mounted during a running
   command are not implicitly granted.

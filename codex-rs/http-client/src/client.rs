@@ -1,4 +1,4 @@
-//! Reusable HTTP client and request-builder wrappers.
+//! Reusable HTTP client wrappers and request construction shared by fixed and route-aware transports.
 
 use http::Error as HttpRequestBuildError;
 use http::HeaderMap;
@@ -38,6 +38,12 @@ impl HttpClient {
     /// the caller above the HTTP transport boundary.
     pub fn new_without_request_logging(inner: reqwest::Client) -> Self {
         Self::from_parts(inner, RequestLogging::Disabled)
+    }
+
+    /// Suppresses URL and response-header diagnostics while preserving this client's routing.
+    pub fn without_request_logging(mut self) -> Self {
+        self.request_logging = RequestLogging::Disabled;
+        self
     }
 
     pub(crate) fn from_parts(inner: reqwest::Client, request_logging: RequestLogging) -> Self {
@@ -241,6 +247,10 @@ impl RequestBuilder {
         B: Into<reqwest::Body>,
     {
         self.map(|builder| builder.body(body))
+    }
+
+    pub(crate) fn build(self) -> Result<reqwest::Request, HttpError> {
+        self.builder.build()
     }
 
     pub async fn send(self) -> Result<HttpResponse, HttpError> {

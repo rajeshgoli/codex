@@ -157,9 +157,6 @@ impl App {
             approvals_reviewer,
             permission_profile: _,
             active_permission_profile,
-            // TODO(anp): Support Windows sandbox updates through environment configuration;
-            // thread/settings/update cannot currently represent this override.
-            windows_sandbox_level: _,
             model,
             effort,
             summary,
@@ -195,6 +192,9 @@ impl App {
         thread_id: ThreadId,
         settings: &ThreadSettings,
     ) {
+        if let Some(blank) = self.agents_overview.blank_sessions.get_mut(&thread_id) {
+            apply_thread_settings_to_session(&mut blank.session, settings);
+        }
         if self.primary_thread_id == Some(thread_id)
             && let Some(session) = self.primary_session_configured.as_mut()
         {

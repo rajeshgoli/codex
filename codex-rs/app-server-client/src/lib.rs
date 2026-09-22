@@ -214,6 +214,7 @@ impl InProcessClientStartArgs {
     /// Builds initialize params from caller-provided metadata.
     pub fn initialize_params(&self) -> InitializeParams {
         let capabilities = InitializeCapabilities {
+            explicit_gateway_oauth: false,
             experimental_api: self.experimental_api,
             request_attestation: false,
             extensions: None,
@@ -1354,6 +1355,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
                     })
@@ -1408,6 +1410,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
                     })
@@ -1484,6 +1487,7 @@ mod tests {
         assert_eq!(
             response,
             GetAccountResponse {
+                workspace_routing: None,
                 account: None,
                 requires_openai_auth: false,
             }
@@ -1587,6 +1591,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
                     })
@@ -1640,6 +1645,7 @@ mod tests {
         assert_eq!(
             first_response,
             GetAccountResponse {
+                workspace_routing: None,
                 account: None,
                 requires_openai_auth: false,
             }

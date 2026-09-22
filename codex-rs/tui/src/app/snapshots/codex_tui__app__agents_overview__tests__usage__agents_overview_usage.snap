@@ -2,13 +2,13 @@
 source: tui/src/app/agents_overview_usage_tests.rs
 expression: "render_bottom_popup(&app.chat_widget,\n96).replace(&format!(\"{project}  2\"),\n&group).replace(&project, \"/tmp/project\").replace(\"fwd del\", \"del\")"
 ---
-  Agent command center
-  1 need input   0 working   1 ready
+  Agent command center  Group: Project  g
+   All 2   Needs you 1   Working 0   Ready 1   Inactive 0                 tab/shift+tab filter
   ────────────────────────────────────────────────────────────────────────────────────────────
-  /tmp/project  2                                     │ Task details
-  › ● Review parser  Needs input                      │
-    ○ Other task  Ready                               │ Review parser
-                                                      │ ● Needs input
+      Tasks                                           │ Task details
+  /tmp/project  2                                     │
+  › ● Review parser                                   │ Review parser
+    ○ Other task                                      │ ● Needs input
                                                       │
                                                       │ Needs attention
                                                       │ Which dependency version should I use?
@@ -20,9 +20,9 @@ expression: "render_bottom_popup(&app.chat_widget,\n96).replace(&format!(\"{proj
                                                       │ Tokens: 13K in · 4K out
                                                       │ Est. usage: 5 credits · ~$0.20
                                                       │
+                                                      │ Prompt
+                                                      │ Review parser
                                                       │
-  New task
-
-› Describe a new task
-
-   enter create task    ctrl+j newline    esc tasks    → open task
+                                                      │
+                                                      │
+  ? help  esc back  ↑/↓ move  enter open  n new

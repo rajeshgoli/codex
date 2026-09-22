@@ -1,3 +1,4 @@
+use crate::route_aware_redirect::MAX_REDIRECTS;
 use std::collections::HashMap;
 use std::io;
 use std::io::Read;
@@ -18,6 +19,206 @@ use tracing_subscriber::layer::SubscriberExt;
 
 use super::*;
 use crate::OutboundProxyPolicy;
+
+#[test]
+fn request_draft_preserves_reqwest_url_auth_and_header_precedence() {
+    let pool = manual_redirect_pool();
+    let client = HttpClientBuilder::new()
+        .build_direct()
+        .expect("client should build");
+    for url in [
+        "https://example.com/path",
+        "https://user:p%40ss@example.com/path",
+        "https://:%E2%98%83@example.com/path",
+        "https://%FF:password@example.com/path",
+    ] {
+        let headers = HeaderMap::from_iter([
+            (
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer replacement"),
+            ),
+            (
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/custom+json"),
+            ),
+        ]);
+        for (actual, expected) in [
+            (pool.post(url), client.post(url)),
+            (
+                pool.post(url)
+                    .header(http::header::AUTHORIZATION, "Bearer appended"),
+                client
+                    .post(url)
+                    .header(http::header::AUTHORIZATION, "Bearer appended"),
+            ),
+            (
+                pool.post(url)
+                    .header(http::header::AUTHORIZATION, "Bearer first")
+                    .headers(headers.clone())
+                    .header(http::header::AUTHORIZATION, "Bearer last"),
+                client
+                    .post(url)
+                    .header(http::header::AUTHORIZATION, "Bearer first")
+                    .headers(headers)
+                    .header(http::header::AUTHORIZATION, "Bearer last"),
+            ),
+            (
+                pool.post(url)
+                    .header(CONTENT_TYPE, "application/custom+json")
+                    .headers(HeaderMap::new()),
+                client
+                    .post(url)
+                    .header(CONTENT_TYPE, "application/custom+json")
+                    .headers(HeaderMap::new()),
+            ),
+            (
+                pool.post(url).json(&serde_json::json!({"previous": true})),
+                client
+                    .post(url)
+                    .json(&serde_json::json!({"previous": true})),
+            ),
+        ] {
+            let body = serde_json::json!({"query": "test"});
+            let timeout = Duration::from_secs(7);
+            let actual = actual
+                .json(&body)
+                .timeout(timeout)
+                .request
+                .expect("request inputs should be valid")
+                .build(&client)
+                .expect("request should build");
+            let expected = expected
+                .json(&body)
+                .timeout(timeout)
+                .build()
+                .expect("reqwest should build");
+            assert_eq!(
+                (
+                    actual.url(),
+                    actual.method(),
+                    actual.headers(),
+                    actual.body().and_then(reqwest::Body::as_bytes),
+                    actual.timeout()
+                ),
+                (
+                    expected.url(),
+                    expected.method(),
+                    expected.headers(),
+                    expected.body().and_then(reqwest::Body::as_bytes),
+                    expected.timeout()
+                ),
+            );
+            assert_eq!(
+                actual
+                    .headers()
+                    .values()
+                    .map(HeaderValue::is_sensitive)
+                    .collect::<Vec<_>>(),
+                expected
+                    .headers()
+                    .values()
+                    .map(HeaderValue::is_sensitive)
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn initial_url_auth_is_built_once_after_routing_and_retained_only_on_same_origin_redirects() {
+    let (first_proxy, first_server) = spawn_response_server(vec![
+        "HTTP/1.1 302 Found\r\nLocation: http://other:secret@origin.test/same?route=2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        "HTTP/1.1 302 Found\r\nLocation: http://other:secret@other.test/final?route=3\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+    ]);
+    let (last_proxy, last_server) = spawn_response_server(vec![
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+    ]);
+    let urls = [
+        "http://user:pass@origin.test/start?route=1",
+        "http://other:secret@origin.test/same?route=2",
+        "http://other:secret@other.test/final?route=3",
+    ];
+    let resolver = FakeRouteResolver::new(
+        urls.iter()
+            .zip([first_proxy, first_proxy, last_proxy])
+            .map(|(url, proxy)| {
+                (
+                    url.to_string(),
+                    OutboundProxyRoute::Proxy {
+                        url: format!("http://{proxy}"),
+                        no_proxy: None,
+                    },
+                )
+            })
+            .collect(),
+    );
+    let pool = manual_redirect_pool();
+    let request = pool
+        .get(urls[0])
+        .timeout(Duration::from_secs(3))
+        .request
+        .expect("valid request");
+    let response = pool
+        .send_with_resolver(request, |url| resolver.resolve(url))
+        .await
+        .expect("request should follow both redirects");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(resolver.observed_urls(), urls.map(str::to_string));
+    let mut requests = first_server.join().expect("first proxy should finish");
+    requests.extend(last_server.join().expect("last proxy should finish"));
+    let auth = requests
+        .iter()
+        .map(|request| {
+            request
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .map(|(_, value)| value.trim())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        auth,
+        vec![
+            vec!["Basic dXNlcjpwYXNz"],
+            vec!["Basic dXNlcjpwYXNz"],
+            vec![]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn fixed_transport_preserves_url_auth_and_explicit_authorization() {
+    use crate::HttpTransport;
+    use crate::ReqwestTransport;
+    for authorization in [None, Some("Bearer explicit")] {
+        let (address, server) = spawn_response_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        ]);
+        let client = HttpClientBuilder::new()
+            .build_direct()
+            .expect("client should build");
+        let transport = ReqwestTransport::from_http_client(client);
+        let mut request = crate::Request::new(Method::GET, format!("http://user:pass@{address}/"));
+        if let Some(authorization) = authorization {
+            request
+                .headers
+                .insert(http::header::AUTHORIZATION, authorization.parse().unwrap());
+        }
+        transport
+            .execute(request)
+            .await
+            .expect("transport should send");
+        let requests = server.join().expect("server should finish");
+        let auth = requests[0]
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.trim())
+            .collect::<Vec<_>>();
+        assert_eq!(auth, vec![authorization.unwrap_or("Basic dXNlcjpwYXNz")]);
+    }
+}
 
 #[tokio::test]
 async fn request_failures_classify_real_untrusted_certificate_handshakes() {
@@ -123,7 +324,9 @@ fn request_builder_debug_redacts_url_secrets() {
         format!("{request:?}"),
         concat!(
             "RouteAwareRequestBuilder { pool: RouteAwareClientPool { ",
-            "http_client_factory: HttpClientFactory { outbound_proxy_policy: ReqwestDefault }, ",
+            "http_client_factory: HttpClientFactory { outbound_proxy_policy: ReqwestDefault, ",
+            "system_proxy_fallback: false, ",
+            "network_policy: NetworkPolicy { managed: false, .. } }, ",
             "route_class: Api, .. }, method: Some(GET), ",
             "url: Some(\"<redacted>\"), .. }"
         )
@@ -402,6 +605,13 @@ async fn reqwest_default_route_preserves_transport_redirects() {
                     Err(error) => panic!("redirect server should accept: {error}"),
                 }
             };
+            // Accepted sockets inherit the listener's nonblocking mode on macOS.
+            stream
+                .set_nonblocking(false)
+                .expect("redirect stream should become blocking");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("redirect stream should get a read timeout");
             let mut buffer = [0_u8; 1024];
             let size = stream
                 .read(&mut buffer)

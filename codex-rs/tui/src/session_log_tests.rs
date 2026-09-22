@@ -7,7 +7,7 @@ fn inbound_fallback_records_only_variant_names() {
     let directory = tempfile::tempdir().expect("temporary log directory");
     let path = directory.path().join("session.jsonl");
     let logger = SessionLogger::new();
-    logger.open(path.clone()).expect("open session log");
+    logger.open_legacy(path.clone()).expect("open session log");
     for event in [
         AppEvent::CopySelection {
             text: Arc::from("private plan without parentheses"),

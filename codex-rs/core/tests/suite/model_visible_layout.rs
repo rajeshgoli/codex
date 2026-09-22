@@ -90,7 +90,7 @@ fn skills_extensions() -> Arc<ExtensionRegistry<Config>> {
         include_instructions: config.include_skill_instructions,
         max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: config.bundled_skills_enabled(),
-        orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+        cloud_skill_enabled: config.cloud_skill_enabled,
         shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
     });
     Arc::new(extensions.build())
@@ -549,10 +549,6 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
         .with_config(|config| {
             config.update_plan_enabled = true;
             config.model = Some("gpt-5.4".to_string());
-            config
-                .features
-                .enable(Feature::Personality)
-                .expect("test config should allow feature update");
             config.personality = Some(Personality::Pragmatic);
         });
     let resumed = resume_builder.restart(&server, &initial).await?;

@@ -367,7 +367,6 @@ async fn windows_restricted_token_rejects_exact_and_glob_deny_read_policy() -> a
             network_environment_id: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
-            windows_sandbox_private_desktop: false,
             justification: None,
             arg0: None,
         },
@@ -375,6 +374,7 @@ async fn windows_restricted_token_rejects_exact_and_glob_deny_read_policy() -> a
         &cwd,
         std::slice::from_ref(&cwd),
         &None,
+        /*codex_self_exe*/ &None,
         /*use_legacy_landlock*/ false,
         /*stdout_stream*/ None,
     )
@@ -416,7 +416,6 @@ async fn windows_elevated_does_not_create_missing_workspace_metadata() -> anyhow
             network_environment_id: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level: WindowsSandboxLevel::Elevated,
-            windows_sandbox_private_desktop: false,
             justification: None,
             arg0: None,
         },
@@ -424,6 +423,7 @@ async fn windows_elevated_does_not_create_missing_workspace_metadata() -> anyhow
         &cwd,
         std::slice::from_ref(&cwd),
         &None,
+        /*codex_self_exe*/ &None,
         /*use_legacy_landlock*/ false,
         /*stdout_stream*/ None,
     )
@@ -595,7 +595,6 @@ async fn windows_elevated_enforces_deny_read_and_protects_setup_marker() -> anyh
             network_environment_id: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level: WindowsSandboxLevel::Elevated,
-            windows_sandbox_private_desktop: false,
             justification: None,
             arg0: None,
         },
@@ -603,6 +602,7 @@ async fn windows_elevated_enforces_deny_read_and_protects_setup_marker() -> anyh
         &cwd,
         std::slice::from_ref(&cwd),
         &None,
+        /*codex_self_exe*/ &None,
         /*use_legacy_landlock*/ false,
         /*stdout_stream*/ None,
     )

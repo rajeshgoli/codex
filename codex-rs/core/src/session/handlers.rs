@@ -1,3 +1,4 @@
+use super::Submission;
 use crate::realtime_conversation::handle_audio as handle_realtime_conversation_audio;
 use crate::realtime_conversation::handle_close as handle_realtime_conversation_close;
 use crate::realtime_conversation::handle_speech as handle_realtime_conversation_speech;
@@ -5,7 +6,6 @@ use crate::realtime_conversation::handle_start as handle_realtime_conversation_s
 use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
 use async_channel::Receiver;
 use codex_otel::set_parent_from_w3c_trace_context;
-use codex_protocol::protocol::Submission;
 use tracing::Instrument;
 use tracing::debug_span;
 use tracing::info_span;
@@ -241,6 +241,8 @@ pub async fn reload_user_config(sess: &Arc<Session>) {
 }
 
 pub async fn compact(sess: &Arc<Session>, sub_id: String) {
+    // Stop the old turn before the compact task picks up the next turn's environments.
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
     let turn_context = sess
         .new_turn_with_default_settings(sub_id, Default::default())
         .await;
@@ -308,12 +310,12 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
         sess.mcp_refresh.close();
         sess.services.mcp_runtime.shutdown().await;
     }
-    sess.guardian_review_session().shutdown().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
+    emit_thread_stop_lifecycle(sess).await;
 }
 
-pub(super) async fn emit_thread_stop_lifecycle(sess: &Session) {
+async fn emit_thread_stop_lifecycle(sess: &Session) {
     for contributor in sess.services.extensions.thread_lifecycle_contributors() {
         contributor
             .on_thread_stop(codex_extension_api::ThreadStopInput {
@@ -337,8 +339,6 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         i64::try_from(turn_count).unwrap_or(0),
         &[],
     );
-
-    emit_thread_stop_lifecycle(sess.as_ref()).await;
 
     // Gracefully flush and shutdown thread persistence on session end so tests
     // that inspect durable state do not race with the background writer.
@@ -426,6 +426,11 @@ pub(super) async fn submission_loop(
             match sub.op {
                 Op::Interrupt => {
                     interrupt(&sess).await;
+                    false
+                }
+                Op::InterruptIfNoPendingInput { turn_id, reply } => {
+                    sess.interrupt_turn_if_no_pending_input(&turn_id, reply)
+                        .await;
                     false
                 }
                 Op::CleanBackgroundTerminals => {
@@ -598,6 +603,7 @@ pub(super) async fn submission_loop(
         }
         .instrument(dispatch_span)
         .await;
+        drop(sub.residency_guard);
         if should_exit {
             shutdown_received = true;
             break;
@@ -607,7 +613,6 @@ pub(super) async fn submission_loop(
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
         shutdown_session_runtime(&sess).await;
-        emit_thread_stop_lifecycle(sess.as_ref()).await;
         if let Some(live_thread) = sess.live_thread()
             && let Err(err) = live_thread.shutdown().await
         {
