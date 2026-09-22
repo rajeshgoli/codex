@@ -15,6 +15,8 @@ use test_case::test_case;
 
 const PARAMETERS: &str = r#"{"type":"object","properties":{"cell_id":{"type":"string","description":"Catalog cell identifier."}},"required":["cell_id"],"additionalProperties":false}"#;
 
+#[test_case(ToolMode::CodeMode, json!({"description":"x".repeat(1_001),"parameters":PARAMETERS}), true; "oversized_description_preserves_parameters")]
+#[test_case(ToolMode::CodeModeOnly, json!({"description":"Catalog wait.","parameters":format!("{PARAMETERS}{}", " ".repeat(1_001))}), false; "oversized_parameters_preserve_description")]
 #[test_case(ToolMode::CodeMode, json!({"description":"  Catalog wait. {{ literal }}\n"}), false; "description_only")]
 #[test_case(ToolMode::CodeMode, json!({"parameters":PARAMETERS}), true; "parameters_only")]
 #[test_case(ToolMode::CodeModeOnly, json!({"description":"Catalog wait.","parameters":PARAMETERS}), true; "both_in_code_mode_only")]
@@ -62,12 +64,55 @@ async fn code_mode_wait_overrides_are_independent(
         .iter_mut()
         .find(|tool| tool["name"] == "wait")
         .expect("wait");
-    if let Some(description) = overrides["description"].as_str() {
+    if let Some(description) = overrides["description"]
+        .as_str()
+        .filter(|text| text.len() <= 1_000)
+    {
         wait["description"] = json!(description);
     }
     if valid_parameters {
         wait["parameters"] = serde_json::from_str(PARAMETERS)?;
     }
     assert_eq!(requests[1].body_json()["tools"], expected);
+    Ok(())
+}
+
+#[test_case(json!({"exec":{"description":"x".repeat(1_001)}}); "exec_description")]
+#[test_case(json!({"deferred_nested_tools_guidance":"界".repeat(334)}); "deferred_guidance")]
+#[test_case(json!({"mcp_typescript_preamble":"x".repeat(1_001)}); "mcp_preamble")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_oversized_exec_fields_use_bundled_tools(overrides: Value) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let mock = mount_sse_sequence(
+        &server,
+        vec![sse_completed("bundled"), sse_completed("catalog")],
+    )
+    .await;
+    for messages in [
+        None,
+        Some(serde_json::from_value::<ToolMessages>(
+            json!({"code_mode": overrides}),
+        )?),
+    ] {
+        let test = test_codex()
+            .with_model_info_override("gpt-5.5", move |model| {
+                model.tool_mode = Some(ToolMode::CodeModeOnly);
+                model.use_responses_lite = false;
+                model.model_messages.as_mut().expect("model messages").tools = messages;
+            })
+            .with_config(|config| {
+                config.code_mode.disable_in_process_fallback = true;
+            })
+            .build_with_auto_env(&server)
+            .await?;
+        test.submit_turn("Inspect the available tools.").await?;
+    }
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].body_json()["tools"],
+        requests[0].body_json()["tools"]
+    );
     Ok(())
 }

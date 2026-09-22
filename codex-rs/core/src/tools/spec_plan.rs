@@ -870,6 +870,7 @@ fn register_code_mode_executors(
     enabled_tools
         .sort_by(|left, right| compare_code_mode_tools(left, right, &namespace_descriptions));
     let model_messages = ResolvedModelMessages::from_model(model_info);
+    let code_mode_messages = model_messages.code_mode();
     let execute_handler = CodeModeExecuteHandler::new(
         create_code_mode_tool(
             &enabled_tools,
@@ -882,7 +883,7 @@ fn register_code_mode_executors(
             } else {
                 codex_code_mode::ImageDetailVisibility::Visible
             },
-            model_messages.code_mode(),
+            code_mode_messages.as_ref(),
         ),
         code_mode_nested_tool_specs,
     );

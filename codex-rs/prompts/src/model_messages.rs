@@ -191,19 +191,53 @@ impl<'a> ResolvedModelMessages<'a> {
         tool.as_ref()
     }
 
-    /// Selects Code Mode messages; bundled text and runtime composition belong to the tool owner.
-    pub fn code_mode(&self) -> Option<&'a CodeModeToolMessages> {
-        self.catalog_messages?.tools.as_ref()?.code_mode.as_ref()
+    /// Selects bounded Code Mode overrides, retaining independent fallback for each field.
+    pub fn code_mode(&self) -> Option<CodeModeToolMessages> {
+        let messages = self.catalog_messages?.tools.as_ref()?.code_mode.as_ref()?;
+        let bounded = |value: &Option<String>| {
+            value
+                .as_deref()
+                .filter(|text| text.len() <= MAX_CATALOG_TOOL_MESSAGE_BYTES)
+                .map(str::to_owned)
+        };
+        let bounded_tool = |tool: &ToolMessage| ToolMessage {
+            description: bounded(&tool.description),
+            parameters: bounded(&tool.parameters),
+        };
+        Some(CodeModeToolMessages {
+            exec: messages.exec.as_ref().map(bounded_tool),
+            wait: messages.wait.as_ref().map(bounded_tool),
+            deferred_nested_tools_guidance: bounded(&messages.deferred_nested_tools_guidance),
+            mcp_typescript_preamble: bounded(&messages.mcp_typescript_preamble),
+        })
     }
 
-    /// Selects wait's complete description.
+    /// Selects wait's bounded description without allocating other Code Mode fields.
     pub fn code_mode_wait_description_override(&self) -> Option<&'a str> {
-        self.code_mode()?.wait.as_ref()?.description.as_deref()
+        self.catalog_messages?
+            .tools
+            .as_ref()?
+            .code_mode
+            .as_ref()?
+            .wait
+            .as_ref()?
+            .description
+            .as_deref()
+            .filter(|text| text.len() <= MAX_CATALOG_TOOL_MESSAGE_BYTES)
     }
 
-    /// Selects wait's parameter schema. Exec uses a harness-owned freeform grammar.
+    /// Selects wait's bounded parameter schema. Exec uses a harness-owned freeform grammar.
     pub fn code_mode_wait_parameters_override(&self) -> Option<&'a str> {
-        self.code_mode()?.wait.as_ref()?.parameters.as_deref()
+        self.catalog_messages?
+            .tools
+            .as_ref()?
+            .code_mode
+            .as_ref()?
+            .wait
+            .as_ref()?
+            .parameters
+            .as_deref()
+            .filter(|text| text.len() <= MAX_CATALOG_TOOL_MESSAGE_BYTES)
     }
 
     /// Resolves persistent-mode instructions without deciding whether the mode is active.
