@@ -12,12 +12,17 @@ All changes merge through pull requests targeting `main`.
 
 ## CI Baseline
 
-Fork CI baseline uses upstream workflows already in this repository:
+Fork CI is `.github/workflows/sm-fork-baseline.yml` and nothing else. It builds
+the bridge-critical crates, tests `codex-protocol`, and checks that no other
+workflow is enabled.
 
-- `.github/workflows/ci.yml`
-- `.github/workflows/rust-ci.yml`
+Every upstream workflow stays disabled in the fork's Actions settings. They
+target OpenAI's private `codex-runners` runner group and paid large macOS/ARM
+runners, so on this fork they fail before running any code. Disabling them in
+settings, rather than editing the files, keeps upstream syncs conflict-free.
 
-A bootstrap commit is used to verify GitHub Actions runs successfully on this fork's `main` branch.
+When an upstream sync adds a workflow, the `workflow-allowlist` job fails and
+prints the path. Disable it with `gh workflow disable -R rajeshgoli/codex <path>`.
 
 ## Upstream Sync Workflow
 
@@ -27,7 +32,7 @@ Cadence: weekly (or immediately for high-priority upstream fixes).
 2. Create `sync/upstream-<yyyymmdd>` from current fork `main`.
 3. Merge `upstream/main` into the sync branch.
 4. Resolve conflicts with Session Manager bridge patches favored only where required.
-5. Run fork CI and Session Manager bridge conformance checks.
+5. Run fork CI (`sm-fork-baseline`) and Session Manager bridge conformance checks.
 6. Open PR into `main` and merge after review.
 
 If sync conflicts are large, split into:

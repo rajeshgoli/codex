@@ -22,3 +22,25 @@ jobs:
         run: cargo build -p codex-core -p codex-protocol --locked
       - name: Test bridge protocol contract crate
         run: cargo test -p codex-protocol --locked
+
+  # Upstream workflows need OpenAI's private runner group and paid large
+  # runners, so they cannot pass on this fork. They stay disabled in repo
+  # settings; this job fails when an upstream sync brings in a new one.
+  workflow-allowlist:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    steps:
+      - name: Only sm-fork-baseline may be enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          enabled=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.state == "active") | .path' \
+            | grep -vx '.github/workflows/sm-fork-baseline.yml' || true)
+          if [ -n "$enabled" ]; then
+            echo "Upstream workflows are enabled on the fork:"
+            echo "$enabled"
+            echo "Disable each with: gh workflow disable -R ${GITHUB_REPOSITORY} <path>"
+            exit 1
+          fi
