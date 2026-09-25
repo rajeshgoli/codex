@@ -35,9 +35,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          enabled=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows" --paginate \
-            --jq '.workflows[] | select(.state == "active") | .path' \
-            | grep -vx '.github/workflows/sm-fork-baseline.yml' || true)
+          active=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.state == "active") | .path')
+          if ! grep -qx '.github/workflows/sm-fork-baseline.yml' <<<"$active"; then
+            echo "Workflow list does not include sm-fork-baseline; cannot verify."
+            exit 1
+          fi
+          enabled=$(grep -vx '.github/workflows/sm-fork-baseline.yml' <<<"$active" || true)
           if [ -n "$enabled" ]; then
             echo "Upstream workflows are enabled on the fork:"
             echo "$enabled"
