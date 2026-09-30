@@ -359,7 +359,10 @@ impl ChatWidget {
                 }
             }
             SlashCommand::Voice => {
-                self.toggle_realtime_conversation();
+                self.app_event_tx.send(AppEvent::VoiceControl {
+                    thread_id: self.thread_id(),
+                    control: crate::app_event::VoiceControl::Toggle,
+                });
             }
             SlashCommand::Side | SlashCommand::Btw => {
                 self.request_empty_side_conversation(cmd);
@@ -787,17 +790,40 @@ impl ChatWidget {
             }
             SlashCommand::Voice => match trimmed.to_ascii_lowercase().as_str() {
                 "settings" => self.app_event_tx.send(AppEvent::OpenRealtimeSettings),
-                "mute" => self.toggle_realtime_microphone(),
-                "stop" => self.stop_realtime_conversation(),
+                "mute" => self.app_event_tx.send(AppEvent::VoiceControl {
+                    thread_id: self.thread_id(),
+                    control: crate::app_event::VoiceControl::Mute,
+                }),
+                "stop" => self.app_event_tx.send(AppEvent::VoiceControl {
+                    thread_id: self.thread_id(),
+                    control: crate::app_event::VoiceControl::Stop,
+                }),
                 _ => self.add_error_message("Usage: /voice [settings|mute|stop]".to_string()),
             },
             SlashCommand::Ide => {
                 self.handle_ide_command_args(trimmed);
             }
-            SlashCommand::Mcp => match trimmed.to_ascii_lowercase().as_str() {
-                "verbose" => self.add_mcp_output(McpServerStatusDetail::Full),
-                _ => self.add_error_message("Usage: /mcp [verbose]".to_string()),
-            },
+            SlashCommand::Mcp => {
+                if trimmed.eq_ignore_ascii_case("verbose") {
+                    self.add_mcp_output(McpServerStatusDetail::Full);
+                } else if let Some((command, name)) = trimmed.split_once(' ')
+                    && command.eq_ignore_ascii_case("login")
+                    && !name.trim().is_empty()
+                {
+                    if let Some(thread_id) = self.thread_id {
+                        self.app_event_tx.send(AppEvent::StartMcpLogin {
+                            name: name.trim().to_string(),
+                            thread_id,
+                        });
+                    } else {
+                        self.add_error_message(
+                            "MCP sign-in requires an active session.".to_string(),
+                        );
+                    }
+                } else {
+                    self.add_error_message("Usage: /mcp [verbose | login <name>]".to_string());
+                }
+            }
             SlashCommand::Keymap => match trimmed.to_ascii_lowercase().as_str() {
                 "" => self.open_keymap_picker(),
                 "debug" => {

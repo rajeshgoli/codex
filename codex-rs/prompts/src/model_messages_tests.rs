@@ -25,6 +25,7 @@ fn catalog_tool_messages_fall_back_when_the_byte_limit_is_exceeded() {
                     wait_agent: tool.clone(),
                     interrupt_agent: tool.clone(),
                     list_agents: tool,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),

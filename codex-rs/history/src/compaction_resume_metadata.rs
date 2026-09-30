@@ -1,6 +1,8 @@
 //! Defines resume metadata stored directly on a compaction.
 
+use crate::RolloutItem;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::turn_input::CyberAccessProgram;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -22,6 +24,30 @@ pub struct CompactionResumeMetadata {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct PreviousTurnSettings {
     pub model: String,
+    /// Historical program for this model; absence must not inherit the next turn's selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cyber_access_program: Option<CyberAccessProgram>,
     pub comp_hash: Option<String>,
     pub realtime_active: Option<bool>,
+}
+
+/// Returns the runtime version stored in a turn context or compaction resume metadata.
+pub fn resume_multi_agent_version(item: &RolloutItem) -> Option<MultiAgentVersion> {
+    match item {
+        RolloutItem::TurnContext(context) => context.multi_agent_version,
+        RolloutItem::Compacted(compacted) => compacted
+            .resume_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.multi_agent_version),
+        RolloutItem::SessionMeta(_)
+        | RolloutItem::ResponseItem(_)
+        | RolloutItem::InterAgentCommunication(_)
+        | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::TokenUsageRecord(_)
+        | RolloutItem::WorldState(_)
+        | RolloutItem::RetainedContext(_)
+        | RolloutItem::SecurityRiskScore(_)
+        | RolloutItem::RealtimeItem(_)
+        | RolloutItem::EventMsg(_) => None,
+    }
 }

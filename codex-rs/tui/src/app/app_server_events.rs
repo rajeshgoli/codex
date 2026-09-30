@@ -78,6 +78,7 @@ impl App {
                 }
                 self.agents_overview.request_id = None;
                 self.agents_overview.refresh_pending = false;
+                self.agents_overview.initialized = false;
                 self.agents_overview.refresh_notifications.clear();
                 self.agents_overview.activity.clear();
                 self.agents_overview.last_messages.clear();
@@ -221,6 +222,18 @@ impl App {
                 .or_default();
         }
         self.track_agents_overview_notification(&notification);
+        // Retained blank sessions stay subscribed after their event channels are cleared.
+        if let ServerNotification::ThreadSettingsUpdated(settings) = &notification
+            && let Ok(thread_id) = ThreadId::from_string(&settings.thread_id)
+            && self.agents_overview.blank_sessions.contains_key(&thread_id)
+            && !self.thread_event_channels.contains_key(&thread_id)
+        {
+            self.apply_thread_settings_to_cached_session(thread_id, &settings.thread_settings)
+                .await;
+            if let Some(input) = self.agents_overview.input_states.get_mut(&thread_id) {
+                input.pending_thread_settings = Some(settings.clone());
+            }
+        }
         if matches!(
             &notification,
             ServerNotification::ThreadStarted(_)
@@ -266,6 +279,25 @@ impl App {
             ServerNotification::McpServerStatusUpdated(_) => {
                 self.refresh_mcp_startup_expected_servers_from_config();
             }
+            ServerNotification::McpServerOauthLoginCompleted(notification) => {
+                // The start response identifies the new attempt. Hold completions until then
+                // so a replacement's cancellation cannot appear as a fresh login failure.
+                if let Some(pending) = self.pending_mcp_login_start.as_mut()
+                    && pending.name == notification.name
+                {
+                    pending.completions.push(notification.clone());
+                    return;
+                }
+                if notification.login_id.is_some() {
+                    if notification.login_id.as_ref()
+                        != self.active_mcp_login_ids.get(&notification.name)
+                    {
+                        return;
+                    }
+                    self.active_mcp_login_ids.remove(&notification.name);
+                }
+            }
+
             ServerNotification::AccountRateLimitsUpdated(notification) => {
                 let workspace_hard_stop = matches!(
                     notification.rate_limits.rate_limit_reached_type,
@@ -413,7 +445,13 @@ impl App {
                         }
                     }
                 }
-                if self.primary_thread_id.is_none() && !self.pending_startup_thread_start {
+                let background_voice = self.background_voice.as_ref().is_some_and(|owner| {
+                    owner.thread_id() == Some(thread_id) && owner.realtime_conversation_is_running()
+                });
+                if self.primary_thread_id.is_none()
+                    && !self.pending_startup_thread_start
+                    && !background_voice
+                {
                     return;
                 }
                 if self.primary_thread_id.is_some()
@@ -438,9 +476,7 @@ impl App {
                 {
                     return;
                 }
-                let result = if self.primary_thread_id == Some(thread_id)
-                    || self.primary_thread_id.is_none()
-                {
+                let result = if self.primary_thread_id.is_none() && !background_voice {
                     self.enqueue_primary_thread_notification(notification).await
                 } else {
                     self.enqueue_thread_notification(thread_id, notification)
@@ -610,6 +646,11 @@ impl App {
         }
 
         let thread_id = server_request_thread_id(&request);
+        let background_voice = self.background_voice.as_ref().is_some_and(|owner| {
+            owner.realtime_conversation_is_running()
+                && owner.thread_id().is_some()
+                && owner.thread_id() == thread_id
+        });
         if thread_id.is_some_and(|thread_id| self.abandoned_side_threads.contains(&thread_id)) {
             if let Err(err) = self
                 .reject_app_server_request(
@@ -625,6 +666,7 @@ impl App {
         }
         if thread_id.is_some()
             && self.primary_thread_id.is_none()
+            && !background_voice
             && self.pending_startup_thread_start
         {
             self.pending_primary_events
@@ -648,6 +690,7 @@ impl App {
         if let Some(thread_id) = thread_id
             && self.primary_thread_id != Some(thread_id)
             && !unsupported_request
+            && !background_voice
             && let Some(requests) = self.agents_overview.dispatched_requests.get_mut(&thread_id)
         {
             requests.push(request);
@@ -655,6 +698,7 @@ impl App {
         }
         if thread_id.is_some()
             && self.primary_thread_id.is_none()
+            && !background_voice
             && !self.pending_startup_thread_start
             && !unsupported_request
         {
@@ -751,12 +795,11 @@ impl App {
             return;
         };
 
-        let result =
-            if self.primary_thread_id == Some(thread_id) || self.primary_thread_id.is_none() {
-                self.enqueue_primary_thread_request(request).await
-            } else {
-                self.enqueue_thread_request(thread_id, request).await
-            };
+        let result = if self.primary_thread_id.is_none() && !background_voice {
+            self.enqueue_primary_thread_request(request).await
+        } else {
+            self.enqueue_thread_request(thread_id, request).await
+        };
         if let Err(err) = result {
             tracing::warn!("failed to enqueue app-server request: {err}");
         }
