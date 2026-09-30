@@ -1,3 +1,12 @@
+# Guardian circuit-breaker errors
+
+Set `auto_review.circuit_break_action = "strict"` to include `TooManyDenials` in
+`TurnAborted.error` when Guardian reaches its denial limit. App-server exposes it
+as `turn.error.codexErrorInfo = "tooManyDenials"` in notifications and history.
+
+The default, `"default"`, leaves this error unset. Both modes preserve the warning,
+denial limit, and interrupted status; neither emits a separate `Error` event.
+
 # Model catalog provider requirements
 
 `model/list` and periodic model catalog refreshes check the startup provider against
@@ -10,8 +19,9 @@ and caching behavior remain in effect while the provider satisfies current requi
 # MCP App UI
 
 `mcpToolCall.mcpAppUi` records the invoked descriptor's `resourceUri`
-and `preferredModelDisplayMode` (`inline` or `fullscreen`). Descriptors with a widget
-URI default to `inline` when the preference is missing or unsupported. The
+and explicit `preferredModelDisplayMode` (`inline` or `fullscreen`). Missing or
+unsupported preferences leave `mcpAppUi` unset; `mcpAppResourceUri` retains the URI
+so clients can apply resource display defaults. The
 UI information is preserved in tool-call events and saved history so clients can
 render without waiting for the full MCP catalog.
 
@@ -29,6 +39,18 @@ An unused thread is not guaranteed to survive restart. Omitted or null leaves
 the choice unset. Ephemeral threads cannot save it.
 Use `thread/metadata/update` for later changes. This preference does not select
 `turn/start.cyberAccessProgram` or grant access to an access program.
+
+# Application network policy
+
+App-server loads application network policy at startup and existing explicit
+config/account reloads. Local requirements-file edits take effect on
+the next explicit reload or restart. Installing a new policy cancels requests
+that it no longer permits; a failed policy load blocks network traffic.
+
+Embedded app-server installs the same policy-aware requirements loader for clients
+it constructs. The embedding TUI and exec runtime install the same policy before
+creating their telemetry providers, background HTTP clients, and executor
+connections. TUI worktree cloud loaders retain that shared policy on reload.
 
 # User verification cancellation (experimental)
 
@@ -194,6 +216,12 @@ Bedrock login return an error without changing configuration or saved credential
 exporter configuration before selecting another credential source. `aws.credential_export` and
 `aws.profile` cannot be configured together.
 
+Application network restrictions apply to each AWS credential and region HTTP request and to
+the Bedrock destination. Static access keys with an explicit region need no credential discovery.
+AWS profile `credential_process` commands are run by the AWS SDK; their network traffic is outside
+the application's HTTP policy. Configured credential exporters and AWS reauthentication commands
+require unrestricted application policy; policy revocation cancels their active work.
+
 ## Stored thread attachments
 
 - `thread/attachment/add` — add a durable resource reference to a stored thread without loading it. Repeated writes with the same attachment type and identity key return the existing attachment.
@@ -294,6 +322,12 @@ This is the server's advertised MCP capabilities object, including its `extensio
 map. It is null when the connection has not initialized successfully; capabilities
 are never inferred from tools or copied from a shared catalog cache.
 
+Pass `serverName` to discover only that server. With `threadId`, the request
+reuses the thread's current MCP connection and tool catalog after any pending
+runtime refresh; discovery then waits only for that server. Without `threadId`,
+discovery creates a connection for the selected server. An unknown name returns an empty page.
+Omitting `serverName` preserves full-inventory discovery.
+
 # MCP OAuth login
 
 `mcpServer/oauth/login` only returns HTTP(S) authorization URLs. Authorization
@@ -309,6 +343,23 @@ Existing rollouts may contain historical `ThreadRolledBack` events. Their replay
 and migration remain supported so resuming, reading, and forking those threads
 preserves the surviving history. This disk compatibility does not require restoring
 support for new `thread/rollback` requests.
+
+# MCP configuration reload
+
+`config/mcpServer/reload` returns an error when a loaded thread rejects the
+refreshed enterprise policy. The rejected thread retains its previous configuration
+layers with enterprise MCP disabled. Other planned thread refreshes are processed
+before the rejection is reported, so an error does not imply that no changes were
+applied. Correct the policy before retrying the reload.
+
+# Enterprise sign-in
+
+Call `mcpServer/oauth/login` with a directly configured server's `name` and its
+connected `threadId`. Open the returned `authorizationUrl` and match
+`mcpServer/oauthLogin/completed` by `loginId`. Starting another enterprise sign-in
+cancels the previous attempt and waits for its callback listener to close. Use
+`account/login/cancel` to cancel explicitly. Start a fresh session after success to
+use the saved grant.
 
 # Selected workspace routing
 
@@ -403,3 +454,52 @@ requests fail promptly and can be retried when sign-in succeeds.
 `model/list` also checks gateway authentication before returning cached models.
 If authentication fails after the provider configuration changes, it asks the client
 to restart Codex so the retained catalog and gateway sign-in use the same provider.
+
+## Application network policy
+
+Application policy uses the same managed TOML merge as agent-network requirements:
+higher-priority layers override conflicting values, including `enabled` and each
+domain permission, while non-conflicting domain entries are retained. Omitted
+values inherit from lower layers. After merging, a present network block defaults
+to `enabled = true` and an empty domain map, meaning no external destinations are
+allowed. An effective `enabled = false` disables application destination policy.
+Domain keys are exact ASCII names, normalized to lowercase without a trailing dot
+before merging; wildcards, URLs, ports, invalid permissions, and duplicate
+normalized names are rejected.
+App-server enforces these rules for its HTTP and WebSocket traffic before route
+resolution or connection work, including redirects and reused clients. An allow
+entry permits only HTTPS or WSS to that exact host. Agent-network requirements
+remain separate in `network`.
+
+App-server reloads effective requirements on explicit config or account reloads.
+Local changes or read failures discovered on reload revoke active requests;
+unchanged requirements preserve them. Failed policy loads block traffic until
+requirements load successfully. Invalid request or project configuration does not
+revoke unrelated traffic. Account changes revoke
+outstanding requests and clients retaining the previous account's authorization.
+Policy updates also stop active requests to newly denied destinations. Narrow
+authentication and requirements-discovery clients use local requirements and
+exact endpoint URLs while workspace policy is loading. API-key-only deployments
+do not discover ChatGPT workspace requirements.
+
+SDK transports without destination enforcement, including OTLP exporters and AWS
+credential discovery/signing, are disabled while restrictions apply. Supported
+HTTP, WebSocket, and code-mode gRPC requests use the shared destination checks.
+User-directed Git, SSH, shell, and other subprocess traffic retain their existing
+execution and sandbox policies.
+
+# Item history anchors
+
+`thread/items/list` accepts an optional nullable `cursor`: either an opaque string
+from a previous response or an item anchor such as
+`{"type":"item","itemId":"item-123"}`. An item anchor resumes exclusively after
+that item in the requested pagination order: ascending (the default) returns newer
+items, and descending returns older items. It requires a non-empty `turnId`;
+otherwise the request returns invalid params (`-32602`) with
+`turnId is required when cursor is an item anchor`.
+The item must belong to that turn in the thread's visible history. Empty, unknown,
+and out-of-scope item IDs return invalid params (`-32602`) with
+`cursor.itemId does not identify an item in the requested history scope`.
+Omitted or null cursors preserve normal first-page behavior. Continue anchored
+pages with the returned opaque string `nextCursor`; response fields and
+`backwardsCursor` semantics are unchanged.

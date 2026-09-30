@@ -138,10 +138,9 @@ impl App {
                 }
             }
             ServerNotification::TurnCompleted(event) => {
-                let state = self
-                    .external_btw_requests
-                    .remove(&thread_id)
-                    .expect("external btw state must exist");
+                let Some(state) = self.external_btw_requests.remove(&thread_id) else {
+                    return false;
+                };
                 match event.turn.status {
                     TurnStatus::Completed => {
                         if let Some(answer) =
@@ -175,10 +174,9 @@ impl App {
                     .send(AppEvent::CleanupExternalBtw { thread_id });
             }
             ServerNotification::ThreadClosed(_) => {
-                let state = self
-                    .external_btw_requests
-                    .remove(&thread_id)
-                    .expect("external btw state must exist");
+                let Some(state) = self.external_btw_requests.remove(&thread_id) else {
+                    return false;
+                };
                 crate::session_log::log_btw_failed(
                     &state.request_id,
                     Some(state.parent_thread_id),

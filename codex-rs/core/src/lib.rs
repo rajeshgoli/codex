@@ -9,6 +9,7 @@ mod apply_patch;
 mod apps;
 mod client;
 mod client_common;
+mod model_request;
 mod realtime_context;
 mod realtime_conversation;
 mod realtime_history;
@@ -46,6 +47,7 @@ pub use codex_protocol::protocol::EnvironmentConfig;
 pub use codex_thread::BackgroundTerminalInfo;
 pub use codex_thread::CodexThread;
 pub use codex_thread::CodexThreadSettingsOverrides;
+pub use codex_thread::ConfigRefreshOutcome;
 pub use codex_thread::GuardianAuthorizationVersion;
 pub use codex_thread::GuardianRootMessage;
 pub use codex_thread::GuardianRootSnapshot;
@@ -62,7 +64,6 @@ pub use agent::api::AgentTurnOutcome;
 pub use agent::api::DeliveryReceipt;
 pub use agent::api::SendRequest;
 pub use agent::api::SpawnRequest;
-pub use agent::api::StatusSubscription;
 pub use agent::types::AgentExecutionGuard;
 pub use agent::types::AgentMessage;
 pub use agent::types::AgentMetadata;
@@ -128,7 +129,6 @@ pub(crate) mod mentions {
 mod sandbox_tags;
 pub mod sandboxing;
 mod session_prefix;
-mod session_startup_prewarm;
 mod skills;
 pub(crate) use skills::maybe_emit_implicit_skill_invocation;
 pub(crate) use skills::skills_load_input_from_config;
@@ -244,3 +244,4 @@ pub mod otel_init;
 
 // Captured environment bindings can be passed back to ThreadManager by internal reviewers.
 pub use environment_selection::TurnEnvironmentSnapshot;
+pub use environment_selection::validate_environment_ids_and_cwds;

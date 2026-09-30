@@ -83,6 +83,7 @@ use codex_feedback::CodexFeedback;
 use codex_goal_extension::GoalService;
 use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::AuthManager;
+use codex_otel::auth_storage::AuthStorageOriginator;
 use codex_protocol::ThreadId;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::SessionSource;
@@ -473,6 +474,7 @@ impl MessageProcessor {
             thread_state_manager.clone(),
             outgoing.clone(),
             config_manager.clone(),
+            account_processor.clone(),
         );
         let plugin_processor = PluginRequestProcessor::new(
             auth_manager.clone(),
@@ -1030,15 +1032,21 @@ impl MessageProcessor {
                     return;
                 }
                 let processor_for_request = Arc::clone(&processor);
+                let originator = AuthStorageOriginator::from_client_name(
+                    session.app_server_client_name().unwrap_or("none"),
+                );
                 // Keep queued requests small to avoid large stack temporaries during construction.
-                let result = Box::pin(processor_for_request.handle_initialized_client_request(
-                    connection_request_id,
-                    codex_request,
-                    request_context,
-                    session,
-                    event_stream_ready,
-                ))
-                .await;
+                let result = originator
+                    .scope(Box::pin(
+                        processor_for_request.handle_initialized_client_request(
+                            connection_request_id,
+                            codex_request,
+                            request_context,
+                            session,
+                            event_stream_ready,
+                        ),
+                    ))
+                    .await;
                 if let Err(error) = result {
                     processor.outgoing.send_error(error_request_id, error).await;
                 }
@@ -1680,7 +1688,8 @@ impl MessageProcessor {
                 self.turn_processor.review_start(&request_id, params).await
             }
             ClientRequest::McpServerOauthLogin { params, .. } => {
-                self.mcp_processor.mcp_server_oauth_login(params).await
+                // Keep MCP discovery's large future from inflating every request.
+                Box::pin(self.mcp_processor.mcp_server_oauth_login(params)).await
             }
             ClientRequest::McpServerRefresh { params, .. } => {
                 self.mcp_processor.mcp_server_refresh(params).await

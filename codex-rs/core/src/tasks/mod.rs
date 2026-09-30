@@ -46,7 +46,9 @@ use codex_otel::TURN_MEMORY_METRIC;
 use codex_otel::TURN_NETWORK_PROXY_METRIC;
 use codex_otel::TURN_TOOL_CALL_METRIC;
 use codex_otel::TURN_UNIFIED_EXEC_RUNNING_PROCESSES_METRIC;
+use codex_otel::auth_storage::AuthStorageOriginator;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::TokenUsage;
@@ -332,7 +334,7 @@ impl Session {
         let mut active = self.active_turn.lock().await;
         let turn = active.get_or_insert_with(ActiveTurn::default);
         debug_assert!(turn.task.is_none());
-        let agent_execution_guard = self.services.agent_control.execution_guard(
+        let agent_execution_guard = self.services.agent_control.admit_turn(
             turn_context.multi_agent_version,
             &turn_context.session_source,
         );
@@ -360,46 +362,46 @@ impl Session {
             codex.turn.token_usage.reasoning_output_tokens = field::Empty,
             codex.turn.token_usage.total_tokens = field::Empty,
         );
-        let handle = tokio::spawn(
-            async move {
-                let ctx_for_finish = Arc::clone(&ctx);
-                let task_result = task_for_run
-                    .run(
-                        Arc::clone(&session),
-                        ctx,
-                        task_input,
-                        task_cancellation_token.child_token(),
-                    )
-                    .instrument(trace_span!("session_task.run"))
-                    .await;
-                let sess = Arc::clone(&session);
-                // Private reviewers save their transcript together with the terminal event.
-                // Errors and cancellation retain their existing save path.
-                if (!sess.is_private_guardian_reviewer().await
-                    || task_cancellation_token.is_cancelled()
-                    || task_result.is_err())
-                    && let Err(err) = sess.flush_rollout().await
-                {
-                    warn!("failed to flush rollout before completing turn: {err}");
-                    sess.send_event(
-                        ctx_for_finish.as_ref(),
-                        EventMsg::Warning(WarningEvent {
-                            message: format!(
-                                "Failed to save the conversation transcript; Codex will continue retrying. Error: {err}"
-                            ),
-                        }),
-                    )
-                    .await;
-                }
-                if !task_cancellation_token.is_cancelled() {
-                    // Finish uniformly from the spawn site so all tasks share the same lifecycle.
-                    sess.on_task_finished(Arc::clone(&ctx_for_finish), task_result)
-                        .await;
-                }
-                done_clone.notify_waiters();
+        let storage_originator = AuthStorageOriginator::from_client_name(&turn_context.originator);
+        let task_future = async move {
+            let ctx_for_finish = Arc::clone(&ctx);
+            let task_result = task_for_run
+                .run(
+                    Arc::clone(&session),
+                    ctx,
+                    task_input,
+                    task_cancellation_token.child_token(),
+                )
+                .instrument(trace_span!("session_task.run"))
+                .await;
+            let sess = Arc::clone(&session);
+            // Private reviewers save their transcript together with the terminal event.
+            // Errors and cancellation retain their existing save path.
+            if (!sess.is_private_guardian_reviewer().await
+                || task_cancellation_token.is_cancelled()
+                || task_result.is_err())
+                && let Err(err) = sess.flush_rollout().await
+            {
+                warn!("failed to flush rollout before completing turn: {err}");
+                sess.send_event(
+                    ctx_for_finish.as_ref(),
+                    EventMsg::Warning(WarningEvent {
+                        message: format!(
+                            "Failed to save the conversation transcript; Codex will continue retrying. Error: {err}"
+                        ),
+                    }),
+                )
+                .await;
             }
-            .instrument(task_span),
-        );
+            if !task_cancellation_token.is_cancelled() {
+                // Finish uniformly from the spawn site so all tasks share the same lifecycle.
+                sess.on_task_finished(Arc::clone(&ctx_for_finish), task_result)
+                    .await;
+            }
+            done_clone.notify_waiters();
+        }
+        .instrument(task_span);
+        let handle = tokio::spawn(storage_originator.scope(task_future));
         let timer = turn_context
             .session_telemetry
             .start_timer(TURN_E2E_DURATION_METRIC, &[])
@@ -541,8 +543,13 @@ impl Session {
             aborted_turn = task.is_some();
             turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
             if let Some(task) = task {
-                self.handle_task_abort(task, reason.clone(), &active_turn.turn_state)
-                    .await;
+                self.handle_task_abort(
+                    task,
+                    reason.clone(),
+                    &active_turn.turn_state,
+                    /*error*/ None,
+                )
+                .await;
             }
             if aborted_turn {
                 active_turn_to_clear = Some(active_turn);
@@ -567,6 +574,7 @@ impl Session {
         self: &Arc<Self>,
         turn_id: &str,
         reason: TurnAbortReason,
+        error: Option<ErrorEvent>,
     ) -> bool {
         let active_turn = {
             let mut active = self.active_turn.lock().await;
@@ -590,7 +598,7 @@ impl Session {
             return false;
         };
 
-        self.finish_turn_abort(active_turn, reason).await;
+        self.finish_turn_abort(active_turn, reason, error).await;
         true
     }
 
@@ -598,11 +606,12 @@ impl Session {
         self: &Arc<Self>,
         mut active_turn: ActiveTurn,
         reason: TurnAbortReason,
+        error: Option<ErrorEvent>,
     ) {
         let task = active_turn.task.take();
         let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
         if let Some(task) = task {
-            self.handle_task_abort(task, reason.clone(), &active_turn.turn_state)
+            self.handle_task_abort(task, reason.clone(), &active_turn.turn_state, error)
                 .await;
         }
         if let Some(turn_context) = turn_context.as_deref() {
@@ -633,6 +642,7 @@ impl Session {
                 self.emit_turn_error_lifecycle(
                     turn_context.as_ref(),
                     err.to_codex_protocol_error(),
+                    err.details(),
                 )
                 .await;
                 self.track_turn_codex_error(turn_context.as_ref(), &err);
@@ -819,6 +829,7 @@ impl Session {
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_context.sub_id.clone()),
                 reason,
+                error: None,
                 started_at,
                 completed_at,
                 duration_ms,
@@ -913,6 +924,7 @@ impl Session {
         task: RunningTask,
         reason: TurnAbortReason,
         turn_state: &Mutex<TurnState>,
+        error: Option<ErrorEvent>,
     ) {
         let sub_id = task.turn_context.sub_id.clone();
         if task.cancellation_token.is_cancelled() {
@@ -996,6 +1008,7 @@ impl Session {
         let event = EventMsg::TurnAborted(TurnAbortedEvent {
             turn_id: Some(task.turn_context.sub_id.clone()),
             reason,
+            error,
             started_at,
             completed_at,
             duration_ms,

@@ -4,6 +4,7 @@
 //! limits, add-credit nudges, and feedback uploads. Results are routed back through `AppEvent` so
 //! the main event loop remains single-threaded.
 
+use super::feedback_upload::fetch_feedback_upload;
 use super::plugin_mentions::fetch_plugin_mentions;
 use super::*;
 use crate::app_event::ConnectorsSnapshot;
@@ -23,6 +24,7 @@ use codex_app_server_protocol::MarketplaceRemoveParams;
 use codex_app_server_protocol::MarketplaceRemoveResponse;
 use codex_app_server_protocol::MarketplaceUpgradeParams;
 use codex_app_server_protocol::MarketplaceUpgradeResponse;
+use codex_app_server_protocol::McpServerOauthLoginParams;
 use codex_app_server_protocol::RequestId;
 
 use crate::hooks_rpc::fetch_hooks_list;
@@ -38,6 +40,33 @@ const WORKSPACE_HEADLINE_FETCH_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(/*millis*/ 2000);
 
 impl App {
+    pub(super) fn start_mcp_login(
+        &self,
+        app_server: &AppServerSession,
+        request_id: String,
+        name: String,
+        thread_id: ThreadId,
+    ) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = request_handle
+                .request_typed(ClientRequest::McpServerOauthLogin {
+                    request_id: RequestId::String(request_id.clone()),
+                    params: McpServerOauthLoginParams {
+                        name,
+                        thread_id: Some(thread_id.to_string()),
+                        client_registration: None,
+                        scopes: None,
+                        timeout_secs: None,
+                    },
+                })
+                .await
+                .map_err(|error| error.to_string());
+            app_event_tx.send(AppEvent::McpLoginStarted { request_id, result });
+        });
+    }
+
     pub(super) fn fetch_mcp_inventory(
         &mut self,
         app_server: &AppServerSession,
@@ -604,8 +633,10 @@ impl App {
             turn_id,
             include_logs,
         );
+        let codex_home = app_server.codex_home_path(&self.config.codex_home);
+        let feedback = self.feedback.clone();
         tokio::spawn(async move {
-            let result = fetch_feedback_upload(request_handle, params)
+            let result = fetch_feedback_upload(request_handle, codex_home, params, feedback)
                 .await
                 .map(|response| response.thread_id)
                 .map_err(|err| err.to_string());
@@ -765,6 +796,7 @@ pub(super) async fn fetch_all_mcp_server_statuses(
                     limit: Some(100),
                     detail: Some(detail),
                     thread_id: thread_id.clone(),
+                    server_name: None,
                 },
             })
             .await
@@ -1278,17 +1310,6 @@ pub(super) fn build_feedback_upload_params(
     }
 }
 
-pub(super) async fn fetch_feedback_upload(
-    request_handle: AppServerRequestHandle,
-    params: FeedbackUploadParams,
-) -> Result<FeedbackUploadResponse> {
-    let request_id = RequestId::String(format!("feedback-upload-{}", Uuid::new_v4()));
-    request_handle
-        .request_typed(ClientRequest::FeedbackUpload { request_id, params })
-        .await
-        .wrap_err("feedback/upload failed in TUI")
-}
-
 /// Convert flat `McpServerStatus` responses into the per-server maps used by the
 /// in-process MCP subsystem (tools keyed as `mcp__{server}__{tool}`, plus
 /// per-server resource/template/auth maps). Test-only because the TUI
@@ -1349,16 +1370,32 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let thread_id = ThreadId::new();
         app.config.chatgpt_base_url = server.uri();
+        app.cli_kv_overrides = vec![(
+            "chatgpt_base_url".to_string(),
+            toml::Value::String(server.uri()),
+        )];
         app.config.cli_auth_credentials_store_mode = AuthCredentialsStoreMode::File;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/codex/config/bundle"))
+            .respond_with(wiremock::ResponseTemplate::new(/*s*/ 200).set_body_string("{}"))
+            .mount(&server)
+            .await;
         write_chatgpt_auth(
             app.config.codex_home.as_path(),
             ChatGptAuthFixture::new("chatgpt-token").account_id("account-123"),
             AuthCredentialsStoreMode::File,
         )
         .expect("write ChatGPT authentication");
-        let app_server = crate::start_embedded_app_server_for_picker(&app.config)
-            .await
-            .expect("start authenticated embedded app server");
+        let app_server = crate::start_app_server_for_picker(
+            &app.config,
+            &crate::AppServerTarget::Embedded,
+            app.cli_kv_overrides.clone(),
+            app.loader_overrides.clone(),
+            /*state_db*/ None,
+            app.environment_manager.clone(),
+        )
+        .await
+        .expect("start authenticated embedded app server");
         write_chatgpt_auth(
             app.config.codex_home.as_path(),
             ChatGptAuthFixture::new("different-token").account_id("different-account"),

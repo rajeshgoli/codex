@@ -9,6 +9,7 @@ use ratatui::layout::Position;
 
 #[derive(Debug)]
 pub(super) struct MouseSelection {
+    pending_copy: Option<(u64, Range<usize>)>,
     origin: Range<usize>,
     unit: SelectionUnit,
     dragging: bool,
@@ -16,6 +17,34 @@ pub(super) struct MouseSelection {
 }
 
 impl TextArea {
+    pub(in crate::bottom_pane) fn defer_copy(&mut self, id: u64) {
+        if let Some(range) = self.mouse_selection_range()
+            && let Some(selection) = &mut self.mouse_selection
+        {
+            selection.pending_copy = Some((id, range));
+        }
+    }
+
+    pub(in crate::bottom_pane) fn finish_copy(
+        &mut self,
+        completion: &(u64, crate::clipboard_copy::worker::CopyResult),
+        current: bool,
+    ) -> Option<usize> {
+        let pending = self.mouse_selection.as_mut()?.pending_copy.as_ref()?;
+        if pending.0 != completion.0 {
+            return None;
+        }
+        let (_, range) = self.mouse_selection.as_mut()?.pending_copy.take()?;
+        if !current || self.mouse_selection_range().as_ref() != Some(&range) {
+            return None;
+        }
+        let characters = self.text()[range].chars().count();
+        if completion.1 == Ok(crate::clipboard_copy::CopyStatus::Confirmed) {
+            self.set_cursor(self.cursor());
+        }
+        Some(characters)
+    }
+
     pub(in crate::bottom_pane) fn contains_mouse(&self, event: MouseEvent) -> bool {
         self.rendered_area
             .get()
@@ -32,16 +61,6 @@ impl TextArea {
         let origin = &self.mouse_selection.as_ref()?.origin;
         let range = origin.start.min(self.cursor_pos)..origin.end.max(self.cursor_pos);
         (!range.is_empty()).then_some(range)
-    }
-
-    pub(super) fn delete_mouse_selection(&mut self) -> bool {
-        let Some(range) = self.mouse_selection_range() else {
-            return false;
-        };
-        // A pointer-selected edit cannot be replayed as a keyboard-relative Vim command.
-        self.vim_commands = VimCommandState::default();
-        self.replace_range(range, "");
-        true
     }
 
     pub(crate) fn handle_mouse(&mut self, event: MouseEvent, state: TextAreaState) -> bool {
@@ -89,6 +108,7 @@ impl TextArea {
             let clicks =
                 crate::text_selection::click_count(&mut self.last_click, event.column, event.row);
             MouseSelection {
+                pending_copy: None,
                 origin: pos..pos,
                 // Padding remains an insertion target on repeated clicks.
                 unit: SelectionUnit::from_clicks(if pos == line.end - 1 { 1 } else { clicks }),

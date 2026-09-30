@@ -9,19 +9,6 @@ use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
 use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_models_manager::test_support::get_model_offline_for_tests;
 
-pub(super) fn select_catalog_tip(app: &mut App, width: u16, expected: &str) {
-    for seed in 0..1024 {
-        app.composer_tips = super::composer_hints::ComposerTips::new(seed);
-        if app
-            .composer_hint(width)
-            .is_some_and(|tip| tip.line.to_string().starts_with(expected))
-        {
-            return;
-        }
-    }
-    panic!("catalog tip was never selected: {expected}");
-}
-
 pub(crate) async fn make_test_app() -> App {
     let (app, _rx, _op_rx) = make_test_app_with_channels().await;
     app
@@ -32,7 +19,8 @@ pub(super) async fn make_test_app_with_channels() -> (
     tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     tokio::sync::mpsc::UnboundedReceiver<AppCommand>,
 ) {
-    let (chat_widget, app_event_tx, rx, op_rx) = make_chatwidget_manual_with_sender().await;
+    let (mut chat_widget, app_event_tx, rx, op_rx) = make_chatwidget_manual_with_sender().await;
+    let test_codex_home = chat_widget.test_codex_home.take();
     let config = chat_widget.config_ref().clone();
     let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
     let model = get_model_offline_for_tests(config.model.as_deref());
@@ -55,12 +43,13 @@ pub(super) async fn make_test_app_with_channels() -> (
         loader_overrides: LoaderOverrides::without_managed_config_for_tests(),
         cloud_config_bundle: CloudConfigBundleLoader::default(),
         runtime_approval_policy_override: None,
+        runtime_approvals_reviewer_override: None,
         runtime_permission_profile_override: None,
         pending_server_profiles: HashMap::new(),
         file_search,
         transcript_cells: Vec::new(),
-        composer_tips: super::composer_hints::ComposerTips::new(/*seed*/ 0),
         native_history: Default::default(),
+        turn_tips: Default::default(),
         transcript_view: Default::default(),
         last_rendered_history_tail: None,
         last_thread_usage_status_cell: None,
@@ -86,6 +75,14 @@ pub(super) async fn make_test_app_with_channels() -> (
         feedback_audience: FeedbackAudience::External,
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
         app_server_target: crate::AppServerTarget::Embedded,
+        pending_right_click_paste: None,
+        right_click_paste_environment: super::right_click_paste::PasteEnvironment {
+            primary: false,
+            platform_default: true,
+            ssh: false,
+            wsl: false,
+            vscode: crate::tui::VscodeDetection::Other,
+        },
         reconnect: Default::default(),
         daemon_cli_executable: None,
         pending_update_action: None,
@@ -95,6 +92,8 @@ pub(super) async fn make_test_app_with_channels() -> (
         pending_realtime_speech_replay: HashMap::new(),
         pending_realtime_transcript_replay: HashMap::new(),
         realtime_replay_order: VecDeque::new(),
+        background_voice: None,
+        background_voice_error: None,
         temporary_structured_requests: HashMap::new(),
         pending_thread_titles: HashMap::new(),
         thread_event_listener_tasks: HashMap::new(),
@@ -125,9 +124,12 @@ pub(super) async fn make_test_app_with_channels() -> (
         startup_pending_protected_request: false,
         rate_limit_hard_stop_generation: 0,
         rate_limit_refresh_state: Default::default(),
+        pending_mcp_login_start: None,
+        active_mcp_login_ids: HashMap::new(),
         pending_plugin_enabled_writes: HashMap::new(),
         pending_hook_enabled_writes: HashMap::new(),
         recap: recap::RecapState::default(),
+        _test_codex_home: test_codex_home,
     };
     (app, rx, op_rx)
 }

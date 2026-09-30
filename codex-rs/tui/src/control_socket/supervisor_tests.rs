@@ -14,10 +14,11 @@ use tokio::sync::mpsc::unbounded_channel;
 
 fn start_handle(path: &Path) -> (ControlSocketHandle, UnboundedReceiver<AppEvent>) {
     let (tx, rx) = unbounded_channel();
-    (
-        ControlSocketHandle::start(path.to_path_buf(), AppEventSender::new(tx)).unwrap(),
-        rx,
-    )
+    let handle = match ControlSocketHandle::start(path.to_path_buf(), AppEventSender::new(tx)) {
+        Ok(handle) => handle,
+        Err(error) => panic!("failed to start control socket: {error}"),
+    };
+    (handle, rx)
 }
 
 fn request(path: &Path, body: &[u8]) -> std::io::Result<Value> {
@@ -39,7 +40,10 @@ fn get_epoch(path: &Path) -> std::io::Result<String> {
         path,
         b"{\"request_id\":\"test-epoch\",\"command\":\"get_epoch\"}\n",
     )?;
-    Ok(value["epoch"].as_str().unwrap().to_string())
+    value["epoch"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| std::io::Error::other("control response is missing an epoch"))
 }
 
 fn wait_for_epoch(path: &Path, previous: Option<&str>) -> String {
