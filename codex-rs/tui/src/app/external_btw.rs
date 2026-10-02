@@ -34,8 +34,14 @@ impl App {
         }
 
         let fork_config = self.side_fork_config();
+        let selected_profile = self.selected_server_profile(parent_thread_id);
         let started = match app_server
-            .fork_side_thread(&self.local_settings, fork_config.clone(), parent_thread_id)
+            .fork_side_thread(
+                &self.local_settings,
+                fork_config.clone(),
+                parent_thread_id,
+                selected_profile.as_ref(),
+            )
             .await
         {
             Ok(started) => started,
@@ -101,7 +107,6 @@ impl App {
             Some(fork_config.service_tier.clone()),
             /*final_output_json_schema*/ None,
             /*collaboration_mode*/ None,
-            fork_config.personality,
         );
         if let Err(err) = self.submit_thread_op(app_server, child_thread_id, op).await {
             self.external_btw_requests.remove(&child_thread_id);

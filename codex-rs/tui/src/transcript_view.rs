@@ -85,6 +85,8 @@ struct VisibleRow {
 
 /// Shared scrolling and interaction state for compact and detailed transcript presentations.
 pub(crate) struct TranscriptView {
+    pub(crate) mouse_scroll_speed: f64,
+    pending_mouse_scroll: f64,
     pub(crate) copy_on_select: bool,
     pub(crate) primary_selection: bool,
     position: Position,
@@ -118,6 +120,8 @@ pub(crate) struct TranscriptView {
 impl Default for TranscriptView {
     fn default() -> Self {
         Self {
+            mouse_scroll_speed: 1.0,
+            pending_mouse_scroll: 0.0,
             copy_on_select: false,
             primary_selection: false,
             position: Position::Latest,
@@ -336,7 +340,7 @@ impl TranscriptView {
         self.cache.clear();
         self.suppressed_prompt_header = None;
         self.live_key = None;
-        // Search temporarily expands content without changing either presentation's position.
+        // Keep search's origin independent of either presentation's saved position.
         if self.detailed != detailed && !self.search.is_active() {
             let previous = self.position;
             self.position = self.saved_position.take().unwrap_or(previous);
@@ -411,9 +415,10 @@ impl TranscriptView {
         let index = self.next_nonempty(cells, index).unwrap_or(index);
         let bottom = self.bottom_start(cells);
         if rows > 0 && (index, row) >= bottom {
-            if self.selection.is_none() {
+            if self.selection.is_none() && !self.search.is_active() {
                 self.jump_to_latest();
             } else {
+                self.release_live_reading();
                 self.position = Position::Latest;
             }
             return;
@@ -471,7 +476,7 @@ impl TranscriptView {
 
     pub(crate) fn needs_history(&mut self, cells: &[Arc<dyn HistoryCell>]) -> bool {
         self.search.needs_history(self.history)
-            || (!self.search.is_active() && self.near_start(cells))
+            || (self.search.allows_viewport_paging() && self.near_start(cells))
     }
 
     pub(crate) fn near_start(&mut self, cells: &[Arc<dyn HistoryCell>]) -> bool {

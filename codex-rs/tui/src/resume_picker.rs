@@ -336,6 +336,7 @@ struct SessionPickerViewPersistence {
 struct SessionPickerRunOptions {
     use_theme_colors: bool,
     copy_on_select: bool,
+    mouse_scroll_speed: f64,
     show_all: bool,
     filter_cwd: Option<PathBuf>,
     local_filter_cwd: Option<PathBuf>,
@@ -447,6 +448,7 @@ async fn run_resume_picker_with_launch_context(
     let options = SessionPickerRunOptions {
         use_theme_colors: local_settings.tui.status_line_use_colors,
         copy_on_select: local_settings.copy_on_select(&codex_terminal_detection::terminal_info()),
+        mouse_scroll_speed: local_settings.tui.mouse_scroll_speed.unwrap_or(1.0),
         show_all,
         filter_cwd: cwd_filter,
         local_filter_cwd,
@@ -507,6 +509,7 @@ pub async fn run_fork_picker_with_app_server(
     let options = SessionPickerRunOptions {
         use_theme_colors: local_settings.tui.status_line_use_colors,
         copy_on_select: local_settings.copy_on_select(&codex_terminal_detection::terminal_info()),
+        mouse_scroll_speed: local_settings.tui.mouse_scroll_speed.unwrap_or(1.0),
         show_all,
         filter_cwd: cwd_filter,
         local_filter_cwd,
@@ -562,6 +565,7 @@ async fn run_session_picker_with_loader(
     state.local_filter_cwd = options.local_filter_cwd;
     state.use_theme_colors = options.use_theme_colors;
     state.copy_on_select = options.copy_on_select;
+    state.mouse_scroll_speed = options.mouse_scroll_speed;
     state.worktrees_enabled = options.worktrees_enabled;
     state.density = options.initial_density;
     state.view_persistence = options.view_persistence;
@@ -835,6 +839,7 @@ struct PickerState {
     clock_format: ClockFormat,
     use_theme_colors: bool,
     copy_on_select: bool,
+    mouse_scroll_speed: f64,
     // Resolve local filesystem membership once per cwd for each page-loading cycle.
     local_cwd_matches: HashMap<PathBuf, bool>,
     requester: FrameRequester,
@@ -1036,6 +1041,7 @@ impl PickerState {
             clock_format: ClockFormat::system(),
             use_theme_colors: true,
             copy_on_select: false,
+            mouse_scroll_speed: 1.0,
             requester,
             relative_time_reference: None,
             pagination: PaginationState::new(),
@@ -1088,7 +1094,7 @@ impl PickerState {
             self.chord_matcher.cancel();
             return Some(key);
         }
-        let context = if matches!(&self.overlay, Some(Overlay::Transcript(overlay)) if overlay.is_search_active())
+        let context = if matches!(&self.overlay, Some(Overlay::Transcript(overlay)) if overlay.is_search_editing())
         {
             crate::keymap::KeymapContext::Editor
         } else if self.overlay.is_some() {
@@ -1141,6 +1147,7 @@ impl PickerState {
             cells.clone(),
             self.keymap.pager.clone(),
             self.copy_on_select,
+            self.mouse_scroll_speed,
         );
         if let Overlay::Transcript(view) = &mut overlay {
             view.set_keymap_bindings(&self.keymap);
@@ -2414,7 +2421,7 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
                 priority: 0,
             },
             PickerFooterHint {
-                key: "ctrl+c".to_string(),
+                key: crate::key_hint::ctrl(KeyCode::Char('c')).display_label(),
                 wide_label: String::from("quit"),
                 compact_label: String::from("quit"),
                 priority: 1,
@@ -2463,7 +2470,7 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
     }
     if !state.filtered_rows.is_empty() && state.archive_shortcut_available() {
         first_row_hints.push(PickerFooterHint {
-            key: "ctrl+a".to_string(),
+            key: crate::key_hint::ctrl(KeyCode::Char('a')).display_label(),
             wide_label: String::from("archive"),
             compact_label: String::from("archive"),
             priority: 2,
@@ -2479,7 +2486,7 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
     }
     first_row_hints.extend([
         PickerFooterHint {
-            key: "ctrl+c".to_string(),
+            key: crate::key_hint::ctrl(KeyCode::Char('c')).display_label(),
             wide_label: ctrl_c_label.to_string(),
             compact_label: ctrl_c_label.to_string(),
             priority: 2,
@@ -2507,19 +2514,19 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
     }
     let mut second_row_hints = vec![
         PickerFooterHint {
-            key: "ctrl+o".to_string(),
+            key: crate::key_hint::ctrl(KeyCode::Char('o')).display_label(),
             wide_label: density_label.to_string(),
             compact_label: density_compact_label.to_string(),
             priority: 3,
         },
         PickerFooterHint {
-            key: "ctrl+t".to_string(),
+            key: crate::key_hint::ctrl(KeyCode::Char('t')).display_label(),
             wide_label: String::from("transcript"),
             compact_label: String::from("preview"),
             priority: 4,
         },
         PickerFooterHint {
-            key: "ctrl+e".to_string(),
+            key: crate::key_hint::ctrl(KeyCode::Char('e')).display_label(),
             wide_label: String::from("expand"),
             compact_label: String::from("exp"),
             priority: 6,
@@ -4575,11 +4582,11 @@ mod tests {
 
         let wide = footer_lines_text(&state, /*width*/ 220);
         assert!(wide.contains("esc exit"));
-        assert!(wide.contains("ctrl+c exit"));
+        assert!(wide.contains("⌃c exit"));
 
         let compact = footer_lines_text(&state, /*width*/ 119);
         assert!(compact.contains("esc exit"));
-        assert!(compact.contains("ctrl+c exit"));
+        assert!(compact.contains("⌃c exit"));
 
         state.query = String::from("picker");
 
@@ -4598,14 +4605,14 @@ mod tests {
             SessionPickerAction::Resume,
         );
 
-        assert!(footer_lines_text(&state, /*width*/ 220).contains("ctrl+o dense view"));
-        assert!(footer_lines_text(&state, /*width*/ 220).contains("ctrl+t transcript"));
-        assert!(footer_lines_text(&state, /*width*/ 220).contains("ctrl+e expand"));
+        assert!(footer_lines_text(&state, /*width*/ 220).contains("⌃o dense view"));
+        assert!(footer_lines_text(&state, /*width*/ 220).contains("⌃t transcript"));
+        assert!(footer_lines_text(&state, /*width*/ 220).contains("⌃e expand"));
         state.keymap.list.move_left = vec![crate::key_hint::ctrl(KeyCode::Char('h'))];
         state.keymap.list.move_right = vec![crate::key_hint::ctrl(KeyCode::Char('l'))];
         let remapped_footer = footer_lines_text(&state, /*width*/ 220);
         assert!(
-            remapped_footer.contains("ctrl+h/ctrl+l change option"),
+            remapped_footer.contains("⌃h/⌃l change option"),
             "{remapped_footer}"
         );
         state.keymap.list.move_left.clear();
@@ -4614,7 +4621,7 @@ mod tests {
 
         state.density = SessionListDensity::Dense;
 
-        assert!(footer_lines_text(&state, /*width*/ 220).contains("ctrl+o comfortable view"));
+        assert!(footer_lines_text(&state, /*width*/ 220).contains("⌃o comfortable view"));
     }
 
     #[test]
@@ -4634,9 +4641,9 @@ mod tests {
         assert!(rendered.contains("esc new"));
         assert!(rendered.contains("tab focus"));
         assert!(rendered.contains("←/→ option"));
-        assert!(rendered.contains("ctrl+o dense"));
-        assert!(rendered.contains("ctrl+t preview"));
-        assert!(rendered.contains("ctrl+e exp"));
+        assert!(rendered.contains("⌃o dense"));
+        assert!(rendered.contains("⌃t preview"));
+        assert!(rendered.contains("⌃e exp"));
         assert!(!rendered.contains("focus sort/filter"));
     }
 
@@ -4702,7 +4709,7 @@ mod tests {
         assert!(lines.iter().all(|line| line.width() <= width as usize));
         assert_eq!(
             rendered,
-            " enter resume   esc new   ctrl+c quit\n ctrl+o comfy   ctrl+t preview"
+            " enter resume   esc new   ⌃c quit\n ⌃o comfy   ⌃t preview   ↑/↓ browse"
         );
     }
 
@@ -4722,7 +4729,7 @@ mod tests {
         let rendered = footer_lines_text(&state, /*width*/ 80);
 
         assert!(rendered.contains("loading transcript"));
-        assert!(rendered.contains("ctrl+c quit"));
+        assert!(rendered.contains("⌃c quit"));
         assert!(!rendered.contains("enter"));
     }
 
