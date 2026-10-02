@@ -85,6 +85,7 @@ mod queue_cmd;
 mod remote_control_cmd;
 #[cfg(target_os = "windows")]
 mod sandbox_setup;
+mod sandbox_uninstall;
 mod state_db_recovery;
 #[cfg(not(windows))]
 mod wsl_paths;
@@ -196,7 +197,7 @@ enum Subcommand {
     Doctor(DoctorCommand),
 
     /// Run commands within a Codex-provided sandbox.
-    Sandbox(HostSandboxArgs),
+    Sandbox(SandboxCommand),
 
     /// Debugging tools.
     Debug(DebugCommand),
@@ -464,6 +465,20 @@ impl clap::FromArgMatches for SessionTuiCli {
     fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
         self.0.update_from_arg_matches(matches)
     }
+}
+
+#[derive(Debug, Parser)]
+struct SandboxCommand {
+    #[command(flatten)]
+    host: HostSandboxArgs,
+
+    #[command(subcommand)]
+    subcommand: Option<SandboxSubcommand>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum SandboxSubcommand {
+    Uninstall(sandbox_uninstall::SandboxUninstallCommand),
 }
 
 #[cfg(target_os = "macos")]
@@ -1659,7 +1674,10 @@ async fn cli_main(
             codex_cloud_tasks::run_main(cloud_cli, arg0_paths.codex_linux_sandbox_exe.clone())
                 .await?;
         }
-        Some(Subcommand::Sandbox(mut sandbox_cli)) => {
+        Some(Subcommand::Sandbox(SandboxCommand {
+            host: mut sandbox_cli,
+            subcommand,
+        })) => {
             let config_profile = sandbox_cli
                 .config_profile
                 .as_ref()
@@ -1687,6 +1705,9 @@ async fn cli_main(
                 root_remote_auth_token_env.as_deref(),
                 "sandbox",
             )?;
+            if let Some(SandboxSubcommand::Uninstall(command)) = subcommand {
+                return command.run();
+            }
             let loader_overrides = loader_overrides_for_profile(config_profile)?;
             #[cfg(target_os = "macos")]
             codex_cli::run_command_under_seatbelt(
@@ -3570,6 +3591,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sandbox_uninstall_respects_command_separator() {
+        let cli = MultitoolCli::try_parse_from(["codex", "sandbox", "uninstall"]).expect("parse");
+        assert!(matches!(
+            cli.subcommand,
+            Some(Subcommand::Sandbox(SandboxCommand {
+                subcommand: Some(SandboxSubcommand::Uninstall(_)),
+                ..
+            }))
+        ));
+
+        for args in [
+            vec!["codex", "sandbox", "--", "uninstall", "--help"],
+            vec![
+                "codex",
+                "sandbox",
+                "--profile",
+                "uninstall",
+                "--",
+                "uninstall",
+                "--help",
+            ],
+        ] {
+            let cli = MultitoolCli::try_parse_from(args).expect("parse forwarded command");
+            let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+                panic!("expected sandbox command");
+            };
+            assert!(command.subcommand.is_none());
+            assert_eq!(command.host.command, vec!["uninstall", "--help"]);
+        }
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
     fn sandbox_parses_permission_profile() {
@@ -3583,7 +3636,7 @@ mod tests {
         ])
         .expect("parse");
 
-        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+        let Some(Subcommand::Sandbox(SandboxCommand { host: command, .. })) = cli.subcommand else {
             panic!("expected sandbox command");
         };
 
@@ -3604,7 +3657,7 @@ mod tests {
         ])
         .expect("parse");
 
-        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+        let Some(Subcommand::Sandbox(SandboxCommand { host: command, .. })) = cli.subcommand else {
             panic!("expected sandbox command");
         };
 
@@ -3627,7 +3680,7 @@ mod tests {
             MultitoolCli::try_parse_from(["codex", "sandbox", "-P", ":workspace", "--", "echo"])
                 .expect("parse");
 
-        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+        let Some(Subcommand::Sandbox(SandboxCommand { host: command, .. })) = cli.subcommand else {
             panic!("expected sandbox command");
         };
 
@@ -3642,7 +3695,7 @@ mod tests {
             MultitoolCli::try_parse_from(["codex", "sandbox", "--profile", "work", "--", "echo"])
                 .expect("parse");
 
-        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+        let Some(Subcommand::Sandbox(SandboxCommand { host: command, .. })) = cli.subcommand else {
             panic!("expected sandbox command");
         };
 

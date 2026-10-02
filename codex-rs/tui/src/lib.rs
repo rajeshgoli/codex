@@ -126,6 +126,7 @@ mod collaboration_modes;
 mod color;
 mod config_update;
 mod control_socket;
+mod copy_input_guard;
 pub(crate) mod custom_terminal;
 mod daybreak;
 mod experimental_features;
