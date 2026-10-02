@@ -1,4 +1,5 @@
 //! App-server event stream handling for the TUI app.
+//! Hidden structured threads reject requests instead of entering interactive routing.
 
 use super::App;
 use super::ThreadBufferedEvent;
@@ -87,6 +88,13 @@ impl App {
                 self.agents_overview.usage_disabled = false;
                 self.repaint_agents_overview();
                 self.refresh_agents_overview_threads(app_server_client);
+                if let Some(primary_thread_id) = self.primary_thread_id
+                    && !self
+                        .agent_navigation
+                        .queue_picker_refresh(primary_thread_id)
+                {
+                    self.refresh_agent_picker_threads(app_server_client, primary_thread_id);
+                }
             }
             AppServerEvent::ServerNotification(notification) => {
                 let request_resolved = matches!(
@@ -205,6 +213,7 @@ impl App {
 
             return;
         }
+        self.handle_agent_picker_visibility_notification(app_server_client, &notification);
 
         if let ServerNotification::ThreadStarted(started) = &notification
             && let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
@@ -326,7 +335,7 @@ impl App {
                 self.agents_overview.pending_usage = None;
                 self.agents_overview.usage_disabled = false;
                 self.repaint_agents_overview();
-                self.chat_widget.cyber_policy_notice = Default::default();
+                self.chat_widget.invalidate_security_setup();
                 if let Some(crate::pager_overlay::Overlay::Analytics(view)) = &mut self.overlay {
                     view.refresh();
                 }
@@ -349,22 +358,27 @@ impl App {
                             | AuthMode::PersonalAccessToken
                     )
                 );
-                self.chat_widget.update_account_state(
-                    status_account_display_from_auth_mode(
-                        notification.auth_mode,
-                        notification.plan_type,
-                    ),
+                let account_display = status_account_display_from_auth_mode(
+                    notification.auth_mode,
                     notification.plan_type,
-                    notification
-                        .auth_mode
-                        .is_some_and(AuthMode::has_chatgpt_account),
+                );
+                let has_chatgpt_account = notification
+                    .auth_mode
+                    .is_some_and(AuthMode::has_chatgpt_account);
+                self.account_email_request_id = None;
+                self.chat_widget.update_account_state(
+                    account_display,
+                    notification.plan_type,
+                    has_chatgpt_account,
                     has_codex_backend_auth,
                 );
                 if self.chat_widget.has_chatgpt_account() {
-                    crate::daybreak::prefetch_notice(
+                    self.refresh_account_email(app_server_client);
+                    crate::security_setup::prefetch(
                         &self.config,
                         app_server_client,
-                        self.chat_widget.cyber_policy_notice.clone(),
+                        self.app_event_tx.clone(),
+                        self.chat_widget.security_setup_request_id,
                     );
                 }
                 return;
@@ -557,6 +571,23 @@ impl App {
         app_server_client: &AppServerSession,
         request: ServerRequest,
     ) {
+        let thread_id = server_request_thread_id(&request);
+        if thread_id
+            .is_some_and(|thread_id| self.temporary_structured_requests.contains_key(&thread_id))
+        {
+            if let Err(err) = self
+                .reject_app_server_request(
+                    app_server_client,
+                    request.id().clone(),
+                    "temporary structured threads cannot request tools or user interaction"
+                        .to_string(),
+                )
+                .await
+            {
+                tracing::debug!("{err}");
+            }
+            return;
+        }
         if let ServerRequest::DynamicToolCall { request_id, params } = &request {
             if self.dynamic_tool_tasks.contains_key(request_id)
                 || (params.namespace.as_deref() != Some(crate::dynamic_tools::NAMESPACE)
@@ -645,7 +676,6 @@ impl App {
             return;
         }
 
-        let thread_id = server_request_thread_id(&request);
         let background_voice = self.background_voice.as_ref().is_some_and(|owner| {
             owner.realtime_conversation_is_running()
                 && owner.thread_id().is_some()
@@ -689,6 +719,7 @@ impl App {
         }
         if let Some(thread_id) = thread_id
             && self.primary_thread_id != Some(thread_id)
+            && self.active_thread_id != Some(thread_id)
             && !unsupported_request
             && !background_voice
             && let Some(requests) = self.agents_overview.dispatched_requests.get_mut(&thread_id)

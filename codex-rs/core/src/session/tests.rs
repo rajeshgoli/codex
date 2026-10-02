@@ -291,6 +291,7 @@ impl StepContext {
             environments,
             selected_capability_roots: Vec::new(),
             executor_capability_discovery: None,
+            extension_data: codex_extension_api::ExtensionData::new(turn.sub_id.clone()),
             mcp: Arc::new(codex_mcp::McpBinding::empty(mcp_config_for_test(
                 &turn.config,
             ))),
@@ -1709,7 +1710,7 @@ async fn user_shell_commands_do_not_inherit_managed_network_proxy() -> anyhow::R
         let event = rx.recv().await.expect("channel open");
         if let EventMsg::ExecCommandEnd(event) = event.msg {
             assert_eq!(event.exit_code, 0);
-            assert_eq!(event.stdout.trim(), "not-set");
+            assert_eq!(event.aggregated_output.trim(), "not-set");
             break;
         }
     }
@@ -2484,6 +2485,7 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
@@ -3101,6 +3103,7 @@ async fn prepares_resumed_history_before_installing_it() {
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: ThreadId::default(),
             history: Arc::new(vec![RolloutItem::ResponseItem(ResponseItemEnvelope {
                 item: resumed_item,
@@ -3161,6 +3164,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
     assert_eq!(
         resolve_multi_agent_version(
             &InitialHistory::Resumed(ResumedHistory {
+                history_revision: None,
                 conversation_id: thread_id,
                 history: Arc::new(Vec::new()),
                 rollout_path: None,
@@ -3172,6 +3176,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
     assert_eq!(
         resolve_multi_agent_version(
             &InitialHistory::Resumed(ResumedHistory {
+                history_revision: None,
                 conversation_id: thread_id,
                 history: Arc::new(Vec::new()),
                 rollout_path: None,
@@ -3183,6 +3188,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
     assert_eq!(
         resolve_multi_agent_version(
             &InitialHistory::Resumed(ResumedHistory {
+                history_revision: None,
                 conversation_id: thread_id,
                 history: Arc::new(vec![session_meta_item(
                     thread_id,
@@ -3248,6 +3254,7 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
@@ -3358,6 +3365,7 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
@@ -4011,12 +4019,16 @@ async fn start_new_context_window_persists_checkpoint_state() {
             .await
             .expect("world state should build"),
     );
-
+    let expected_snapshot = world_state.render_full().0.into_object();
     session
         .start_new_context_window(&step_context, world_state)
         .await;
 
     let live_history = session.clone_history().await;
+    assert_eq!(
+        live_history.world_state_checkpoint().unwrap().state,
+        expected_snapshot
+    );
     assert!(live_history.raw_items().next().is_some());
     assert!(live_history.raw_items().all(|item| item.id().is_some()));
 
@@ -4027,6 +4039,17 @@ async fn start_new_context_window_persists_checkpoint_state() {
     else {
         panic!("expected resumed rollout history");
     };
+    let persisted_world_state = resumed
+        .history
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            RolloutItem::WorldState(world_state) => Some(world_state),
+            _ => None,
+        })
+        .expect("new window should persist a world state");
+    assert!(persisted_world_state.full);
+    assert_eq!(persisted_world_state.state, expected_snapshot);
     let persisted_compacted = resumed.history.iter().rev().find_map(|item| match item {
         RolloutItem::Compacted(compacted) => Some(compacted),
         RolloutItem::SessionMeta(_)
@@ -4389,6 +4412,7 @@ async fn set_rate_limits_retains_previous_credits() {
         },
     };
     let session_configuration = SessionConfiguration {
+        turn_extension_init: Default::default(),
         provider: create_model_provider(config.model_provider.clone(), /*auth_manager*/ None),
         environments: Vec::new(),
         step_settings: Arc::new(StepSettings {
@@ -4511,6 +4535,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         },
     };
     let session_configuration = SessionConfiguration {
+        turn_extension_init: Default::default(),
         provider: create_model_provider(config.model_provider.clone(), /*auth_manager*/ None),
         environments: Vec::new(),
         step_settings: Arc::new(StepSettings {
@@ -5132,6 +5157,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
     };
 
     SessionConfiguration {
+        turn_extension_init: Default::default(),
         provider: create_model_provider(config.model_provider.clone(), /*auth_manager*/ None),
         environments: Vec::new(),
         step_settings: Arc::new(StepSettings {
@@ -5869,6 +5895,7 @@ async fn settings_checkpoint_waits_for_accepted_settings_persistence() {
             /*reference_context_item*/ None,
             /*world_state_baseline*/ None,
             CompactedHistoryMetadata {
+                input_goal_ids: Default::default(),
                 message: "summary".to_string(),
                 window_number,
                 window_ids,
@@ -6002,6 +6029,7 @@ async fn mcp_attribution_checkpoints_cover_batch_prefixes_compaction_and_restore
             /*reference_context_item*/ None,
             /*world_state_baseline*/ None,
             CompactedHistoryMetadata {
+                input_goal_ids: Default::default(),
                 message: "summary".to_string(),
                 window_number,
                 window_ids,
@@ -6061,6 +6089,7 @@ async fn standalone_settings_invalidate_continuation_before_delivering_acceptanc
     tx_sub
         .send(Submission {
             id: "settings".into(),
+            turn_extension_init: None,
             op: Op::ThreadSettings {
                 thread_settings: codex_protocol::protocol::ThreadSettingsOverrides::default(),
                 reply: Some(reply),
@@ -6125,14 +6154,33 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
         thread_settings: session.thread_settings_snapshot().await,
     };
 
+    let mut first_live_history = None;
     for with_baselines in [true, false] {
+        let input_goal_ids =
+            crate::context::UserGoalUpdate::message_ids(session.clone_history().await.raw_items());
+        // The goal edit is accepted after the compaction input was captured.
+        let accepted_goal = if with_baselines {
+            session
+                .record_user_goal_update(crate::context::UserGoalUpdate::Clear)
+                .await
+                .expect("record concurrent clear");
+            session
+                .clone_history()
+                .await
+                .annotated_items()
+                .last()
+                .cloned()
+        } else {
+            None
+        };
         let (window_number, window_ids) = session.advance_auto_compact_window().await;
         session
             .replace_compacted_history(
                 vec![ResponseItemEnvelope::new(user_message("compacted context"))],
                 with_baselines.then_some(turn_context_baseline.clone()),
-                with_baselines.then_some(Arc::clone(&world_state)),
+                with_baselines.then(|| world_state.render_full().0),
                 CompactedHistoryMetadata {
+                    input_goal_ids,
                     message: String::new(),
                     window_number,
                     window_ids,
@@ -6142,6 +6190,11 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
                 },
             )
             .await;
+        if let Some(accepted_goal) = accepted_goal {
+            let live_history = session.clone_history().await.annotated_items().to_vec();
+            assert_eq!(&live_history[1..], &[accepted_goal]);
+            first_live_history = Some(live_history);
+        }
     }
 
     session.flush_rollout().await.expect("flush checkpoints");
@@ -6163,11 +6216,12 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
     else {
         panic!("unexpected compaction records: {compaction_items:#?}");
     };
+    assert_eq!(first.replacement_history, first_live_history);
     assert_eq!(first.resume_metadata.as_ref(), Some(&expected));
     assert_eq!(second.resume_metadata.as_ref(), Some(&expected));
     assert_eq!(
         first_world_state,
-        &WorldStateItem::full(world_state.snapshot().into_object())
+        &WorldStateItem::full(world_state.render_full().0.into_object())
     );
     assert_eq!(first_turn_context, &turn_context_baseline);
     assert_eq!(first_settings, &expected_settings);
@@ -6228,6 +6282,30 @@ async fn session_settings_commit_keeps_snapshot_across_postcommit_wait() {
     assert_eq!(commit.snapshot, expected);
     assert_eq!(configuration_snapshot, expected);
     assert_ne!(later_commit.snapshot, expected);
+}
+
+#[tokio::test]
+async fn mcp_runtime_keeps_local_backend_without_a_selected_local_environment() {
+    let (session, turn) = make_session_and_context().await;
+    let mut desired = session
+        .latest_mcp_desired_state(/*auth*/ None, turn.initial_environments.clone())
+        .await;
+    Arc::make_mut(&mut desired.config).prefer_mxc = true;
+    desired.environments.environments.clear();
+    let runtime = session.build_mcp_runtime_input(
+        &desired,
+        crate::mcp::McpRuntimeProjection {
+            config: (*mcp_config_for_test(&desired.config)).clone(),
+            plugins_available: false,
+            selected_plugins: Default::default(),
+        },
+        &[],
+        /*elicitation_reviewer*/ None,
+    );
+    assert_eq!(
+        runtime.config.environment_use_mxc,
+        HashMap::from([(DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(), cfg!(windows))])
+    );
 }
 
 #[tokio::test]
@@ -6472,6 +6550,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         },
     };
     let session_configuration = SessionConfiguration {
+        turn_extension_init: Default::default(),
         provider: create_model_provider(
             config.model_provider.clone(),
             Some(Arc::clone(&auth_manager)),
@@ -6592,6 +6671,7 @@ async fn build_initial_context(
     session
         .build_initial_context_with_world_state(&step_context, &world_state)
         .await
+        .0
 }
 
 pub(crate) async fn build_world_state_from_turn_context(
@@ -6698,6 +6778,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     };
     let default_environments = vec![local(config.cwd.clone())];
     let session_configuration = SessionConfiguration {
+        turn_extension_init: Default::default(),
         environments: default_environments.clone(),
         provider: create_model_provider(
             config.model_provider.clone(),
@@ -6827,6 +6908,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         models_manager: Arc::clone(&models_manager),
         git_root_discovery: Arc::default(),
         tool_approvals: Mutex::new(ApprovalStore::default()),
+        granted_permissions_by_environment_id: Arc::default(),
         runtime_handle: tokio::runtime::Handle::current(),
         skills_service,
         agents_md_manager: Arc::new(AgentsMdManager::new(SessionInstructions::default())),
@@ -6952,6 +7034,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let turn_context = Session::make_turn_context(
         thread_id,
         SessionId::from(thread_id),
+        Arc::clone(&session.services.granted_permissions_by_environment_id),
         Some(Arc::clone(&auth_manager)),
         &session_telemetry,
         session_configuration.provider.clone(),
@@ -7021,6 +7104,7 @@ async fn make_session_with_config_and_rx(
     };
     let default_environments = vec![local(config.cwd.clone())];
     let session_configuration = SessionConfiguration {
+        turn_extension_init: Default::default(),
         environments: default_environments.clone(),
         provider: create_model_provider(
             config.model_provider.clone(),
@@ -7153,6 +7237,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
     };
     let default_environments = vec![local(config.cwd.clone())];
     let session_configuration = SessionConfiguration {
+        turn_extension_init: Default::default(),
         environments: default_environments.clone(),
         provider: create_model_provider(
             config.model_provider.clone(),
@@ -7269,6 +7354,7 @@ async fn resumed_root_session_uses_thread_id_as_session_id() {
     let thread_id = ThreadId::new();
     let (session, rx_event) = make_session_with_history_source_and_agent_control_and_rx(
         InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: thread_id,
             history: Arc::new(Vec::new()),
             rollout_path: None,
@@ -7304,6 +7390,7 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
     });
     let (session, rx_event) = make_session_with_history_source_and_agent_control_and_rx(
         InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: thread_id,
             history: Arc::new(vec![RolloutItem::SessionMeta(SessionMetaLine {
                 meta: SessionMeta {
@@ -7365,6 +7452,7 @@ async fn resumed_copied_fork_ignores_source_history_base() {
     ];
     let (session, _rx_event) = make_session_with_history_source_and_agent_control_and_rx(
         InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: thread_id,
             history: Arc::new(history),
             rollout_path: None,
@@ -7381,8 +7469,9 @@ async fn resumed_copied_fork_ignores_source_history_base() {
 
 #[tokio::test]
 async fn notify_request_permissions_response_ignores_unmatched_call_id() {
-    let (session, _turn_context) = make_session_and_context().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    let (session, turn_context) = make_session_and_context().await;
+    let active_turn = ActiveTurn::default();
+    *session.active_turn.lock().await = Some(active_turn);
 
     session
         .notify_request_permissions_response(
@@ -7401,23 +7490,16 @@ async fn notify_request_permissions_response_ignores_unmatched_call_id() {
         .await;
 
     assert_eq!(
-        session
-            .granted_turn_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID)
-            .await,
+        turn_context.granted_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID),
         None
     );
 }
 
 #[tokio::test]
 async fn record_granted_request_permissions_for_turn_uses_originating_turn() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let originating_active_turn = ActiveTurn::default();
-    let originating_turn_state = Arc::clone(&originating_active_turn.turn_state);
-    *session.active_turn.lock().await = Some(originating_active_turn);
+    let (session, turn_context) = make_session_and_context().await;
 
-    let current_active_turn = ActiveTurn::default();
-    let current_turn_state = Arc::clone(&current_active_turn.turn_state);
-    *session.active_turn.lock().await = Some(current_active_turn);
+    let (_other_session, current_turn_context) = make_session_and_context().await;
 
     let requested_permissions = RequestPermissionProfile {
         network: Some(codex_protocol::models::NetworkPermissions {
@@ -7425,46 +7507,29 @@ async fn record_granted_request_permissions_for_turn_uses_originating_turn() {
         }),
         ..RequestPermissionProfile::default()
     };
-    session
-        .record_granted_request_permissions_for_turn(
-            &codex_protocol::request_permissions::RequestPermissionsResponse {
-                permissions: requested_permissions.clone(),
-                scope: PermissionGrantScope::Turn,
-                strict_auto_review: false,
-            },
-            codex_exec_server::LOCAL_ENVIRONMENT_ID,
-            Some(&originating_turn_state),
-        )
-        .await;
+    session.record_granted_request_permissions_for_turn(
+        &codex_protocol::request_permissions::RequestPermissionsResponse {
+            permissions: requested_permissions.clone(),
+            scope: PermissionGrantScope::Turn,
+            strict_auto_review: false,
+        },
+        codex_exec_server::LOCAL_ENVIRONMENT_ID,
+        &turn_context,
+    );
 
     assert_eq!(
-        originating_turn_state
-            .lock()
-            .await
-            .granted_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID),
+        turn_context.granted_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID),
         Some(requested_permissions.into())
     );
     assert_eq!(
-        current_turn_state
-            .lock()
-            .await
-            .granted_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID),
-        None
-    );
-    assert_eq!(
-        session
-            .granted_turn_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID)
-            .await,
+        current_turn_context.granted_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID),
         None
     );
 }
 
 #[tokio::test]
 async fn request_permission_grants_are_environment_keyed() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let originating_active_turn = ActiveTurn::default();
-    let originating_turn_state = Arc::clone(&originating_active_turn.turn_state);
-    *session.active_turn.lock().await = Some(originating_active_turn);
+    let (session, turn_context) = make_session_and_context().await;
 
     let requested_permissions = RequestPermissionProfile {
         network: Some(codex_protocol::models::NetworkPermissions {
@@ -7472,52 +7537,57 @@ async fn request_permission_grants_are_environment_keyed() {
         }),
         ..RequestPermissionProfile::default()
     };
-    session
-        .record_granted_request_permissions_for_turn(
-            &codex_protocol::request_permissions::RequestPermissionsResponse {
-                permissions: requested_permissions.clone(),
-                scope: PermissionGrantScope::Turn,
-                strict_auto_review: false,
-            },
-            "remote",
-            Some(&originating_turn_state),
-        )
-        .await;
-
-    {
-        let turn_state = originating_turn_state.lock().await;
-        assert_eq!(
-            turn_state.granted_permissions("remote"),
-            Some(requested_permissions.clone().into())
-        );
-        assert_eq!(turn_state.granted_permissions("local"), None);
-    }
-
-    session
-        .record_granted_request_permissions_for_turn(
-            &codex_protocol::request_permissions::RequestPermissionsResponse {
-                permissions: requested_permissions.clone(),
-                scope: PermissionGrantScope::Session,
-                strict_auto_review: false,
-            },
-            "remote",
-            /*originating_turn_state*/ None,
-        )
-        .await;
+    session.record_granted_request_permissions_for_turn(
+        &codex_protocol::request_permissions::RequestPermissionsResponse {
+            permissions: requested_permissions.clone(),
+            scope: PermissionGrantScope::Turn,
+            strict_auto_review: false,
+        },
+        "remote",
+        &turn_context,
+    );
 
     assert_eq!(
-        session.granted_session_permissions("remote").await,
+        turn_context.granted_permissions("remote"),
+        Some(requested_permissions.clone().into())
+    );
+    assert_eq!(turn_context.granted_permissions("local"), None);
+
+    session.record_granted_request_permissions_for_turn(
+        &codex_protocol::request_permissions::RequestPermissionsResponse {
+            permissions: requested_permissions.clone(),
+            scope: PermissionGrantScope::Session,
+            strict_auto_review: false,
+        },
+        "remote",
+        &turn_context,
+    );
+
+    assert_eq!(
+        session
+            .services
+            .granted_permissions_by_environment_id
+            .lock()
+            .expect("session permission grants lock poisoned")
+            .get("remote")
+            .cloned(),
         Some(requested_permissions.into())
     );
-    assert_eq!(session.granted_session_permissions("local").await, None);
+    assert_eq!(
+        session
+            .services
+            .granted_permissions_by_environment_id
+            .lock()
+            .expect("session permission grants lock poisoned")
+            .get("local")
+            .cloned(),
+        None
+    );
 }
 
 #[tokio::test]
 async fn enable_strict_auto_review_for_turn_uses_originating_turn() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let originating_active_turn = ActiveTurn::default();
-    let originating_turn_state = Arc::clone(&originating_active_turn.turn_state);
-    *session.active_turn.lock().await = Some(originating_active_turn);
+    let (session, turn_context) = make_session_and_context().await;
 
     let requested_permissions = RequestPermissionProfile {
         network: Some(codex_protocol::models::NetworkPermissions {
@@ -7525,24 +7595,17 @@ async fn enable_strict_auto_review_for_turn_uses_originating_turn() {
         }),
         ..RequestPermissionProfile::default()
     };
-    session
-        .record_granted_request_permissions_for_turn(
-            &codex_protocol::request_permissions::RequestPermissionsResponse {
-                permissions: requested_permissions.clone(),
-                scope: PermissionGrantScope::Turn,
-                strict_auto_review: true,
-            },
-            codex_exec_server::LOCAL_ENVIRONMENT_ID,
-            Some(&originating_turn_state),
-        )
-        .await;
-
-    assert!(
-        originating_turn_state
-            .lock()
-            .await
-            .strict_auto_review_enabled()
+    session.record_granted_request_permissions_for_turn(
+        &codex_protocol::request_permissions::RequestPermissionsResponse {
+            permissions: requested_permissions,
+            scope: PermissionGrantScope::Turn,
+            strict_auto_review: true,
+        },
+        codex_exec_server::LOCAL_ENVIRONMENT_ID,
+        &turn_context,
     );
+
+    assert!(turn_context.strict_auto_review_enabled());
 }
 
 #[test]
@@ -7949,8 +8012,12 @@ async fn request_permissions_response_materializes_session_cwd_grants_before_rec
     assert_eq!(response, Some(expected_response));
     assert_eq!(
         session
-            .granted_session_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID)
-            .await,
+            .services
+            .granted_permissions_by_environment_id
+            .lock()
+            .expect("session permission grants lock poisoned")
+            .get(codex_exec_server::LOCAL_ENVIRONMENT_ID)
+            .cloned(),
         Some(expected_permissions.into())
     );
 }
@@ -8118,6 +8185,7 @@ fn submission_dispatch_span_prefers_submission_trace_context() {
     };
     let dispatch_span = ambient_span.in_scope(|| {
         submission_dispatch_span(&Submission {
+            turn_extension_init: None,
             id: "sub-1".into(),
             op: Op::Interrupt,
             parent_turn_id: None,
@@ -8139,6 +8207,7 @@ fn submission_dispatch_span_uses_debug_for_realtime_audio() {
     let _trace_test_context = install_test_tracing("codex-core-tests");
 
     let dispatch_span = submission_dispatch_span(&Submission {
+        turn_extension_init: None,
         id: "sub-1".into(),
         op: Op::RealtimeConversationAudio(ConversationAudioParams {
             frame: RealtimeAudioFrame {
@@ -8505,6 +8574,7 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
             .await;
 
     let dispatch_span = submission_dispatch_span(&Submission {
+        turn_extension_init: None,
         id: "sub-1".into(),
         op: Op::Interrupt,
         parent_turn_id: None,
@@ -8975,6 +9045,7 @@ where
     };
     let default_environments = vec![local(config.cwd.clone())];
     let session_configuration = SessionConfiguration {
+        turn_extension_init: Default::default(),
         environments: default_environments.clone(),
         provider: create_model_provider(
             config.model_provider.clone(),
@@ -9103,6 +9174,7 @@ where
         models_manager: Arc::clone(&models_manager),
         git_root_discovery: Arc::default(),
         tool_approvals: Mutex::new(ApprovalStore::default()),
+        granted_permissions_by_environment_id: Arc::default(),
         runtime_handle: tokio::runtime::Handle::current(),
         skills_service,
         agents_md_manager: Arc::new(AgentsMdManager::new(SessionInstructions::default())),
@@ -9228,6 +9300,7 @@ where
     let turn_context = Arc::new(Session::make_turn_context(
         thread_id,
         SessionId::from(thread_id),
+        Arc::clone(&session.services.granted_permissions_by_environment_id),
         Some(Arc::clone(&auth_manager)),
         &session_telemetry,
         session_configuration.provider.clone(),
@@ -9354,12 +9427,6 @@ async fn cancelled_step_capture_finishes_warning_delivery() {
         ),
         (INITIAL_SUBMIT_ID.to_owned(), warnings[1].clone()),
     );
-    assert!(
-        turn.extension_data
-            .get::<codex_extension_api::SelectedPluginSnapshot>()
-            .is_none()
-    );
-
     session
         .capture_step_context(turn, &CancellationToken::new())
         .await
@@ -9860,6 +9927,40 @@ async fn mcp_refresh_detects_shared_auth_manager_changes() {
             .services
             .mcp_runtime
             .current_auth_matches(session.services.auth_manager.auth_cached().as_ref())
+    );
+}
+
+/// A ready registry entry alone must not expose roots outside the turn's environment selection.
+#[tokio::test]
+async fn capability_roots_require_turn_environment_selection() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let environment = turn_context
+        .initial_environments
+        .primary()
+        .expect("ready local environment");
+    let root = codex_protocol::capabilities::SelectedCapabilityRoot {
+        id: "selected-root".to_string(),
+        location: codex_protocol::capabilities::CapabilityRootLocation::Environment {
+            environment_id: environment.selection.environment_id.clone(),
+            path: environment.cwd().clone(),
+        },
+    };
+    session.services.selected_capability_roots = vec![root.clone()];
+
+    let unselected_roots = session
+        .resolve_selected_capability_roots_for_step(&TurnEnvironmentSnapshot::default())
+        .await;
+    assert!(unselected_roots.is_empty());
+
+    let selected_roots = session
+        .resolve_selected_capability_roots_for_step(&turn_context.initial_environments)
+        .await;
+    assert_eq!(
+        selected_roots
+            .iter()
+            .map(|root| root.selected_root().clone())
+            .collect::<Vec<_>>(),
+        vec![root]
     );
 }
 
@@ -10480,7 +10581,7 @@ async fn build_initial_context_reuses_in_flight_recommendation_prewarm() {
     tokio::pin!(initial_context);
     assert!(futures::poll!(initial_context.as_mut()).is_pending());
 
-    let (_, initial_context) = tokio::join!(prewarm, initial_context);
+    let (_, (initial_context, _)) = tokio::join!(prewarm, initial_context);
     assert_eq!(
         developer_input_texts(&initial_context)
             .into_iter()
@@ -10669,7 +10770,7 @@ async fn record_context_updates_includes_turn_context_fragments_on_steady_state_
         state.set_reference_context_item(Some(previous_context_item));
         state
             .history
-            .set_world_state_baseline(world_state.snapshot());
+            .set_world_state_baseline(world_state.render_full().0);
     }
 
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
@@ -11056,6 +11157,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
     let world_state = build_world_state_from_turn_context(&session, &previous_context).await;
     let retained_world_state = world_state
         .render_full()
+        .1
         .into_iter()
         .map(ContextualUserFragment::into_boxed_response_item)
         .collect::<Vec<_>>();
@@ -11072,7 +11174,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
         let mut state = session.state.lock().await;
         state
             .history
-            .set_world_state_baseline(world_state.snapshot());
+            .set_world_state_baseline(world_state.render_full().0);
     }
     let rollout_path = attach_thread_persistence(&mut session).await;
 
@@ -11242,13 +11344,14 @@ async fn build_initial_context_uses_retained_step_after_model_change() {
     let world_b = session.build_world_state_for_step(&step_b).await.unwrap();
     let initial_b = session
         .build_initial_context_with_world_state(&step_b, &world_b)
-        .await;
+        .await
+        .0;
     let turn_contributions_b = session.build_turn_context_contribution_items(&step_b).await;
-    let (restored_a, restored_world) =
+    let (restored_a, restored_snapshot) =
         crate::compact::build_compaction_initial_context(&session, &retained).await;
 
     assert_eq!(restored_a, initial_a);
-    assert!(Arc::ptr_eq(restored_world.as_ref().unwrap(), &world_a));
+    assert_eq!(restored_snapshot, Some(world_a.render_full().0));
     let initial_a = initial_a
         .into_iter()
         .map(ResponseItemEnvelope::into_item)

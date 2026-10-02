@@ -9,6 +9,7 @@ use super::*;
 use crate::history_cell::HistoryRenderMode;
 use crate::keymap::KeymapContext;
 use crate::keymap::bindings_for_action;
+use crate::keymap::configured_binding_for_action;
 use crate::keymap::keymap_action_ids;
 use crate::motion::MotionMode;
 use crate::pager_overlay::TranscriptHistoryState;
@@ -42,6 +43,7 @@ impl App {
         let chat_widget = &self.chat_widget;
         let transcript_width = chat_widget.history_wrap_width(width);
         let view = &mut self.transcript_view;
+        view.mouse_scroll_speed = self.local_settings.tui.mouse_scroll_speed.unwrap_or(1.0);
         view.primary_selection = self.right_click_paste_environment.primary;
         view.copy_on_select = self
             .local_settings
@@ -53,7 +55,10 @@ impl App {
         let active_ids = chat_widget.active_activity_ids();
         let expanded = view.sync_live_activity(&self.transcript_cells, active_ids)
             && chat_widget.history_render_mode() == HistoryRenderMode::Rich;
-        if detailed {
+        let search_changed = view.sync_search_live_tail(transcript_width, active_key, |width| {
+            chat_widget.active_cell_transcript_hyperlink_lines(width)
+        });
+        let changed = if detailed {
             view.sync_live_tail(transcript_width, active_key, |width| {
                 chat_widget.active_cell_transcript_hyperlink_lines(width)
             })
@@ -61,7 +66,8 @@ impl App {
             view.sync_live_activity_tail(transcript_width, active_key, expanded, |width| {
                 chat_widget.active_cell_owned_transcript_lines(width, expanded)
             })
-        }
+        };
+        changed || search_changed
     }
 
     pub(super) fn render_owned_transcript(
@@ -112,16 +118,24 @@ impl App {
             /*height*/ 1,
         ));
         let footer = view.footer_with_navigation(footer_area.width, motion, latest_navigation);
-        let bottom = chat_widget.bottom_pane_renderable(
-            prompt_footer.as_ref().or(footer.as_ref()),
-            if view.has_active_interaction() {
-                crate::bottom_pane::CommandPopupPlacement::Hidden
-            } else {
-                crate::bottom_pane::CommandPopupPlacement::Overlay
-            },
-            composer_gap.as_ref(),
-            working_tip,
-        );
+        // Cap the whole composer (including padding and hints) at two-thirds of the screen,
+        // but allow at least 8 rows on small screens, without exceeding the screen itself.
+        let max_composer_height = ((u32::from(screen_size.height) * 2 / 3) as u16)
+            .max(8)
+            .min(screen_size.height);
+        let bottom =
+            chat_widget.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions {
+                max_height: Some(max_composer_height),
+                footer: prompt_footer.as_ref().or(footer.as_ref()),
+                command_popup_placement: if view.has_active_interaction() {
+                    crate::bottom_pane::CommandPopupPlacement::Hidden
+                } else {
+                    crate::bottom_pane::CommandPopupPlacement::Overlay
+                },
+                composer_gap: composer_gap.as_ref(),
+                working_tip,
+                ..Default::default()
+            });
         let dashboard_visible = chat_widget
             .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID)
             .is_some();
@@ -181,16 +195,19 @@ impl App {
             {
                 *progress = crate::bottom_pane::footer_hint_items_line(&items);
             }
-            let bottom = chat_widget.bottom_pane_renderable(
-                prompt_footer.as_ref().or(footer.as_ref()),
-                if view.has_active_interaction() {
-                    crate::bottom_pane::CommandPopupPlacement::Hidden
-                } else {
-                    crate::bottom_pane::CommandPopupPlacement::Overlay
-                },
-                composer_gap.as_ref(),
-                working_tip,
-            );
+            let bottom =
+                chat_widget.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions {
+                    max_height: Some(max_composer_height),
+                    footer: prompt_footer.as_ref().or(footer.as_ref()),
+                    command_popup_placement: if view.has_active_interaction() {
+                        crate::bottom_pane::CommandPopupPlacement::Hidden
+                    } else {
+                        crate::bottom_pane::CommandPopupPlacement::Overlay
+                    },
+                    composer_gap: composer_gap.as_ref(),
+                    working_tip,
+                    ..Default::default()
+                });
             footer_height_changed = !dashboard_visible
                 && bottom
                     .desired_height(screen_size.width)
@@ -357,9 +374,15 @@ impl App {
                 return Ok(true);
             }
             if composer_ready && self.chat_widget.handle_composer_mouse(*mouse) {
-                self.transcript_view.end_selection(&self.transcript_cells);
-                self.transcript_view.cancel_search();
-                self.transcript_view.clear_activity_focus();
+                if !matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::ScrollUp
+                        | crossterm::event::MouseEventKind::ScrollDown
+                ) {
+                    self.transcript_view.end_selection(&self.transcript_cells);
+                    self.transcript_view.cancel_search();
+                    self.transcript_view.clear_activity_focus();
+                }
                 tui.frame_requester().schedule_frame();
                 return Ok(true);
             }
@@ -450,15 +473,30 @@ impl App {
             self.close_transcript_overlay(tui);
             return Ok(true);
         }
+        let empty_enter_returns_to_latest = matches!(
+            event,
+            TuiEvent::Key(KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                ..
+            })
+        ) && self.enter_returns_to_latest()
+            && self.transcript_view.can_return_to_latest();
         if let TuiEvent::Key(key) = event
-            && ((key.modifiers.is_empty()
-                && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown))
-                || crate::transcript_view::JumpTarget::from_key(*key).is_some())
             && !self.transcript_view.has_active_interaction()
             && keymap_action_ids().any(|action| {
                 action.context != KeymapContext::Pager
                     && !matches!(action.action, "find_transcript" | "focus_activity")
                     && self.active_keymap_contexts().contains_action(action)
+                    && !(empty_enter_returns_to_latest
+                        && action.context == KeymapContext::Composer
+                        && action.action == "submit")
+                    && ((key.modifiers.is_empty()
+                        && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown))
+                        || crate::transcript_view::JumpTarget::from_key(*key).is_some()
+                        || configured_binding_for_action(&self.local_settings.tui.keymap, action)
+                            .is_some_and(std::option::Option::is_some))
                     && bindings_for_action(
                         &self.keymap,
                         action.context.config_name(),
@@ -471,7 +509,7 @@ impl App {
         }
         let action = match event {
             TuiEvent::Key(key)
-                if !self.transcript_view.is_search_active()
+                if !self.transcript_view.is_search_editing()
                     && self.keymap.app.find_transcript.is_pressed(*key) =>
             {
                 self.transcript_view.begin_search();
@@ -499,17 +537,7 @@ impl App {
             | TuiEvent::FocusLost => None,
         };
         let Some(action) = action else {
-            if matches!(
-                event,
-                TuiEvent::Key(KeyEvent {
-                    code: KeyCode::Enter,
-                    modifiers: KeyModifiers::NONE,
-                    kind: KeyEventKind::Press,
-                    ..
-                })
-            ) && self.enter_returns_to_latest()
-                && self.transcript_view.can_return_to_latest()
-            {
+            if empty_enter_returns_to_latest {
                 self.transcript_view.jump_to_latest();
                 tui.frame_requester().schedule_frame();
                 return Ok(true);

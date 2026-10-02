@@ -59,6 +59,8 @@ pub(super) struct AgentsOverviewState {
         Arc<std::sync::Mutex<super::agents_overview_view::AgentsOverviewViewState>>,
     /// Explicit permission-profile choices for new-session carryover, retained across navigation.
     pub(super) selected_permission_profiles: HashMap<ThreadId, String>,
+    /// Accepted menu requests; unchanged settings may never produce a notification.
+    pub(super) requested_permission_profiles: HashMap<ThreadId, PermissionProfileSelection>,
     /// Keep new tasks subscribed and reusable until a first turn makes them resumable.
     pub(super) blank_sessions: HashMap<ThreadId, crate::app_server_session::AppServerStartedThread>,
     pub(super) input_states: HashMap<ThreadId, ThreadInputState>,
@@ -292,12 +294,12 @@ impl App {
             self.chat_widget.add_info_message(
                 format!(
                     "The rename target disappeared. Unsubmitted title: {}",
-                    state.input
+                    state.input.text()
                 ),
                 /*hint*/ None,
             );
             state.rename_target = None;
-            state.input.clear();
+            state.input.set_text_clearing_elements("");
         }
         self.chat_widget
             .replace_bottom_pane_view_if_present(AGENTS_OVERVIEW_VIEW_ID, Box::new(view));
@@ -362,6 +364,11 @@ impl App {
             });
         }
 
+        self.agents_overview
+            .view_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .vim_enabled = self.chat_widget.composer_is_vim_enabled();
         AgentsOverviewView::new(
             rows,
             selected_thread_id,
@@ -773,6 +780,9 @@ impl App {
                     .set_workspace_roots(self.config.permissions.workspace_roots().to_vec());
             }
             self.config = destination_config;
+            if is_new_session {
+                self.remember_launch_permissions();
+            }
             if !read_only {
                 let approval = self.config.permissions.approval_policy.value();
                 if self
@@ -860,7 +870,7 @@ impl App {
                 self.chat_widget.maybe_send_next_queued_input();
             }
         }
-        if !read_only && !is_new_session {
+        if !read_only && !is_new_session && !self.chat_widget.fork_in_progress {
             self.maybe_prompt_resume_paused_goal_after_resume(app_server, root_thread_id)
                 .await;
         }
@@ -956,6 +966,15 @@ impl App {
                 .active_permission_profile
                 .as_ref()
                 .is_some_and(|active| !active.id.starts_with(':'))
+            && self.chat_widget.thread_id().is_none_or(|thread_id| {
+                self.agents_overview
+                    .selected_permission_profiles
+                    .get(&thread_id)
+                    != profile
+                        .active_permission_profile
+                        .as_ref()
+                        .map(|active| &active.id)
+            })
             && (!profile.matches_config(&config)
                 || config.permissions.profile_workspace_roots()
                     != self.config.permissions.profile_workspace_roots())
@@ -974,7 +993,10 @@ impl App {
         }
         .to_path_buf();
         if let Some(draft) = startup_draft.as_deref_mut() {
-            draft.apply_config(&config);
+            draft.apply_settings(
+                &crate::local_settings::LocalSettings::from(&config),
+                config.cwd.as_path(),
+            );
         }
         let mut server_model_cleared = false;
         match StartupDraftPump::run_with_optional_draft(

@@ -832,7 +832,7 @@ impl ProviderAuthCommandFixture {
         #[cfg(unix)]
         let (command, args) = {
             let script_path = tempdir.path().join("print-token.sh");
-            std::fs::write(
+            codex_utils_cargo_bin::write_executable(
                 &script_path,
                 r#"#!/bin/sh
 if [ -f fail-until-401 ]; then
@@ -844,12 +844,6 @@ tail -n +2 tokens.txt > tokens.next
 mv tokens.next tokens.txt
 "#,
             )?;
-            let mut permissions = std::fs::metadata(&script_path)?.permissions();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                permissions.set_mode(0o755);
-            }
-            std::fs::set_permissions(&script_path, permissions)?;
             ("./print-token.sh".to_string(), Vec::new())
         };
 
@@ -907,7 +901,7 @@ fn non_zero_u64(value: u64) -> NonZeroU64 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_includes_initial_messages_and_sends_prior_items() {
+async fn resume_sends_prior_items() {
     skip_if_no_network!();
 
     // Create a fake rollout session file with prior user + system + assistant messages.
@@ -1022,18 +1016,8 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         .await
         .expect("resume conversation");
     let codex = test.codex.clone();
-    let session_configured = test.session_configured;
 
-    // 1) Assert initial_messages only includes existing EventMsg entries; response items are not converted
-    let initial_msgs = session_configured
-        .initial_messages
-        .clone()
-        .expect("expected initial messages option for resumed session");
-    let initial_json = serde_json::to_value(&initial_msgs).unwrap();
-    let expected_initial_json = json!([]);
-    assert_eq!(initial_json, expected_initial_json);
-
-    // 2) Submit new input; the request body must include the prior items, then initial context, then new user input.
+    // Submit new input; the request body must include the prior items, then initial context, then new user input.
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
             text: "hello".into(),

@@ -835,10 +835,7 @@ async fn status_uses_server_provider_id_and_auth_requirement() {
             .flat_map(|line| line.hyperlinks.into_iter())
             .map(|link| link.destination)
             .collect();
-        assert_eq!(
-            destinations,
-            vec!["https://chatgpt.com/codex/settings/usage"]
-        );
+        assert_eq!(destinations, vec!["https://chatgpt.com/settings/usage"]);
     }
 
     let narrow_destinations: Vec<String> = composite
@@ -1916,7 +1913,10 @@ async fn status_snapshot_includes_credits_and_limits() {
     config.model = Some("gpt-5.1-codex".to_string());
     set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
 
-    let account_display = test_status_account_display();
+    let account_display = Some(StatusAccountDisplay::ChatGpt {
+        email: Some("user@example.com".into()),
+        plan: Some("Pro 200".into()),
+    });
     let usage = TokenUsage {
         input_tokens: 1_500,
         cached_input_tokens: 100,

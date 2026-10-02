@@ -336,6 +336,14 @@
         }
       ]
     },
+    "AsyncClassifierMode": {
+      "description": "Async classifier experiment, resolved once for each parent task.",
+      "enum": [
+        "snapshot",
+        "conversation"
+      ],
+      "type": "string"
+    },
     "AuthCredentialsStoreMode": {
       "description": "Determine where Codex should store CLI auth credentials.",
       "oneOf": [
@@ -713,6 +721,9 @@
             "analytics_plan_history": {
               "type": "boolean"
             },
+            "api_key_cyber_access_programs": {
+              "type": "boolean"
+            },
             "api_key_model_discovery": {
               "type": "boolean"
             },
@@ -754,6 +765,9 @@
               "type": "boolean"
             },
             "bedrock_setup_wizard": {
+              "type": "boolean"
+            },
+            "browser_annotation_api": {
               "type": "boolean"
             },
             "browser_use": {
@@ -906,6 +920,9 @@
             "guardianv2": {
               "$ref": "#/definitions/FeatureToml_for_GuardianV2ConfigToml"
             },
+            "guardianv2_decisions_comparison": {
+              "type": "boolean"
+            },
             "hooks": {
               "type": "boolean"
             },
@@ -936,6 +953,9 @@
             "in_app_updates": {
               "type": "boolean"
             },
+            "in_app_voice": {
+              "type": "boolean"
+            },
             "instant_interrupt": {
               "type": "boolean"
             },
@@ -954,6 +974,9 @@
             "local_thread_store_shared_compression": {
               "type": "boolean"
             },
+            "login_shell_package_path": {
+              "type": "boolean"
+            },
             "mcp_2026_07_28": {
               "type": "boolean"
             },
@@ -969,6 +992,9 @@
             "mentions_v2": {
               "type": "boolean"
             },
+            "model_catalog_in_context": {
+              "type": "boolean"
+            },
             "multi_agent": {
               "type": "boolean"
             },
@@ -977,6 +1003,9 @@
             },
             "multi_agent_v2": {
               "$ref": "#/definitions/FeatureToml_for_MultiAgentV2ConfigToml"
+            },
+            "multi_agent_v2_dynamic_tools": {
+              "type": "boolean"
             },
             "network_proxy": {
               "$ref": "#/definitions/FeatureToml_for_NetworkProxyConfigToml"
@@ -1838,6 +1867,20 @@
       "additionalProperties": false,
       "description": "User-configurable prompt, approval, and context settings for Guardian v2.",
       "properties": {
+        "async_classifier_conversation_token_limit": {
+          "description": "Reset retained async history when the next request exceeds this token estimate. Defaults to 100,000. Fresh requests remain subject to the model's input limit.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "async_classifier_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AsyncClassifierMode"
+            }
+          ],
+          "description": "Classifier experiment override. Otherwise use the model default, then snapshots."
+        },
         "classifier_instructions": {
           "type": "string"
         },
@@ -2548,6 +2591,24 @@
         "v2"
       ],
       "type": "string"
+    },
+    "MicrophoneChannels": {
+      "anyOf": [
+        {
+          "format": "uint16",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        {
+          "items": {
+            "format": "uint16",
+            "minimum": 1.0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "Selected microphone inputs. Scalars preserve existing single-channel configuration."
     },
     "ModelAvailabilityNuxConfig": {
       "additionalProperties": {
@@ -3755,6 +3816,14 @@
         "microphone": {
           "type": "string"
         },
+        "microphone_channel": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/MicrophoneChannels"
+            }
+          ],
+          "description": "One-based microphone channels to mix; unset mixes all input channels."
+        },
         "speaker": {
           "type": "string"
         }
@@ -4429,6 +4498,7 @@
             "agents": {
               "archive": null,
               "delete": null,
+              "fork": null,
               "hide": null,
               "new_task": null,
               "new_worktree": null,
@@ -4616,6 +4686,13 @@
           "default": {},
           "description": "Startup tooltip availability NUX state persisted by the TUI."
         },
+        "mouse_scroll_speed": {
+          "default": null,
+          "description": "Mouse wheel speed multiplier for transcript scrolling, based on one row per event. Defaults to `1.0`. Positive fractional values slow scrolling; values above `1.0` speed it up.",
+          "exclusiveMinimum": 0.0,
+          "format": "double",
+          "type": "number"
+        },
         "notification_condition": {
           "allOf": [
             {
@@ -4782,6 +4859,14 @@
             }
           ],
           "description": "Permanently delete the selected task and its child agents after confirmation."
+        },
+        "fork": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Fork the selected conversation and open the new session."
         },
         "hide": {
           "allOf": [
@@ -5367,6 +5452,7 @@
           "default": {
             "archive": null,
             "delete": null,
+            "fork": null,
             "hide": null,
             "new_task": null,
             "new_worktree": null,
@@ -6669,6 +6755,10 @@
     "computer_use": {
       "$ref": "#/definitions/ComputerUseConfigToml"
     },
+    "daybreak": {
+      "description": "Default Daybreak preference for new threads and non-interactive turns.",
+      "type": "boolean"
+    },
     "default_permissions": {
       "description": "Default permissions profile to apply. Names starting with `:` refer to built-in profiles; other names are resolved from the `[permissions]` table.",
       "type": "string"
@@ -6737,6 +6827,9 @@
         "analytics_plan_history": {
           "type": "boolean"
         },
+        "api_key_cyber_access_programs": {
+          "type": "boolean"
+        },
         "api_key_model_discovery": {
           "type": "boolean"
         },
@@ -6778,6 +6871,9 @@
           "type": "boolean"
         },
         "bedrock_setup_wizard": {
+          "type": "boolean"
+        },
+        "browser_annotation_api": {
           "type": "boolean"
         },
         "browser_use": {
@@ -6930,6 +7026,9 @@
         "guardianv2": {
           "$ref": "#/definitions/FeatureToml_for_GuardianV2ConfigToml"
         },
+        "guardianv2_decisions_comparison": {
+          "type": "boolean"
+        },
         "hooks": {
           "type": "boolean"
         },
@@ -6960,6 +7059,9 @@
         "in_app_updates": {
           "type": "boolean"
         },
+        "in_app_voice": {
+          "type": "boolean"
+        },
         "instant_interrupt": {
           "type": "boolean"
         },
@@ -6978,6 +7080,9 @@
         "local_thread_store_shared_compression": {
           "type": "boolean"
         },
+        "login_shell_package_path": {
+          "type": "boolean"
+        },
         "mcp_2026_07_28": {
           "type": "boolean"
         },
@@ -6993,6 +7098,9 @@
         "mentions_v2": {
           "type": "boolean"
         },
+        "model_catalog_in_context": {
+          "type": "boolean"
+        },
         "multi_agent": {
           "type": "boolean"
         },
@@ -7001,6 +7109,9 @@
         },
         "multi_agent_v2": {
           "$ref": "#/definitions/FeatureToml_for_MultiAgentV2ConfigToml"
+        },
+        "multi_agent_v2_dynamic_tools": {
+          "type": "boolean"
         },
         "network_proxy": {
           "$ref": "#/definitions/FeatureToml_for_NetworkProxyConfigToml"

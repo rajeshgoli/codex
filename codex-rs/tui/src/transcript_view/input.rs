@@ -3,6 +3,7 @@
 //! Shift-click extends the existing selection from its original text unit.
 //! Optional automatic copying happens only when a nonempty mouse selection is released.
 //! Automatic copies retain the selection; explicit copies clear it after confirmed delivery.
+//! Wheel input accumulates fractional rows and discards the remainder when direction reverses.
 
 use crate::key_hint::KeyBindingListExt;
 use crossterm::event::KeyCode;
@@ -135,10 +136,7 @@ impl TranscriptView {
             return true;
         }
         if self.selection.is_some() {
-            return (code == KeyCode::Char('c')
-                && matches!(modifiers, KeyModifiers::CONTROL | KeyModifiers::SUPER))
-                || (code == KeyCode::Char('c')
-                    && modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT))
+            return crate::text_selection::is_copy_key(key)
                 || code == KeyCode::Esc
                 || (code == KeyCode::Enter && modifiers == KeyModifiers::NONE)
                 || (matches!(modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
@@ -149,8 +147,11 @@ impl TranscriptView {
                 || (modifiers == KeyModifiers::NONE
                     && matches!(code, KeyCode::PageUp | KeyCode::PageDown));
         }
-        self.is_search_active()
-            && (matches!(code, KeyCode::Esc | KeyCode::Enter)
+        self.search.is_active()
+            && (code == KeyCode::Esc
+                || (code == KeyCode::Enter && self.is_search_editing())
+                || (modifiers == KeyModifiers::NONE
+                    && matches!(code, KeyCode::PageUp | KeyCode::PageDown))
                 || (modifiers == KeyModifiers::CONTROL
                     && matches!(code, KeyCode::Char('c' | 'n' | 'p'))))
     }
@@ -229,8 +230,27 @@ impl TranscriptView {
             selection.pointer = None;
         }
         match event.kind {
-            MouseEventKind::ScrollUp => self.scroll(cells, /*rows*/ -3),
-            MouseEventKind::ScrollDown => self.scroll(cells, /*rows*/ 3),
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let direction = if event.kind == MouseEventKind::ScrollUp {
+                    -1.0
+                } else {
+                    1.0
+                };
+                if self.pending_mouse_scroll.signum() != direction {
+                    self.pending_mouse_scroll = 0.0;
+                }
+                self.pending_mouse_scroll += direction * self.mouse_scroll_speed;
+                // Decimal speeds can land just short of a whole row after repeated addition.
+                let rounded = self.pending_mouse_scroll.round();
+                if rounded != 0.0 && (self.pending_mouse_scroll - rounded).abs() < 1e-9 {
+                    self.pending_mouse_scroll = rounded;
+                }
+                let rows = self.pending_mouse_scroll as isize;
+                self.pending_mouse_scroll = self.pending_mouse_scroll.fract();
+                if rows != 0 {
+                    self.scroll(cells, rows);
+                }
+            }
             MouseEventKind::Down(MouseButton::Right) if inside => {
                 return self
                     .selected_text(cells)
@@ -323,17 +343,24 @@ impl TranscriptView {
     ) -> Option<ViewAction> {
         let jump = JumpTarget::from_key(key);
         match (key.code, key.modifiers) {
-            (KeyCode::PageUp, KeyModifiers::NONE) => {
-                self.scroll(
-                    cells,
-                    -(self.area.height.saturating_sub(/*rhs*/ 1).max(/*other*/ 1) as isize),
-                );
-            }
-            (KeyCode::PageDown, KeyModifiers::NONE) => {
-                self.scroll(
-                    cells,
-                    self.area.height.saturating_sub(/*rhs*/ 1).max(/*other*/ 1) as isize,
-                );
+            (KeyCode::PageUp | KeyCode::PageDown, KeyModifiers::NONE) => {
+                // Share page-key configuration without taking the pager's typing shortcuts.
+                // Full pages retain the main view's existing one-row overlap.
+                let keymap = &self.disclosure.keymap.pager;
+                let height = self.area.height.max(/*other*/ 1) as isize;
+                let page = (height - 1).max(/*other*/ 1);
+                let half = (height + 1) / 2;
+                let delta = [
+                    (&keymap.scroll_up, -1),
+                    (&keymap.scroll_down, 1),
+                    (&keymap.page_up, -page),
+                    (&keymap.page_down, page),
+                    (&keymap.half_page_up, -half),
+                    (&keymap.half_page_down, half),
+                ]
+                .into_iter()
+                .find_map(|(bindings, delta)| bindings.is_pressed(key).then_some(delta))?;
+                self.scroll(cells, delta);
             }
             (KeyCode::Esc, KeyModifiers::NONE) if self.can_return_to_latest() => {
                 self.jump_to_latest();
